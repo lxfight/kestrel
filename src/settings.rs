@@ -1,7 +1,7 @@
 //! Persisted user settings, custom keybindings, and the last editor session.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
@@ -51,8 +51,6 @@ pub struct Settings {
     /// Last used project-search include/exclude globs.
     pub search_include: String,
     pub search_exclude: String,
-    /// Recently opened files, newest first.
-    pub recent_files: Vec<String>,
     /// New terminals start in the active editor's directory.
     pub terminal_follow_active_dir: bool,
 }
@@ -96,7 +94,6 @@ impl Default for Settings {
             plugin_config: HashMap::new(),
             search_include: String::new(),
             search_exclude: String::new(),
-            recent_files: Vec::new(),
             terminal_follow_active_dir: false,
         }
     }
@@ -199,15 +196,6 @@ impl Settings {
         self.recent_folders.retain(|f| f != folder);
         self.recent_folders.insert(0, folder.to_string());
         self.recent_folders.truncate(12);
-        self.save();
-    }
-
-    /// Record an opened file for the welcome page's recent list.
-    pub fn note_recent_file(&mut self, path: &Path) {
-        let entry = path.to_string_lossy().to_string();
-        self.recent_files.retain(|existing| existing != &entry);
-        self.recent_files.insert(0, entry);
-        self.recent_files.truncate(12);
         self.save();
     }
 
@@ -320,6 +308,8 @@ pub struct Session {
     pub active_terminal: usize,
     /// Last project-search query, restored into the search sidebar.
     pub search_query: String,
+    /// Files opened recently, newest first; feeds the welcome page.
+    pub recent_files: Vec<String>,
 }
 
 impl Default for Session {
@@ -340,6 +330,7 @@ impl Default for Session {
             terminals: Vec::new(),
             active_terminal: 0,
             search_query: String::new(),
+            recent_files: Vec::new(),
         }
     }
 }

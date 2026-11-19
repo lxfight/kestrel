@@ -50,6 +50,9 @@ impl UiStyle {
 
 impl KestrelApp {
     pub fn root_ui(&mut self, ui: &mut Ui) {
+        // Runs before the palette draws: the first Esc clears its query, the
+        // next one closes it (see `palette_ui`).
+        self.handle_palette_escape(ui.ctx());
         let style = self.ui_style();
         let theme = style.theme;
         let win_w = ui.max_rect().width();
@@ -207,10 +210,10 @@ impl KestrelApp {
         };
         if pill_compact {
             if widgets::icon_button(ui, pill_rect, &theme, Icon::Search, true)
-                .on_hover_text("快速打开 (Ctrl+P)")
+                .on_hover_text("快速打开 (Ctrl+P)，Esc 清空")
                 .clicked()
             {
-                self.open_palette(PaletteMode::QuickOpen);
+                self.focus_or_open_quick_open();
             }
         } else {
             let pill_resp = ui.interact(
@@ -219,25 +222,17 @@ impl KestrelApp {
                 Sense::click(),
             );
             let radius = CornerRadius::same(R_MD);
+            let fade = widgets::hover_fade(ui, "command_pill_hover", pill_resp.hovered());
             let fill = if pill_resp.is_pointer_button_down_on() {
                 theme.active
-            } else if pill_resp.hovered() {
-                theme.hover
             } else {
-                theme.input_bg
+                widgets::blend(theme.input_bg, theme.hover, fade)
             };
             ui.painter().rect_filled(pill_rect, radius, fill);
             ui.painter().rect_stroke(
                 pill_rect,
                 radius,
-                Stroke::new(
-                    1.0,
-                    if pill_resp.hovered() {
-                        theme.border_strong
-                    } else {
-                        theme.border
-                    },
-                ),
+                Stroke::new(1.0, widgets::blend(theme.border, theme.border_strong, fade)),
                 egui::StrokeKind::Inside,
             );
             if pill_resp.has_focus() {
@@ -278,8 +273,11 @@ impl KestrelApp {
                 style.tiny(),
                 theme.text_faint,
             );
-            if pill_resp.clicked() {
-                self.open_palette(PaletteMode::QuickOpen);
+            if pill_resp
+                .on_hover_text("搜索文件、符号或命令 (Ctrl+P)，Esc 清空")
+                .clicked()
+            {
+                self.focus_or_open_quick_open();
             }
         }
 
@@ -300,16 +298,21 @@ impl KestrelApp {
         );
 
         let close_resp = ui.interact(close_rect, ui.scope_id().with("win_close"), Sense::click());
-        if close_resp.hovered() {
-            ui.painter()
-                .rect_filled(close_rect, 0.0, Color32::from_rgb(0xC4, 0x2B, 0x1C));
+        let close_fade = widgets::hover_fade(ui, "win_close_hover", close_resp.hovered());
+        if close_fade > 0.001 {
+            let fill = if close_resp.is_pointer_button_down_on() {
+                theme.error.gamma_multiply(0.86)
+            } else {
+                widgets::blend(theme.panel_bg, theme.error, close_fade)
+            };
+            ui.painter().rect_filled(close_rect, 0.0, fill);
         }
         icons::paint(
             ui.painter(),
             Rect::from_center_size(close_rect.center(), Vec2::splat(13.0)),
             Icon::Close,
-            if close_resp.hovered() {
-                Color32::WHITE
+            if close_resp.is_pointer_button_down_on() || close_fade > 0.5 {
+                theme.accent_text
             } else {
                 theme.text_dim
             },
@@ -320,10 +323,17 @@ impl KestrelApp {
         }
 
         let max_resp = ui.interact(max_rect, ui.scope_id().with("win_max"), Sense::click());
-        if max_resp.hovered() {
-            ui.painter().rect_filled(max_rect, 0.0, theme.hover);
+        let max_fade = widgets::hover_fade(ui, "win_max_hover", max_resp.hovered());
+        if max_resp.is_pointer_button_down_on() {
+            ui.painter().rect_filled(max_rect, 0.0, theme.active);
+        } else if max_fade > 0.001 {
+            ui.painter().rect_filled(
+                max_rect,
+                0.0,
+                widgets::blend(theme.panel_bg, theme.hover, max_fade),
+            );
         }
-        let max_fg = if max_resp.hovered() {
+        let max_fg = if max_resp.hovered() || max_resp.is_pointer_button_down_on() {
             theme.text
         } else {
             theme.text_dim
@@ -367,10 +377,17 @@ impl KestrelApp {
         }
 
         let min_resp = ui.interact(min_rect, ui.scope_id().with("win_min"), Sense::click());
-        if min_resp.hovered() {
-            ui.painter().rect_filled(min_rect, 0.0, theme.hover);
+        let min_fade = widgets::hover_fade(ui, "win_min_hover", min_resp.hovered());
+        if min_resp.is_pointer_button_down_on() {
+            ui.painter().rect_filled(min_rect, 0.0, theme.active);
+        } else if min_fade > 0.001 {
+            ui.painter().rect_filled(
+                min_rect,
+                0.0,
+                widgets::blend(theme.panel_bg, theme.hover, min_fade),
+            );
         }
-        let min_fg = if min_resp.hovered() {
+        let min_fg = if min_resp.hovered() || min_resp.is_pointer_button_down_on() {
             theme.text
         } else {
             theme.text_dim
@@ -407,14 +424,15 @@ impl KestrelApp {
                 Vec2::splat(size),
             );
             let resp = ui.interact(r, ui.scope_id().with(("top_btn", tip)), Sense::click());
-            if resp.hovered() || active {
+            let fade = widgets::hover_fade(ui, ("top_btn_hover", tip), resp.hovered());
+            if fade > 0.001 || active {
                 ui.painter().rect_filled(
                     r,
                     CornerRadius::same(6),
-                    if resp.hovered() {
-                        theme.hover
-                    } else {
+                    if active {
                         theme.active.gamma_multiply(0.75)
+                    } else {
+                        widgets::blend(theme.panel_bg, theme.hover, fade)
                     },
                 );
                 if active {
@@ -545,6 +563,8 @@ impl KestrelApp {
                     Command::ToggleComment,
                     Command::DuplicateLine,
                     Command::DeleteLine,
+                    Command::ToggleIndent,
+                    Command::ToggleEol,
                 ],
             );
         });
@@ -626,17 +646,22 @@ impl KestrelApp {
 
     fn menu_item(&mut self, ui: &mut Ui, style: &UiStyle, command: Command) {
         let theme = style.theme;
+        let enabled = self.command_enabled(command);
         let shortcut = command.shortcut_text().unwrap_or_default();
         let (rect, response) = ui.allocate_exact_size(Vec2::new(244.0, 25.0), Sense::click());
-        if response.hovered() {
+        let fade = widgets::hover_fade(ui, ("menu_hover", command.id()), response.hovered());
+        if enabled && fade > 0.001 {
             ui.painter()
-                .rect_filled(rect, CornerRadius::same(4), theme.hover);
+                .rect_filled(rect, CornerRadius::same(4), widgets::blend(theme.panel_bg, theme.hover, fade));
         }
+        let text_color = if enabled { theme.text } else { theme.text_faint };
         icons::paint(
             ui.painter(),
             Rect::from_center_size(Pos2::new(rect.left() + 13.0, rect.center().y), Vec2::splat(14.0)),
             command.icon(),
-            if response.hovered() {
+            if !enabled {
+                theme.text_faint
+            } else if response.hovered() {
                 theme.accent
             } else {
                 theme.text_dim
@@ -648,7 +673,7 @@ impl KestrelApp {
             Align2::LEFT_CENTER,
             command.label(),
             style.small(),
-            theme.text,
+            text_color,
         );
         if !shortcut.is_empty() {
             ui.painter().text(
@@ -659,7 +684,7 @@ impl KestrelApp {
                 theme.text_faint,
             );
         }
-        if response.clicked() {
+        if enabled && response.clicked() {
             ui.close();
             let ctx = ui.ctx().clone();
             self.dispatch(command, &ctx);
@@ -687,6 +712,7 @@ impl KestrelApp {
          -> bool {
             let r = Rect::from_min_size(Pos2::new(rect.left(), y), Vec2::new(rect.width(), 44.0));
             let resp = ui.interact(r, ui.scope_id().with(("activity", tip)), Sense::click());
+            let fade = widgets::hover_fade(ui, ("activity_hover", tip), resp.hovered());
             if selected {
                 ui.painter().rect_filled(
                     Rect::from_min_max(
@@ -704,14 +730,14 @@ impl KestrelApp {
                     CornerRadius::same(1),
                     theme.accent,
                 );
-            } else if resp.hovered() {
+            } else if fade > 0.001 {
                 ui.painter().rect_filled(
                     Rect::from_min_max(
                         Pos2::new(r.left() + 6.0, r.top() + 5.0),
                         Pos2::new(r.right() - 6.0, r.bottom() - 5.0),
                     ),
                     CornerRadius::same(7),
-                    theme.hover.gamma_multiply(0.6),
+                    widgets::blend(theme.activity_bg, theme.hover, fade * 0.6),
                 );
             }
             icons::paint(
@@ -894,22 +920,23 @@ impl KestrelApp {
                     Pos2::new(rects[group - 1].right(), avail.top()),
                     Pos2::new(rects[group].left(), avail.bottom()),
                 );
+                // The visual seam stays 5 px; the interaction rect is 6 px so
+                // the handle is easy to grab without moving either pane.
+                let sep_hit = sep.expand2(Vec2::new(0.5, 0.0));
                 let resp = ui.interact(
-                    sep,
+                    sep_hit,
                     ui.scope_id().with(("group_sep", group)),
                     Sense::click_and_drag(),
                 );
-                if resp.hovered() || resp.dragged() {
+                let active = resp.hovered() || resp.dragged();
+                if active {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                 }
+                let fade = widgets::hover_fade(ui, ("group_sep_hover", group), active);
                 ui.painter().rect_filled(
                     sep,
                     0.0,
-                    if resp.hovered() || resp.dragged() {
-                        theme.accent
-                    } else {
-                        theme.border_strong
-                    },
+                    widgets::blend(theme.border_strong, theme.accent, fade),
                 );
                 if resp.dragged()
                     && let Some(pos) = resp.interact_pointer_pos()
@@ -923,8 +950,10 @@ impl KestrelApp {
                     self.groups[group - 1].weight = total * fraction;
                     self.groups[group].weight = total * (1.0 - fraction);
                 } else if resp.double_clicked() {
-                    self.groups[group - 1].weight = 1.0;
-                    self.groups[group].weight = 1.0;
+                    let total = self.groups[group - 1].weight.max(0.05)
+                        + self.groups[group].weight.max(0.05);
+                    self.groups[group - 1].weight = total * 0.5;
+                    self.groups[group].weight = total * 0.5;
                 }
             }
             let Some(rect) = rects.get(group).copied() else {
@@ -1014,15 +1043,8 @@ impl KestrelApp {
         let bar_resp = ui.interact(
             rect,
             ui.scope_id().with(("group_bar", group_idx)),
-            Sense::hover(),
+            Sense::click(),
         );
-        if bar_resp.hovered() {
-            let (dx, dy) = ui.input(|i| (i.smooth_scroll_delta.x, i.smooth_scroll_delta.y));
-            if dx != 0.0 || dy != 0.0 {
-                self.groups[group_idx].tab_scroll =
-                    (self.groups[group_idx].tab_scroll - dx - dy).max(0.0);
-            }
-        }
 
         let group_active = group_idx == self.active_group;
         let active_id = self.groups[group_idx].active_id();
@@ -1040,15 +1062,123 @@ impl KestrelApp {
         if self.groups.len() > 1 {
             actions_reserve += 26.0;
         }
-        let tabs_clip = Rect::from_min_max(
+        let tabs_zone = Rect::from_min_max(
             rect.min,
             Pos2::new(rect.right() - actions_reserve, rect.bottom()),
         );
-        let scroll = self.groups[group_idx].tab_scroll;
         let ids: Vec<u64> = self.groups[group_idx].tabs.clone();
+        // One measuring pass per frame; the scroll bounds and the paint pass
+        // below reuse these widths instead of laying every title out twice.
+        let mut widths: Vec<f32> = Vec::with_capacity(ids.len());
+        let mut total_w = 0.0;
+        for id in &ids {
+            let Some(index) = self.tab_index(*id) else {
+                widths.push(0.0);
+                continue;
+            };
+            let width = tab_width(ui, style, &self.tabs[index]);
+            widths.push(width);
+            total_w += width;
+        }
         let pointer_pos = ui
             .ctx()
             .input(|i| i.pointer.interact_pos().or(i.pointer.hover_pos()));
+        let overflow = total_w > tabs_zone.width() - 0.5;
+        let scroll_btn_w = if overflow { 18.0 } else { 0.0 };
+        let tabs_clip = Rect::from_min_max(
+            Pos2::new(tabs_zone.left() + scroll_btn_w, tabs_zone.top()),
+            Pos2::new(tabs_zone.right() - scroll_btn_w, tabs_zone.bottom()),
+        );
+        let max_scroll = (total_w - tabs_clip.width()).max(0.0);
+        let mut scroll = if max_scroll > 0.0 {
+            self.groups[group_idx].tab_scroll.max(0.0)
+        } else {
+            0.0
+        };
+        // Wheel over the strip scrolls the tabs, even when the pointer sits on a
+        // tab (that tab is the top-most hover target, but the wheel belongs here).
+        if max_scroll > 0.0
+            && pointer_pos.is_some_and(|pos| tabs_zone.contains(pos))
+        {
+            let (dx, dy) = ui.input(|i| (i.smooth_scroll_delta.x, i.smooth_scroll_delta.y));
+            if dx != 0.0 || dy != 0.0 {
+                scroll -= dx + dy;
+            }
+        }
+        if overflow {
+            let step = (tabs_clip.width() * 0.7).max(120.0);
+            let button =
+                |ui: &mut Ui, x: f32, salt: &'static str, icon: Icon, enabled: bool| -> f32 {
+                    let r = Rect::from_min_size(
+                        Pos2::new(x, rect.top() + 2.0),
+                        Vec2::new(scroll_btn_w, rect.height() - 4.0),
+                    );
+                    let resp = ui.interact(
+                        r,
+                        ui.scope_id().with(("gtab_scroll", group_idx, salt)),
+                        if enabled { Sense::click() } else { Sense::hover() },
+                    );
+                    let fade = widgets::hover_fade(
+                        ui,
+                        ("gtab_scroll_hover", group_idx, salt),
+                        resp.hovered() && enabled,
+                    );
+                    if fade > 0.001 {
+                        ui.painter().rect_filled(
+                            r.shrink2(Vec2::new(0.0, 3.0)),
+                            CornerRadius::same(4),
+                            widgets::blend(theme.panel_bg, theme.hover, fade),
+                        );
+                    }
+                    icons::paint(
+                        ui.painter(),
+                        Rect::from_center_size(r.center(), Vec2::splat(12.0)),
+                        icon,
+                        if !enabled {
+                            theme.text_faint
+                        } else if resp.hovered() {
+                            theme.text
+                        } else {
+                            theme.text_dim
+                        },
+                        1.3,
+                    );
+                    if enabled && resp.clicked() {
+                        if salt == "left" { -step } else { step }
+                    } else {
+                        0.0
+                    }
+                };
+            let delta = button(ui, tabs_zone.left(), "left", Icon::ChevronLeft, scroll > 0.5)
+                + button(
+                    ui,
+                    tabs_clip.right(),
+                    "right",
+                    Icon::ChevronRight,
+                    scroll < max_scroll - 0.5,
+                );
+            scroll += delta;
+        }
+        if let Some(active) = active_id
+            && let Some(pos) = ids.iter().position(|id| *id == active)
+        {
+            // Only react to an actual active-tab change: manual scrolling away
+            // from the active tab must not snap back on every frame.
+            let reveal_key = ui.scope_id().with(("gtab_reveal", group_idx));
+            let previous: Option<u64> = ui.ctx().data(|data| data.get_temp(reveal_key));
+            ui.ctx().data_mut(|data| data.insert_temp(reveal_key, active));
+            if previous != Some(active) {
+                let left: f32 = widths[..pos].iter().sum();
+                let right = left + widths[pos];
+                if right - scroll > tabs_clip.width() - 2.0 {
+                    scroll = right - tabs_clip.width() + 2.0;
+                } else if left - scroll < 2.0 {
+                    scroll = left - 2.0;
+                }
+            }
+        }
+        scroll = scroll.clamp(0.0, max_scroll);
+        self.groups[group_idx].tab_scroll = scroll;
         let dragging_tab = match &self.drag_payload {
             Some(DragPayload::Tab { id, group }) => Some((*id, *group)),
             _ => None,
@@ -1067,26 +1197,10 @@ impl KestrelApp {
                 continue;
             };
             let tab = &self.tabs[index];
-            let title = tab.title();
             let dirty = tab.is_dirty();
-            let preview = tab.preview;
             let pinned = tab.pinned;
-            let display_title = if preview {
-                format!("{title} · 预览")
-            } else {
-                title.clone()
-            };
-            let text_width = ui.ctx().fonts_mut(|fonts| {
-                fonts
-                    .layout_job(LayoutJob::simple_singleline(
-                        display_title.clone(),
-                        style.small(),
-                        theme.text,
-                    ))
-                    .rect
-                    .width()
-            });
-            let width = (text_width + 52.0).clamp(116.0, 236.0);
+            let display_title = tab_display_title(tab);
+            let width = widths[pos_in_group];
             let tab_rect = Rect::from_min_size(
                 Pos2::new(x, rect.top()),
                 Vec2::new(width, rect.height()),
@@ -1134,14 +1248,17 @@ impl KestrelApp {
 
             let active = active_id == Some(*id);
             let focused_tab = active && group_active;
+            let hover_t = if active {
+                0.0
+            } else {
+                widgets::hover_fade(ui, ("gtab_hover", group_idx, *id), tab_resp.hovered())
+            };
             let bg = if tab_resp.is_pointer_button_down_on() {
                 theme.active
             } else if active {
                 theme.bg
-            } else if tab_resp.hovered() {
-                theme.hover
             } else {
-                theme.panel_bg
+                widgets::blend(theme.panel_bg, theme.hover, hover_t)
             };
             ui.painter().rect_filled(clip_rect, 0.0, bg);
             if tab_resp.has_focus() && !active {
@@ -1238,13 +1355,23 @@ impl KestrelApp {
             }
 
             let right_icon_center = Pos2::new(tab_rect.right() - 16.0, tab_rect.center().y);
-            if tab_resp.hovered() && !pinned {
-                let close_rect = Rect::from_center_size(right_icon_center, Vec2::splat(16.0));
+            let close_rect = Rect::from_center_size(right_icon_center, Vec2::splat(16.0));
+            let close_hovered =
+                tab_resp.hovered() && pointer_pos.is_some_and(|pos| close_rect.contains(pos));
+            let close_fade = widgets::hover_fade(ui, ("gtab_close", group_idx, *id), close_hovered);
+            if close_fade > 0.001 {
+                ui.painter().with_clip_rect(clip_rect).rect_filled(
+                    close_rect,
+                    CornerRadius::same(3),
+                    widgets::blend(theme.panel_bg, theme.active, close_fade),
+                );
+            }
+            if close_hovered {
                 icons::paint(
                     &ui.painter().with_clip_rect(clip_rect),
                     close_rect.shrink(3.5),
                     Icon::Close,
-                    theme.text_dim,
+                    theme.text,
                     1.3,
                 );
             } else if pinned {
@@ -1260,13 +1387,17 @@ impl KestrelApp {
                 ui.painter()
                     .with_clip_rect(clip_rect)
                     .circle_filled(right_icon_center, 3.2, theme.accent);
+            } else if tab_resp.hovered() {
+                icons::paint(
+                    &ui.painter().with_clip_rect(clip_rect),
+                    close_rect.shrink(3.5),
+                    Icon::Close,
+                    theme.text_dim,
+                    1.3,
+                );
             }
 
-            let close_hit = ui.input(|i| i.pointer.primary_clicked())
-                && ui.input(|i| i.pointer.interact_pos()).is_some_and(|pos| {
-                    Rect::from_center_size(right_icon_center, Vec2::splat(18.0)).contains(pos)
-                })
-                && tab_resp.hovered();
+            let close_hit = close_hovered && ui.input(|i| i.pointer.primary_clicked());
             if close_hit {
                 if pinned {
                     toggle_pin = Some(*id);
@@ -1312,6 +1443,10 @@ impl KestrelApp {
                     context_action = Some(TabAction::CloseOthers(group_idx, *id));
                     ui.close();
                 }
+                if Self::context_item(ui, style, Icon::Close, "关闭右侧标签", None) {
+                    context_action = Some(TabAction::CloseRight(group_idx, *id));
+                    ui.close();
+                }
                 ui.separator();
                 if Self::context_item(ui, style, Icon::Copy, "复制文件路径", None) {
                     context_action = Some(TabAction::CopyPath(*id));
@@ -1341,6 +1476,16 @@ impl KestrelApp {
                 to,
                 tabs_clip.right().min(rect.right() - actions_reserve),
             ));
+        }
+
+        // Double-clicking the empty end of the tab strip creates a new file,
+        // the convention users expect from the tab row.
+        if bar_resp.double_clicked()
+            && let Some(pos) = pointer_pos
+            && pos.x >= rect.left() - scroll + total_w
+            && pos.x < tabs_clip.right()
+        {
+            self.new_untitled();
         }
 
         if let Some((src, src_group, to, line_x)) = reorder {
@@ -1500,6 +1645,25 @@ impl KestrelApp {
                     }
                     self.focus_tab_in_group(group, keep);
                 }
+                TabAction::CloseRight(group, keep) => {
+                    let ids: Vec<u64> = self
+                        .groups
+                        .get(group)
+                        .map(|tabs| {
+                            let start = tabs.index_of(keep).map(|pos| pos + 1).unwrap_or(0);
+                            tabs.tabs.iter().copied().skip(start).collect()
+                        })
+                        .unwrap_or_default();
+                    for id in ids {
+                        if let Some(index) = self.tab_index(id)
+                            && !self.tabs[index].is_dirty()
+                            && !self.tabs[index].pinned
+                        {
+                            self.close_tab_force_in_group(group, index);
+                        }
+                    }
+                    self.focus_tab_in_group(group, keep);
+                }
                 TabAction::CopyPath(id) => {
                     if let Some(index) = self.tab_index(id)
                         && let Some(path) = &self.tabs[index].doc.path
@@ -1564,8 +1728,11 @@ impl KestrelApp {
         let Some(editor) = self.tabs.get(tab_idx) else {
             return;
         };
-        let mut segments: Vec<(String, bool)> = Vec::new();
-        if let Some(path) = &editor.doc.path {
+        // Each crumb carries its own absolute path: clicking one reveals that
+        // directory in the file tree, hovering shows the full path.
+        let full_path: Option<PathBuf> = editor.doc.path.clone();
+        let mut segments: Vec<(String, Option<PathBuf>)> = Vec::new();
+        if let Some(path) = &full_path {
             if let Some(root) = &self.workspace.root {
                 if let Ok(rel) = path.strip_prefix(root) {
                     let parts: Vec<String> = rel
@@ -1574,21 +1741,26 @@ impl KestrelApp {
                         .collect();
                     if parts.is_empty() {
                         if let Some(name) = root.file_name() {
-                            segments.push((name.to_string_lossy().to_string(), true));
+                            segments.push((name.to_string_lossy().to_string(), Some(path.clone())));
                         }
                     } else {
-                        for (i, part) in parts.iter().enumerate() {
-                            segments.push((part.clone(), i + 1 == parts.len()));
+                        let mut acc = root.clone();
+                        for part in parts {
+                            acc.push(&part);
+                            segments.push((part, Some(acc.clone())));
                         }
                     }
                 } else {
-                    segments.push((path.to_string_lossy().to_string(), true));
+                    segments.push((path.to_string_lossy().to_string(), Some(path.clone())));
                 }
             } else {
-                segments.push((path.to_string_lossy().to_string(), true));
+                segments.push((path.to_string_lossy().to_string(), Some(path.clone())));
             }
         } else {
-            segments.push((editor.title(), true));
+            segments.push((editor.title(), None));
+        }
+        if segments.is_empty() {
+            segments.push((editor.title(), None));
         }
 
         let caret_line = editor.doc.char_to_line(editor.caret);
@@ -1597,28 +1769,139 @@ impl KestrelApp {
             .iter().rfind(|s| caret_line >= s.start_line && caret_line <= s.end_line)
             .cloned();
 
+        // The language label and the view-mode capsule keep their spots on the
+        // right; the crumbs may only use what is left of the row.
+        let is_diff = editor.diff.is_some();
+        let is_md = !is_diff && editor.language == crate::highlight::Language::Markdown;
+        let cur_md_mode = editor.md_mode;
+        let is_tabular = !is_diff
+            && editor.multimodal.as_ref().is_some_and(|m| {
+                matches!(m, crate::viewer::MultimodalViewer::Spreadsheet(_))
+                    && editor.doc.path.as_deref().is_some_and(|p| {
+                        matches!(
+                            crate::viewer::MultimodalKind::from_path(p),
+                            Some(
+                                crate::viewer::MultimodalKind::Csv
+                                    | crate::viewer::MultimodalKind::Tsv
+                            )
+                        )
+                    })
+            });
+        let cur_tabular_src = editor
+            .multimodal
+            .as_ref()
+            .is_some_and(|m| m.is_showing_source());
+        let language = if is_diff {
+            "Git 差异"
+        } else if let Some(mm) = &editor.multimodal {
+            mm.kind().label()
+        } else if editor.doc.encoding == crate::doc::Encoding::Binary {
+            "二进制文件"
+        } else {
+            editor.language.name()
+        };
+        let measure = |ui: &Ui, text: &str| -> f32 {
+            ui.ctx().fonts_mut(|fonts| {
+                fonts
+                    .layout_job(LayoutJob::simple_singleline(
+                        text.to_string(),
+                        style.small(),
+                        theme.text,
+                    ))
+                    .rect
+                    .width()
+            })
+        };
+        let language_w = measure(ui, language);
+        let has_capsule = (is_tabular || is_md) && rect.width() > 360.0;
+        let right_reserve = if has_capsule {
+            language_w.max(120.0) + 92.0
+        } else {
+            language_w + 24.0
+        };
+        let available = (rect.right() - right_reserve - (rect.left() + 14.0)).max(0.0);
+        let widths: Vec<f32> = segments
+            .iter()
+            .map(|(label, _)| measure(ui, label))
+            .collect();
+        let last_icon_w = 16.0;
+        let ellipsis_label = "…";
+        let ellipsis_w = measure(ui, ellipsis_label) + 19.0;
+        // Drop leading crumbs until the row fits; the marker that replaces them
+        // explains the hidden prefix on hover.
+        let mut start = 0usize;
+        loop {
+            let mut total = widths[start..].iter().sum::<f32>()
+                + 4.0 * (segments.len() - start) as f32
+                + 15.0 * (segments.len() - start - 1) as f32
+                + last_icon_w;
+            if start > 0 {
+                total += ellipsis_w;
+            }
+            if total <= available || start + 1 >= segments.len() {
+                break;
+            }
+            start += 1;
+        }
+        // Crumbs never paint over the language label or the view-mode capsule.
+        let painter = ui.painter().with_clip_rect(Rect::from_min_max(
+            Pos2::new(rect.left(), rect.top()),
+            Pos2::new(
+                (rect.right() - right_reserve + 4.0).max(rect.left() + 40.0),
+                rect.bottom(),
+            ),
+        ));
+        let mut reveal: Option<PathBuf> = None;
         let mut x = rect.left() + 14.0;
-        for (index, (segment, is_last)) in segments.iter().enumerate() {
-            if index > 0 {
+        if start > 0
+            && let Some(path) = &full_path
+        {
+            let chip = Rect::from_min_size(
+                Pos2::new(x, rect.center().y - 9.0),
+                Vec2::new(ellipsis_w, 18.0),
+            );
+            let resp = ui.interact(
+                chip,
+                ui.scope_id().with(("bc_ellipsis", tab_idx)),
+                Sense::click(),
+            );
+            let fade = widgets::hover_fade(ui, ("bc_ellipsis_hover", tab_idx), resp.hovered());
+            if fade > 0.001 {
+                painter.rect_filled(
+                    chip,
+                    CornerRadius::same(4),
+                    widgets::blend(theme.bg, theme.hover, fade),
+                );
+            }
+            painter.text(
+                Pos2::new(chip.left() + 3.0, rect.center().y),
+                Align2::LEFT_CENTER,
+                ellipsis_label,
+                style.small(),
+                theme.text_dim,
+            );
+            if resp.clicked() {
+                reveal = Some(path.clone());
+            }
+            resp.on_hover_text(path.to_string_lossy().to_string());
+            x += ellipsis_w;
+        }
+        for (index, (label, path)) in segments.iter().enumerate().skip(start) {
+            if index > start {
                 let chevron =
                     Rect::from_center_size(Pos2::new(x + 5.0, rect.center().y), Vec2::splat(11.0));
-                icons::paint(
-                    ui.painter(),
-                    chevron,
-                    Icon::ChevronRight,
-                    theme.text_faint,
-                    1.2,
-                );
+                icons::paint(&painter, chevron, Icon::ChevronRight, theme.text_faint, 1.2);
                 x += 15.0;
             }
-            if *is_last {
+            let is_last = index + 1 == segments.len();
+            if is_last {
                 let icon_rect = Rect::from_center_size(
                     Pos2::new(x + 6.0, rect.center().y),
                     Vec2::splat(13.0),
                 );
-                if let Some(p) = &editor.doc.path {
+                if let Some(p) = &full_path {
                     icons::paint_path_icon(
-                        ui.painter(),
+                        &painter,
                         icon_rect,
                         p,
                         false,
@@ -1627,27 +1910,41 @@ impl KestrelApp {
                         theme.kind.is_dark(),
                     );
                 } else {
-                    icons::file_glyph(ui.painter(), icon_rect, theme.text_dim, false, false);
+                    icons::file_glyph(&painter, icon_rect, theme.text_dim, false, false);
                 }
-                x += 16.0;
+                x += last_icon_w;
             }
-            let width = ui.ctx().fonts_mut(|fonts| {
-                fonts
-                    .layout_job(LayoutJob::simple_singleline(
-                        segment.clone(),
-                        style.small(),
-                        theme.text,
-                    ))
-                    .rect
-                    .width()
-            });
-            ui.painter().text(
+            let width = widths[index];
+            let hit = Rect::from_min_size(
+                Pos2::new(x - 3.0, rect.center().y - 9.0),
+                Vec2::new(width + 6.0, 18.0),
+            );
+            let resp = ui.interact(
+                hit,
+                ui.scope_id().with(("bc_seg", tab_idx, index)),
+                Sense::click(),
+            );
+            let fade = widgets::hover_fade(ui, ("bc_seg_hover", tab_idx, index), resp.hovered());
+            if fade > 0.001 {
+                painter.rect_filled(
+                    hit,
+                    CornerRadius::same(4),
+                    widgets::blend(theme.bg, theme.hover, fade),
+                );
+            }
+            painter.text(
                 Pos2::new(x, rect.center().y),
                 Align2::LEFT_CENTER,
-                segment,
+                label.as_str(),
                 style.small(),
-                if *is_last { theme.text } else { theme.text_dim },
+                if is_last { theme.text } else { theme.text_dim },
             );
+            if let Some(path) = path {
+                let resp = resp.on_hover_text(path.to_string_lossy().to_string());
+                if resp.clicked() {
+                    reveal = Some(path.clone());
+                }
+            }
             x += width + 4.0;
         }
 
@@ -1699,36 +1996,7 @@ impl KestrelApp {
             }
         }
 
-        // Language & Markdown view mode pills on the right of the breadcrumb
-        let is_diff = editor.diff.is_some();
-        let is_md = !is_diff && editor.language == crate::highlight::Language::Markdown;
-        let cur_md_mode = editor.md_mode;
-        let is_tabular = !is_diff
-            && editor.multimodal.as_ref().is_some_and(|m| {
-                matches!(m, crate::viewer::MultimodalViewer::Spreadsheet(_))
-                    && editor.doc.path.as_deref().is_some_and(|p| {
-                        matches!(
-                            crate::viewer::MultimodalKind::from_path(p),
-                            Some(
-                                crate::viewer::MultimodalKind::Csv
-                                    | crate::viewer::MultimodalKind::Tsv
-                            )
-                        )
-                    })
-            });
-        let cur_tabular_src = editor
-            .multimodal
-            .as_ref()
-            .is_some_and(|m| m.is_showing_source());
-        let language = if is_diff {
-            "Git 差异"
-        } else if let Some(mm) = &editor.multimodal {
-            mm.kind().label()
-        } else if editor.doc.encoding == crate::doc::Encoding::Binary {
-            "二进制文件"
-        } else {
-            editor.language.name()
-        };
+        // Language label on the right of the breadcrumb.
         ui.painter().text(
             Pos2::new(rect.right() - 14.0, rect.center().y),
             Align2::RIGHT_CENTER,
@@ -1797,6 +2065,14 @@ impl KestrelApp {
 
         if open_symbols {
             self.open_palette(PaletteMode::Symbols);
+        }
+        if let Some(path) = reveal {
+            self.sidebar.visible = true;
+            self.sidebar.mode = SidebarMode::Explorer;
+            self.reveal_in_tree(&path);
+            if path.is_dir() {
+                self.workspace.tree.expand(&path);
+            }
         }
     }
 
@@ -1921,22 +2197,23 @@ impl KestrelApp {
                 });
 
                 let sep_resp = ui.interact(
-                    sep_rect,
+                    sep_rect.expand2(Vec2::new(0.5, 0.0)),
                     ui.scope_id().with(("md_split_sep", pane_tag, tab_idx)),
                     Sense::click_and_drag(),
                 );
                 let sep_dragging = sep_resp.dragged();
-                if sep_resp.hovered() || sep_resp.dragged() {
+                if sep_resp.hovered() || sep_dragging {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                 }
+                let sep_fade = widgets::hover_fade(
+                    ui,
+                    ("md_split_sep_hover", pane_tag, tab_idx),
+                    sep_resp.hovered() || sep_dragging,
+                );
                 ui.painter().rect_filled(
                     sep_rect,
                     0.0,
-                    if sep_resp.hovered() || sep_resp.dragged() {
-                        style.theme.accent
-                    } else {
-                        style.theme.border_strong
-                    },
+                    widgets::blend(style.theme.border_strong, style.theme.accent, sep_fade),
                 );
                 if sep_dragging
                     && let Some(pos) = sep_resp.interact_pointer_pos()
@@ -2063,305 +2340,417 @@ impl KestrelApp {
             ],
             Stroke::new(1.0, theme.border),
         );
-
-        // Paint the right cluster first: Painter::text lays the galley out once and
-        // returns its rect, so the position comes from the paint call instead of a
-        // separate measurement layout. Its left edge then bounds the left cluster,
-        // which keeps the two from overlapping on narrow windows.
         let center_y = rect.center().y;
-        let mut rx = rect.right() - 12.0;
-        let item = |ui: &Ui, rx: &mut f32, text: &str, color: Color32, font: FontId| -> Rect {
-            let painted = ui.painter().text(
-                Pos2::new(*rx, center_y),
-                Align2::RIGHT_CENTER,
-                text,
-                font,
-                color,
-            );
-            *rx -= painted.width();
-            let slot = Rect::from_min_size(
-                Pos2::new(*rx, center_y - 8.0),
-                Vec2::new(painted.width(), 16.0),
-            );
-            *rx -= 16.0;
-            slot
-        };
-        let mut zoom_rect = None;
+
+        // Right cluster first: every entry is measured once, then painted with
+        // its hover plate underneath. Its left edge bounds the left cluster so
+        // the two can never overlap on narrow windows.
+        let mut right: Vec<StatusSegment> = Vec::new();
         if (self.settings.ui_zoom - 1.0).abs() > 0.01 {
-            let zoom = self.status_cache.zoom(self.settings.ui_zoom);
-            zoom_rect = Some(item(ui, &mut rx, zoom, theme.accent, style.small()));
+            right.push(StatusSegment {
+                text: self.status_cache.zoom(self.settings.ui_zoom).to_owned(),
+                color: theme.accent,
+                font: style.small(),
+                action: Some(StatusAction::Zoom),
+                tip: "点击重置界面缩放为 100% (Ctrl+0)",
+            });
         }
-        let mut language_rect = None;
-        let mut active_language = None;
-        let mut pos_rect = None;
         if let Some(editor) = self.tabs.get(self.active) {
             if let Some(mm) = &editor.multimodal
                 && !mm.is_showing_source()
             {
-                let size = self.status_cache.file_size(
-                    editor.id,
-                    editor.doc.version,
-                    editor.doc.path.as_deref(),
-                );
-                item(ui, &mut rx, mm.kind().label(), theme.text_dim, style.small());
+                let size = self
+                    .status_cache
+                    .file_size(editor.id, editor.doc.version, editor.doc.path.as_deref())
+                    .to_owned();
+                right.push(StatusSegment {
+                    text: mm.kind().label().to_string(),
+                    color: theme.text_dim,
+                    font: style.small(),
+                    action: None,
+                    tip: "",
+                });
                 if !size.is_empty() {
-                    item(ui, &mut rx, size, theme.text_faint, style.small());
+                    right.push(StatusSegment {
+                        text: size,
+                        color: theme.text_faint,
+                        font: style.small(),
+                        action: None,
+                        tip: "",
+                    });
                 }
             } else if editor.doc.encoding == crate::doc::Encoding::Binary {
-                let size = self.status_cache.file_size(
-                    editor.id,
-                    editor.doc.version,
-                    editor.doc.path.as_deref(),
-                );
-                item(
-                    ui,
-                    &mut rx,
-                    "二进制文件 (不可读取)",
-                    theme.warning,
-                    style.small(),
-                );
+                let size = self
+                    .status_cache
+                    .file_size(editor.id, editor.doc.version, editor.doc.path.as_deref())
+                    .to_owned();
+                right.push(StatusSegment {
+                    text: "二进制文件 (不可读取)".to_string(),
+                    color: theme.warning,
+                    font: style.small(),
+                    action: None,
+                    tip: "",
+                });
                 if !size.is_empty() {
-                    item(ui, &mut rx, size, theme.text_faint, style.small());
+                    right.push(StatusSegment {
+                        text: size,
+                        color: theme.text_faint,
+                        font: style.small(),
+                        action: None,
+                        tip: "",
+                    });
                 }
             } else if editor.diff.is_some() {
-                item(ui, &mut rx, "Git 差异", theme.text_dim, style.small());
+                right.push(StatusSegment {
+                    text: "Git 差异".to_string(),
+                    color: theme.text_dim,
+                    font: style.small(),
+                    action: None,
+                    tip: "",
+                });
             } else {
-                language_rect = Some(item(ui, &mut rx, editor.language.name(), theme.text_dim, style.small()));
-                active_language = Some(editor.language);
-                item(
-                    ui,
-                    &mut rx,
-                    editor.doc.eol.as_str(),
-                    theme.text_faint,
-                    style.small(),
-                );
-                item(
-                    ui,
-                    &mut rx,
-                    editor.doc.encoding.as_str(),
-                    theme.text_faint,
-                    style.small(),
-                );
-                let indent = self.status_cache.indent(self.settings.tab_size, self.settings.insert_spaces);
-                item(ui, &mut rx, indent, theme.text_faint, style.small());
+                right.push(StatusSegment {
+                    text: editor.language.name().to_string(),
+                    color: theme.text_dim,
+                    font: style.small(),
+                    action: Some(StatusAction::Language),
+                    tip: "点击切换语言模式",
+                });
+                right.push(StatusSegment {
+                    text: editor.doc.eol.as_str().to_string(),
+                    color: theme.text_faint,
+                    font: style.small(),
+                    action: Some(StatusAction::Eol),
+                    tip: "点击切换行尾 (LF / CRLF)",
+                });
+                right.push(StatusSegment {
+                    text: editor.doc.encoding.as_str().to_string(),
+                    color: theme.text_faint,
+                    font: style.small(),
+                    action: Some(StatusAction::Encoding),
+                    tip: "点击选择保存编码",
+                });
+                let indent = self
+                    .status_cache
+                    .indent(self.settings.tab_size, self.settings.insert_spaces)
+                    .to_owned();
+                right.push(StatusSegment {
+                    text: indent,
+                    color: theme.text_faint,
+                    font: style.small(),
+                    action: Some(StatusAction::Indent),
+                    tip: "点击切换缩进：空格 / 制表符",
+                });
                 let (line, col) = editor.doc.char_to_line_col(editor.caret);
                 let cursors = editor.extra_cursors.len() + 1;
                 let position = self
                     .status_cache
-                    .cursor(editor.doc.version, line, col, cursors);
-                pos_rect = Some(item(ui, &mut rx, position, theme.text_dim, style.small()));
+                    .cursor(editor.doc.version, line, col, cursors)
+                    .to_owned();
+                right.push(StatusSegment {
+                    text: position,
+                    color: theme.text_dim,
+                    font: style.small(),
+                    action: Some(StatusAction::Cursor),
+                    tip: "转到行 (Ctrl+G)",
+                });
             }
         }
-        let mut clicked_plugin = None;
         for (index, status) in self.plugins.status_items().iter().enumerate() {
-            let slot = item(ui, &mut rx, &status.text, theme.text_dim, style.small());
-            if status.command.is_some()
-                && ui
-                    .interact(
-                        slot.expand2(Vec2::new(4.0, 4.0)),
-                        ui.scope_id().with(("status_plugin", index)),
-                        Sense::click(),
-                    )
-                    .clicked()
-            {
-                clicked_plugin = Some(index);
-            }
-        }
-        if let Some(index) = clicked_plugin
-            && let Some(command) = self
-                .plugins
-                .status_items()
-                .get(index)
-                .and_then(|status| status.command.clone())
-            && let Some(command_index) = self.plugins.command_index_of_id(&command)
-        {
-            self.run_plugin_command(command_index);
+            right.push(StatusSegment {
+                text: status.text.clone(),
+                color: theme.text_dim,
+                font: style.small(),
+                action: status.command.as_ref().map(|_| StatusAction::Plugin(index)),
+                tip: "",
+            });
         }
 
-        if let Some(z_rect) = zoom_rect
-            && ui
-                .interact(
-                    z_rect.expand2(Vec2::new(4.0, 4.0)),
-                    ui.scope_id().with("status_zoom_reset"),
-                    Sense::click(),
-                )
-                .on_hover_text("点击重置界面缩放为 100% (Ctrl+0)")
-                .clicked()
-        {
-            let ctx = ui.ctx().clone();
-            self.set_ui_zoom(1.0, &ctx);
-        }
-        if let Some(p_rect) = pos_rect
-            && ui
-                .interact(
-                    p_rect.expand2(Vec2::new(4.0, 4.0)),
-                    ui.scope_id().with("status_goto_line"),
-                    Sense::click(),
-                )
-                .on_hover_text("转到行 (Ctrl+G)")
-                .clicked()
-        {
-            self.open_palette(PaletteMode::GotoLine);
-        }
-        if let Some(lang_rect) = language_rect
-            && let Some(language) = active_language
-        {
-            let resp = ui.interact(
-                lang_rect.expand2(Vec2::new(4.0, 4.0)),
-                ui.scope_id().with("status_language"),
-                Sense::click(),
-            );
-            if resp.hovered() {
-                ui.painter().rect_filled(
-                    lang_rect.expand2(Vec2::new(4.0, 3.0)),
-                    CornerRadius::same(4),
-                    theme.hover,
+        let mut rx = rect.right() - 12.0;
+        let mut right_hits: Vec<(StatusAction, egui::Response)> = Vec::new();
+        // The encoding popup must be shown every frame while it is open; only
+        // the toggle decision comes from the click on the segment.
+        let mut encoding_response: Option<egui::Response> = None;
+        for (index, segment) in right.into_iter().enumerate() {
+            let galley = ui.ctx().fonts_mut(|fonts| {
+                fonts.layout_job(LayoutJob::simple_singleline(
+                    segment.text,
+                    segment.font,
+                    segment.color,
+                ))
+            });
+            let width = galley.rect.width();
+            let pos = Pos2::new(rx - width, center_y - galley.rect.height() * 0.5);
+            if let Some(action) = segment.action {
+                let hit = Rect::from_min_max(
+                    Pos2::new(rx - width - 6.0, rect.top() + 3.0),
+                    Pos2::new(rx + 6.0, rect.bottom() - 3.0),
                 );
-                ui.painter().text(
-                    Pos2::new(lang_rect.left(), center_y),
-                    Align2::LEFT_CENTER,
-                    language.name(),
-                    style.small(),
-                    theme.text,
+                let resp = ui.interact(
+                    hit,
+                    ui.scope_id().with(("status_seg", index)),
+                    Sense::click(),
                 );
+                let fade = widgets::hover_fade(ui, ("status_seg_hover", index), resp.hovered());
+                if fade > 0.001 {
+                    ui.painter().rect_filled(
+                        hit,
+                        CornerRadius::same(4),
+                        widgets::blend(theme.status_bg, theme.hover, fade),
+                    );
+                }
+                let resp = if segment.tip.is_empty() {
+                    resp
+                } else {
+                    resp.on_hover_text(segment.tip)
+                };
+                ui.painter().galley(pos, galley, segment.color);
+                if matches!(action, StatusAction::Encoding) {
+                    encoding_response = Some(resp.clone());
+                }
+                right_hits.push((action, resp));
+            } else {
+                ui.painter().galley(pos, galley, segment.color);
             }
-            if resp.on_hover_text("点击切换语言模式").clicked() {
-                self.open_palette(PaletteMode::Language);
-                self.palette.focus = true;
-            }
+            rx -= width + 16.0;
         }
 
         let left_limit = rx.max(rect.left() + 96.0);
         let mut x = rect.left() + 10.0;
-        // Left cluster: ellipsize keeps long branch names and folder labels from
-        // running under the right cluster on narrow windows.
-        let text = |ui: &mut Ui, x: &mut f32, s: &str, color: Color32, font: FontId| -> Rect {
-            let avail = (left_limit - *x - 6.0).max(0.0);
-            let origin = Pos2::new(*x, center_y - 9.0);
-            if avail < 12.0 {
-                return Rect::from_min_size(origin, Vec2::ZERO);
-            }
-            let (galley, clipped) = widgets::ellipsize(ui, s, font, color, avail);
-            let width = galley.rect.width();
-            ui.painter()
-                .galley(Pos2::new(*x, center_y - galley.rect.height() * 0.5), galley, color);
-            let r = Rect::from_min_size(origin, Vec2::new(width, 18.0));
-            let _ = clipped;
-            *x += width;
-            r
-        };
+        let mut left_hits: Vec<(StatusAction, egui::Response)> = Vec::new();
 
-        // 1. Git Branch indicator (clickable to switch branch)
+        // Git branch: click opens the branch switcher.
         if self.git.snapshot.is_repo && !self.git.snapshot.branch.is_empty() {
-            let icon_r = Rect::from_center_size(Pos2::new(x + 7.0, center_y), Vec2::splat(13.0));
-            icons::paint(ui.painter(), icon_r, Icon::GitBranch, theme.accent, 1.2);
-            x += 16.0;
             let (label, counts) = self.status_cache.branch(
                 &self.git.snapshot.branch,
                 !self.git.snapshot.changes.is_empty(),
                 self.git.snapshot.ahead,
                 self.git.snapshot.behind,
             );
-            let br_rect = text(ui, &mut x, label, theme.text, style.small());
-            let mut hit = Rect::from_min_max(icon_r.min, br_rect.max);
-            if !counts.is_empty() {
+            let label = label.to_owned();
+            let counts = counts.to_owned();
+            let start_x = x;
+            let icon_rect =
+                Rect::from_center_size(Pos2::new(x + 7.0, center_y), Vec2::splat(13.0));
+            x += 16.0;
+            let avail = (left_limit - x - 6.0).max(0.0);
+            let (label_galley, label_cut) =
+                widgets::ellipsize(ui, &label, style.small(), theme.text, avail);
+            let label_width = label_galley.rect.width();
+            let label_pos = Pos2::new(x, center_y - label_galley.rect.height() * 0.5);
+            x += label_width;
+            let mut hit = Rect::from_min_max(
+                Pos2::new(start_x - 2.0, rect.top() + 3.0),
+                Pos2::new(x + 2.0, rect.bottom() - 3.0),
+            );
+            let counts_galley = if counts.is_empty() {
+                None
+            } else {
                 x += 6.0;
-                let counts_rect = text(ui, &mut x, counts, theme.text_faint, style.tiny());
-                hit = hit.union(counts_rect);
-            }
-            let hit = hit.expand2(Vec2::new(4.0, 2.0));
+                let galley = ui.ctx().fonts_mut(|fonts| {
+                    fonts.layout_job(LayoutJob::simple_singleline(
+                        counts.clone(),
+                        style.tiny(),
+                        theme.text_faint,
+                    ))
+                });
+                let pos = Pos2::new(x, center_y - galley.rect.height() * 0.5);
+                x += galley.rect.width();
+                hit.max.x = x + 2.0;
+                Some((pos, galley))
+            };
             let resp = ui.interact(hit, ui.scope_id().with("status_git_branch"), Sense::click());
-            if resp.on_hover_text("点击切换 Git 分支").clicked() {
-                self.open_palette(PaletteMode::Branches);
+            let fade = widgets::hover_fade(ui, "status_git_branch_hover", resp.hovered());
+            if fade > 0.001 {
+                ui.painter().rect_filled(
+                    hit,
+                    CornerRadius::same(4),
+                    widgets::blend(theme.status_bg, theme.hover, fade),
+                );
             }
+            icons::paint(ui.painter(), icon_rect, Icon::GitBranch, theme.accent, 1.2);
+            ui.painter().galley(label_pos, label_galley, theme.text);
+            if let Some((pos, galley)) = counts_galley {
+                ui.painter().galley(pos, galley, theme.text_faint);
+            }
+            let resp = if label_cut {
+                resp.on_hover_text(format!("{label}\n点击切换 Git 分支"))
+            } else {
+                resp.on_hover_text("点击切换 Git 分支")
+            };
+            left_hits.push((StatusAction::Branch, resp));
             x += 14.0;
         }
 
-        // 2. Folder name
-        if let Some(folder) = self.workspace.root.as_ref().and_then(|p| p.file_name()) {
-            text(
-                ui,
-                &mut x,
-                &folder.to_string_lossy(),
-                theme.text_dim,
-                style.small(),
-            );
+        // Workspace folder label.
+        let folder = self
+            .workspace
+            .root
+            .as_ref()
+            .and_then(|path| path.file_name())
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| "没有打开文件夹".to_string());
+        let folder_color = if self.workspace.root.is_some() {
+            theme.text_dim
         } else {
-            text(
-                ui,
-                &mut x,
-                "没有打开文件夹",
-                theme.text_faint,
-                style.small(),
+            theme.text_faint
+        };
+        let avail = (left_limit - x - 6.0).max(0.0);
+        if avail > 12.0 {
+            let (galley, cut) =
+                widgets::ellipsize(ui, &folder, style.small(), folder_color, avail);
+            let width = galley.rect.width();
+            ui.painter().galley(
+                Pos2::new(x, center_y - galley.rect.height() * 0.5),
+                galley,
+                folder_color,
             );
+            if cut {
+                let hit =
+                    Rect::from_min_size(Pos2::new(x, center_y - 9.0), Vec2::new(width, 18.0));
+                ui.interact(hit, ui.scope_id().with("status_folder"), Sense::hover())
+                    .on_hover_text(&folder);
+            }
+            x += width;
         }
         x += 14.0;
 
-        // 3. Error & Warning Diagnostic Counters (clickable to open Problems panel)
-        let diag_hit = {
+        // Diagnostics: click opens the problems panel.
+        {
             let (err_count, warn_count, err_text, warn_text) =
                 self.status_cache.diagnostics(&self.tabs);
-            let diag_start_x = x;
-            let er_r = Rect::from_center_size(Pos2::new(x + 6.0, center_y), Vec2::splat(12.0));
-            icons::paint(
-                ui.painter(),
-                er_r,
-                Icon::Error,
+            let err_text = err_text.to_owned();
+            let warn_text = warn_text.to_owned();
+            let start_x = x;
+            let error_icon =
+                Rect::from_center_size(Pos2::new(x + 6.0, center_y), Vec2::splat(12.0));
+            x += 14.0;
+            let err_galley = ui.ctx().fonts_mut(|fonts| {
+                fonts.layout_job(LayoutJob::simple_singleline(
+                    err_text,
+                    style.tiny(),
+                    theme.text_faint,
+                ))
+            });
+            let err_pos = Pos2::new(x, center_y - err_galley.rect.height() * 0.5);
+            x += err_galley.rect.width() + 8.0;
+            let warn_icon =
+                Rect::from_center_size(Pos2::new(x + 6.0, center_y), Vec2::splat(12.0));
+            x += 14.0;
+            let warn_galley = ui.ctx().fonts_mut(|fonts| {
+                fonts.layout_job(LayoutJob::simple_singleline(
+                    warn_text,
+                    style.tiny(),
+                    theme.text_faint,
+                ))
+            });
+            let warn_pos = Pos2::new(x, center_y - warn_galley.rect.height() * 0.5);
+            x += warn_galley.rect.width();
+            let hit = Rect::from_min_max(
+                Pos2::new(start_x - 2.0, rect.top() + 3.0),
+                Pos2::new(x + 2.0, rect.bottom() - 3.0),
+            );
+            let resp = ui.interact(hit, ui.scope_id().with("status_problems"), Sense::click());
+            let fade = widgets::hover_fade(ui, "status_problems_hover", resp.hovered());
+            if fade > 0.001 {
+                ui.painter().rect_filled(
+                    hit,
+                    CornerRadius::same(4),
+                    widgets::blend(theme.status_bg, theme.hover, fade),
+                );
+            }
+            let (err_color, warn_color) = (
                 if err_count > 0 {
                     theme.error
                 } else {
                     theme.text_faint
                 },
-                1.2,
-            );
-            x += 14.0;
-            let err_color = if err_count > 0 {
-                theme.error
-            } else {
-                theme.text_faint
-            };
-            text(ui, &mut x, err_text, err_color, style.tiny());
-            x += 8.0;
-            let wn_r = Rect::from_center_size(Pos2::new(x + 6.0, center_y), Vec2::splat(12.0));
-            icons::paint(
-                ui.painter(),
-                wn_r,
-                Icon::Warning,
                 if warn_count > 0 {
                     theme.warning
                 } else {
                     theme.text_faint
                 },
-                1.2,
             );
+            icons::paint(ui.painter(), error_icon, Icon::Error, err_color, 1.2);
+            ui.painter().galley(err_pos, err_galley, err_color);
+            icons::paint(ui.painter(), warn_icon, Icon::Warning, warn_color, 1.2);
+            ui.painter().galley(warn_pos, warn_galley, warn_color);
+            let resp = resp.on_hover_text("显示问题面板 (Ctrl+Shift+M)");
+            left_hits.push((StatusAction::Problems, resp));
             x += 14.0;
-            let warn_color = if warn_count > 0 {
-                theme.warning
-            } else {
-                theme.text_faint
-            };
-            text(ui, &mut x, warn_text, warn_color, style.tiny());
-            Rect::from_min_max(
-                Pos2::new(diag_start_x - 2.0, rect.top()),
-                Pos2::new(x + 2.0, rect.bottom()),
-            )
-        };
-        if ui
-            .interact(diag_hit, ui.scope_id().with("status_problems"), Sense::click())
-            .on_hover_text("显示问题面板 (Ctrl+Shift+M)")
-            .clicked()
-        {
-            self.bottom.visible = true;
-            self.bottom.tab = BottomTab::Problems;
         }
-        x += 14.0;
 
         if let Some(editor) = self.tabs.get(self.active)
             && editor.is_dirty()
         {
-            text(ui, &mut x, "● 未保存", theme.accent, style.small());
+            let avail = (left_limit - x).max(0.0);
+            let (galley, _) =
+                widgets::ellipsize(ui, "● 未保存", style.small(), theme.accent, avail);
+            ui.painter().galley(
+                Pos2::new(x, center_y - galley.rect.height() * 0.5),
+                galley,
+                theme.accent,
+            );
+        }
+
+        let ctx = ui.ctx().clone();
+        for (action, response) in right_hits {
+            if !response.clicked() {
+                continue;
+            }
+            match action {
+                StatusAction::Zoom => self.set_ui_zoom(1.0, &ctx),
+                StatusAction::Language => {
+                    self.open_palette(PaletteMode::Language);
+                    self.palette.focus = true;
+                }
+                StatusAction::Cursor => self.open_palette(PaletteMode::GotoLine),
+                StatusAction::Indent => self.dispatch(Command::ToggleIndent, &ctx),
+                StatusAction::Eol => self.dispatch(Command::ToggleEol, &ctx),
+                StatusAction::Encoding => {}
+                StatusAction::Plugin(index) => {
+                    if let Some(command) = self
+                        .plugins
+                        .status_items()
+                        .get(index)
+                        .and_then(|status| status.command.clone())
+                        && let Some(command_index) = self.plugins.command_index_of_id(&command)
+                    {
+                        self.run_plugin_command(command_index);
+                    }
+                }
+                StatusAction::Branch | StatusAction::Problems => {}
+            }
+        }
+        if let Some(response) = encoding_response {
+            let current = self.tabs.get(self.active).map(|editor| editor.doc.encoding);
+            egui::Popup::menu(&response).show(|ui| {
+                for encoding in ENCODINGS {
+                    if ui
+                        .selectable_label(current == Some(*encoding), encoding.as_str())
+                        .clicked()
+                    {
+                        self.set_active_encoding(*encoding);
+                        ui.close();
+                    }
+                }
+            });
+        }
+        for (action, response) in left_hits {
+            if !response.clicked() {
+                continue;
+            }
+            match action {
+                StatusAction::Branch => self.open_palette(PaletteMode::Branches),
+                StatusAction::Problems => {
+                    self.bottom.visible = true;
+                    self.bottom.tab = BottomTab::Problems;
+                }
+                _ => {}
+            }
         }
     }
+
 
     fn welcome_ui(&mut self, ui: &mut Ui, style: &UiStyle) {
         let theme = style.theme;
@@ -2473,69 +2862,208 @@ impl KestrelApp {
             self.new_untitled();
         }
 
-        let recents: Vec<String> = self
+        let projects: Vec<String> = self
             .settings
             .recent_folders
             .iter()
-            .filter(|f| std::path::Path::new(f).is_dir())
+            .filter(|folder| std::path::Path::new(folder).is_dir())
             .take(6)
             .cloned()
             .collect();
-        // Only spend rows the window can actually show; 760x480 must not overlap the footer.
-        let room = ((bottom_limit - (y + 48.0 + 22.0)) / 28.0).floor().max(0.0) as usize;
-        let recents = &recents[..recents.len().min(room)];
-        if !recents.is_empty() {
-            y += 48.0;
-            ui.painter().text(
-                Pos2::new(center_x, y),
-                Align2::CENTER_CENTER,
-                "最近打开的项目",
-                style.tiny(),
-                theme.text_faint,
-            );
-            y += 22.0;
-            for recent in recents {
-                let name = std::path::Path::new(recent)
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| recent.clone());
-                let row = Rect::from_center_size(Pos2::new(center_x, y), Vec2::new(330.0, 26.0));
-                let resp = widgets::paint_row(ui, row, &theme, widgets::RowState::idle());
-                icons::paint_path_icon(
-                    ui.painter(),
-                    Rect::from_center_size(
-                        Pos2::new(row.left() + 14.0, row.center().y),
-                        Vec2::splat(14.0),
-                    ),
-                    std::path::Path::new(recent),
-                    true,
-                    false,
-                    theme.accent,
-                    theme.kind.is_dark(),
-                );
-                let (name_galley, name_cut) =
-                    widgets::ellipsize(ui, &name, style.small(), theme.text, 200.0);
-                ui.painter().galley(
-                    Pos2::new(row.left() + 28.0, row.center().y - name_galley.rect.height() * 0.5),
-                    name_galley,
-                    theme.text,
-                );
-                if name_cut {
-                    resp.clone().on_hover_text(&name);
-                }
-                let path_label = elide_middle(recent, 42);
-                ui.painter().with_clip_rect(row).text(
-                    Pos2::new(row.right() - 10.0, row.center().y),
-                    Align2::RIGHT_CENTER,
-                    path_label,
+        let files: Vec<PathBuf> = self
+            .recent_files
+            .iter()
+            .filter(|path| path.is_file())
+            .take(12)
+            .cloned()
+            .collect();
+        if !projects.is_empty() || !files.is_empty() {
+            // Row budget: the footer stays clear on 760x480, and a cramped
+            // window still gets the recent-files list instead of nothing.
+            let mut header_gap = 48.0;
+            if bottom_limit - (y + header_gap) < 48.0 {
+                header_gap = 24.0;
+            }
+            let start_y = y + header_gap;
+            let rows_single = ((bottom_limit - start_y - 22.0) / 28.0).floor().max(0.0) as usize;
+            let rows_pair = ((bottom_limit - start_y - 12.0 - 44.0) / 56.0)
+                .floor()
+                .max(0.0) as usize;
+            let two_columns = !projects.is_empty()
+                && !files.is_empty()
+                && rect.width() >= crate::theme::SP6 * 2.0 + 2.0 * 330.0 + crate::theme::SP5;
+            let (project_rows, file_rows) = if two_columns
+                || projects.is_empty()
+                || files.is_empty()
+            {
+                (
+                    rows_single.min(projects.len()),
+                    rows_single.min(files.len()),
+                )
+            } else if rows_pair > 0 {
+                (
+                    rows_pair.min(projects.len()),
+                    rows_pair.min(files.len()),
+                )
+            } else {
+                // One section only: the new recent-files list wins the space.
+                (0, rows_single.min(files.len()))
+            };
+            let column = if two_columns {
+                ((rect.width() - crate::theme::SP6 * 2.0 - crate::theme::SP5) * 0.5).min(330.0)
+            } else {
+                330.0
+            };
+            let gap = crate::theme::SP5;
+            let (projects_x, files_x) = if two_columns {
+                (
+                    center_x - gap * 0.5 - column * 0.5,
+                    center_x + gap * 0.5 + column * 0.5,
+                )
+            } else {
+                (center_x, center_x)
+            };
+            let mut next_y = start_y;
+            if project_rows > 0 {
+                ui.painter().text(
+                    Pos2::new(projects_x, start_y),
+                    Align2::CENTER_CENTER,
+                    "最近打开的项目",
                     style.tiny(),
                     theme.text_faint,
                 );
-                if resp.clicked() {
-                    let path = PathBuf::from(recent);
-                    self.open_folder(path);
+                let mut row_y = start_y + 22.0;
+                for recent in projects.iter().take(project_rows) {
+                    let name = std::path::Path::new(recent)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| recent.clone());
+                    let row =
+                        Rect::from_center_size(Pos2::new(projects_x, row_y), Vec2::new(column, 26.0));
+                    let resp = widgets::paint_row(ui, row, &theme, widgets::RowState::idle());
+                    icons::paint_path_icon(
+                        ui.painter(),
+                        Rect::from_center_size(
+                            Pos2::new(row.left() + 14.0, row.center().y),
+                            Vec2::splat(14.0),
+                        ),
+                        std::path::Path::new(recent),
+                        true,
+                        false,
+                        theme.accent,
+                        theme.kind.is_dark(),
+                    );
+                    let (name_galley, name_cut) = widgets::ellipsize(
+                        ui,
+                        &name,
+                        style.small(),
+                        theme.text,
+                        (column - 130.0).max(40.0),
+                    );
+                    ui.painter().galley(
+                        Pos2::new(
+                            row.left() + 28.0,
+                            row.center().y - name_galley.rect.height() * 0.5,
+                        ),
+                        name_galley,
+                        theme.text,
+                    );
+                    if name_cut {
+                        resp.clone().on_hover_text(&name);
+                    }
+                    let path_label = elide_middle(recent, 42);
+                    ui.painter().with_clip_rect(row).text(
+                        Pos2::new(row.right() - 10.0, row.center().y),
+                        Align2::RIGHT_CENTER,
+                        path_label,
+                        style.tiny(),
+                        theme.text_faint,
+                    );
+                    if resp.clicked() {
+                        let path = PathBuf::from(recent);
+                        self.open_folder(path);
+                    }
+                    row_y += 28.0;
                 }
-                y += 28.0;
+                next_y = row_y;
+            }
+            if file_rows > 0 {
+                let section_y = if project_rows > 0 && !two_columns {
+                    next_y + 12.0
+                } else {
+                    start_y
+                };
+                ui.painter().text(
+                    Pos2::new(files_x, section_y),
+                    Align2::CENTER_CENTER,
+                    "最近打开的文件",
+                    style.tiny(),
+                    theme.text_faint,
+                );
+                let mut row_y = section_y + 22.0;
+                for path in files.iter().take(file_rows) {
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| path.to_string_lossy().to_string());
+                    let row =
+                        Rect::from_center_size(Pos2::new(files_x, row_y), Vec2::new(column, 26.0));
+                    let resp = widgets::paint_row(ui, row, &theme, widgets::RowState::idle());
+                    icons::paint_path_icon(
+                        ui.painter(),
+                        Rect::from_center_size(
+                            Pos2::new(row.left() + 14.0, row.center().y),
+                            Vec2::splat(14.0),
+                        ),
+                        path,
+                        false,
+                        false,
+                        theme.text_dim,
+                        theme.kind.is_dark(),
+                    );
+                    let (name_galley, name_cut) = widgets::ellipsize(
+                        ui,
+                        &name,
+                        style.small(),
+                        theme.text,
+                        (column - 130.0).max(40.0),
+                    );
+                    ui.painter().galley(
+                        Pos2::new(
+                            row.left() + 28.0,
+                            row.center().y - name_galley.rect.height() * 0.5,
+                        ),
+                        name_galley,
+                        theme.text,
+                    );
+                    let dir_label = path
+                        .parent()
+                        .map(|dir| {
+                            self.workspace
+                                .root
+                                .as_ref()
+                                .and_then(|root| dir.strip_prefix(root).ok())
+                                .filter(|rel| !rel.as_os_str().is_empty())
+                                .map(|rel| rel.to_string_lossy().to_string())
+                                .unwrap_or_else(|| dir.to_string_lossy().to_string())
+                        })
+                        .unwrap_or_default();
+                    ui.painter().with_clip_rect(row).text(
+                        Pos2::new(row.right() - 10.0, row.center().y),
+                        Align2::RIGHT_CENTER,
+                        elide_middle(&dir_label, 30),
+                        style.tiny(),
+                        theme.text_faint,
+                    );
+                    let resp = resp.on_hover_text(path.to_string_lossy().to_string());
+                    if name_cut {
+                        resp.clone().on_hover_text(&name);
+                    }
+                    if resp.clicked() {
+                        self.open_file(path.clone());
+                    }
+                    row_y += 28.0;
+                }
             }
         }
 
@@ -2775,11 +3303,199 @@ impl KestrelApp {
     }
 }
 
+
+impl KestrelApp {
+    /// Newest-first recent file list, capped at 12 entries (welcome page).
+    pub(crate) fn record_recent_file(&mut self, path: &std::path::Path) {
+        push_recent_file(&mut self.recent_files, path.to_path_buf());
+    }
+
+    /// Toggle the indent unit between spaces and tab characters.
+    pub(crate) fn toggle_indent(&mut self) {
+        self.settings.insert_spaces = !self.settings.insert_spaces;
+        self.settings.save();
+    }
+
+    /// Re-encode the buffer on the next save (text itself stays UTF-8 in memory).
+    fn set_active_encoding(&mut self, encoding: crate::doc::Encoding) {
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        if !tab_is_editable_text(tab) || tab.doc.encoding == encoding {
+            return;
+        }
+        tab.doc.encoding = encoding;
+        tab.doc.bom = encoding == crate::doc::Encoding::Utf8Bom;
+        if tab.doc.path.is_some() || tab.doc.len_chars() > 0 {
+            tab.doc.mark_dirty();
+        }
+        self.toast(
+            format!("保存时按 {} 写入", encoding.as_str()),
+            crate::app::ToastKind::Info,
+        );
+    }
+
+    /// First Esc clears the open palette query, the next one closes the overlay.
+    fn handle_palette_escape(&mut self, ctx: &egui::Context) {
+        if !self.palette.open || self.palette.query.is_empty() {
+            return;
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            self.palette.query.clear();
+            self.palette.selected = 0;
+            self.palette.needs_filter = true;
+        }
+    }
+
+    /// Clicking the search pill focuses an already open quick-open overlay
+    /// instead of resetting its query.
+    fn focus_or_open_quick_open(&mut self) {
+        if self.palette.open && self.palette.mode == PaletteMode::QuickOpen {
+            self.palette.focus = true;
+        } else {
+            self.open_palette(PaletteMode::QuickOpen);
+        }
+    }
+
+    /// Whether a menu entry can run right now; disabled entries paint grey.
+    fn command_enabled(&self, command: Command) -> bool {
+        let editor = self.tabs.get(self.active);
+        let text_editable = editor.is_some_and(tab_is_editable_text);
+        let markdown = editor.is_some_and(|tab| tab.language == crate::highlight::Language::Markdown);
+        match command {
+            Command::Save | Command::SaveAs | Command::FormatDocument => text_editable,
+            Command::SaveAll => self
+                .tabs
+                .iter()
+                .any(|tab| tab.is_dirty() && tab.diff.is_none()),
+            Command::CloseTab => editor.is_some(),
+            Command::CloseAllTabs => !self.tabs.is_empty(),
+            Command::ReloadFile => self.active_path().is_some(),
+            Command::Undo => editor.is_some_and(|tab| tab.doc.can_undo()),
+            Command::Redo => editor.is_some_and(|tab| tab.doc.can_redo()),
+            Command::Cut
+            | Command::Paste
+            | Command::ToggleComment
+            | Command::DuplicateLine
+            | Command::DeleteLine
+            | Command::MoveLineUp
+            | Command::MoveLineDown
+            | Command::Indent
+            | Command::Outdent
+            | Command::ToggleFold
+            | Command::FoldAll
+            | Command::UnfoldAll
+            | Command::TriggerSuggest
+            | Command::ToggleEol
+            | Command::ToggleWordWrap
+            | Command::SplitEditor
+            | Command::SetLanguage => text_editable,
+            Command::Copy
+            | Command::SelectAll
+            | Command::SelectNextOccurrence
+            | Command::SelectAllOccurrences
+            | Command::Find
+            | Command::Replace
+            | Command::FindNext
+            | Command::FindPrev
+            | Command::GotoLine
+            | Command::GotoDefinition
+            | Command::GotoSymbol => editor.is_some(),
+            Command::ToggleMarkdownPreview | Command::MarkdownPreviewSide => markdown,
+            Command::ZoomReset => (self.settings.ui_zoom - 1.0).abs() > 0.001,
+            Command::ThemeDark => self.settings.theme != "dark",
+            Command::ThemeLight => self.settings.theme != "light",
+            Command::NextTab | Command::PrevTab => self
+                .groups
+                .get(self.active_group)
+                .is_some_and(|group| group.tabs.len() > 1),
+            Command::CopyPath | Command::RevealInExplorer => self.active_path().is_some(),
+            Command::RefreshExplorer | Command::ShowGit => self.workspace.root.is_some(),
+            _ => true,
+        }
+    }
+}
+
+/// Text the editor may modify: no diff view, no binary buffer, not read-only.
+fn tab_is_editable_text(tab: &crate::editor::Editor) -> bool {
+    tab.diff.is_none()
+        && tab.doc.encoding != crate::doc::Encoding::Binary
+        && !tab.doc.readonly
+        && tab
+            .multimodal
+            .as_ref()
+            .is_none_or(|viewer| viewer.is_showing_source())
+}
+
+/// Newest-first recent file list; duplicates move to the front (capped at 12).
+fn push_recent_file(list: &mut Vec<PathBuf>, path: PathBuf) {
+    list.retain(|known| known != &path);
+    list.insert(0, path);
+    list.truncate(12);
+}
+
+/// Encodings the status bar can switch to; the next save converts the buffer.
+const ENCODINGS: &[crate::doc::Encoding] = &[
+    crate::doc::Encoding::Utf8,
+    crate::doc::Encoding::Utf8Bom,
+    crate::doc::Encoding::Utf16Le,
+    crate::doc::Encoding::Utf16Be,
+];
+
+/// Tab label as painted, including the preview suffix.
+fn tab_display_title(tab: &crate::editor::Editor) -> String {
+    let title = tab.title();
+    if tab.preview {
+        format!("{title} · 预览")
+    } else {
+        title
+    }
+}
+
+/// Measured tab width; the tab bar and its scroll bounds share it.
+fn tab_width(ui: &Ui, style: &UiStyle, tab: &crate::editor::Editor) -> f32 {
+    let title = tab_display_title(tab);
+    let text_width = ui.ctx().fonts_mut(|fonts| {
+        fonts
+            .layout_job(LayoutJob::simple_singleline(
+                title,
+                style.small(),
+                style.theme.text,
+            ))
+            .rect
+            .width()
+    });
+    (text_width + 52.0).clamp(116.0, 236.0)
+}
+
+/// One painted status-bar segment; `action` is `None` for plain text.
+struct StatusSegment {
+    text: String,
+    color: Color32,
+    font: FontId,
+    action: Option<StatusAction>,
+    tip: &'static str,
+}
+
+/// What clicking a status-bar segment does.
+enum StatusAction {
+    Zoom,
+    Language,
+    Cursor,
+    Indent,
+    Encoding,
+    Eol,
+    Branch,
+    Problems,
+    Plugin(usize),
+}
+
 enum TabAction {
     TogglePin(u64),
     Split(usize, u64),
     Close(usize, u64),
     CloseOthers(usize, u64),
+    CloseRight(usize, u64),
     CopyPath(u64),
 }
 
@@ -2956,12 +3672,16 @@ fn segmented_capsule<T: Copy + PartialEq>(
         );
         let active = *current == *val;
         let resp = ui.interact(seg_r, ui.scope_id().with((id_salt, *label)), Sense::click());
+        let fade = widgets::hover_fade(ui, (id_salt, *label, "capsule"), resp.hovered());
         if active {
             ui.painter()
                 .rect_filled(seg_r, CornerRadius::same(4), theme.accent);
-        } else if resp.hovered() {
-            ui.painter()
-                .rect_filled(seg_r, CornerRadius::same(4), theme.hover);
+        } else if fade > 0.001 {
+            ui.painter().rect_filled(
+                seg_r,
+                CornerRadius::same(4),
+                widgets::blend(theme.input_bg, theme.hover, fade),
+            );
         }
         ui.painter().text(
             seg_r.center(),
@@ -2996,7 +3716,12 @@ fn elide_middle(text: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{preview_y_for_source_line, source_line_for_preview_y};
+    use super::{
+        preview_y_for_source_line, push_recent_file, source_line_for_preview_y,
+        tab_is_editable_text,
+    };
+    use crate::commands::Command;
+    use std::path::PathBuf;
     use crate::markdown::MarkdownPreviewState;
 
     fn state() -> MarkdownPreviewState {
@@ -3027,5 +3752,61 @@ mod tests {
         assert!((y - 450.0).abs() < 1.0);
         let line = source_line_for_preview_y(&state, 450.0, 100.0, 14.0);
         assert!((line - 50.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn recent_files_stay_newest_first_deduped_and_capped() {
+        let mut list = Vec::new();
+        for index in 0..14 {
+            push_recent_file(&mut list, PathBuf::from(format!("file-{index}.rs")));
+        }
+        assert_eq!(list.len(), 12);
+        assert_eq!(list[0], PathBuf::from("file-13.rs"));
+        assert_eq!(list[11], PathBuf::from("file-2.rs"));
+        // Re-opening a known file moves it to the front instead of duplicating.
+        push_recent_file(&mut list, PathBuf::from("file-5.rs"));
+        assert_eq!(list.len(), 12);
+        assert_eq!(list[0], PathBuf::from("file-5.rs"));
+        assert_eq!(
+            list.iter()
+                .filter(|path| path.ends_with("file-5.rs"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn session_roundtrips_recent_files() {
+        let session = crate::settings::Session {
+            recent_files: vec!["D:/work/a.rs".to_string(), "D:/work/b.md".to_string()],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&session).unwrap();
+        let back: crate::settings::Session = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.recent_files, session.recent_files);
+    }
+
+    #[test]
+    fn document_settings_commands_are_registered() {
+        assert_eq!(Command::from_id("file.toggleEol"), Some(Command::ToggleEol));
+        assert_eq!(
+            Command::from_id("edit.toggleIndent"),
+            Some(Command::ToggleIndent)
+        );
+        assert_eq!(Command::ToggleEol.category(), "文件");
+        assert_eq!(Command::ToggleIndent.category(), "编辑");
+    }
+
+    #[test]
+    fn read_only_and_binary_tabs_are_not_editable_text() {
+        use crate::doc::{Document, Encoding};
+        use crate::editor::Editor;
+        let mut editor = Editor::new(Document::from_text("fn main() {}"), 1, 0);
+        assert!(tab_is_editable_text(&editor));
+        editor.doc.readonly = true;
+        assert!(!tab_is_editable_text(&editor));
+        editor.doc.readonly = false;
+        editor.doc.encoding = Encoding::Binary;
+        assert!(!tab_is_editable_text(&editor));
     }
 }

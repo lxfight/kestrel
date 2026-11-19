@@ -159,6 +159,35 @@ pub fn ellipsize(
     (layout(ui, &middle_elided(&chars, head, tail)), true)
 }
 
+/// Hover fade duration shared by the hand-painted chrome (title bar, tabs,
+/// status bar, breadcrumbs, split handles). Only paint colours read it, so
+/// layout never shifts while a control animates in or out.
+pub const HOVER_FADE: f32 = 0.12;
+
+/// 0..=1 hover progress for `hovered`, animated over [`HOVER_FADE`].
+///
+/// The id must be stable across frames (a control identity, not its rect), so
+/// the animation state stays bounded instead of growing with scrolling.
+pub fn hover_fade(
+    ui: &Ui,
+    id_salt: impl std::hash::Hash + std::fmt::Debug,
+    hovered: bool,
+) -> f32 {
+    ui.ctx()
+        .animate_bool_with_time(ui.scope_id().with(id_salt), hovered, HOVER_FADE)
+}
+
+/// Linear blend between two colours; `t` is clamped to 0..=1.
+pub fn blend(from: Color32, to: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t).round() as u8;
+    Color32::from_rgb(
+        mix(from.r(), to.r()),
+        mix(from.g(), to.g()),
+        mix(from.b(), to.b()),
+    )
+}
+
 fn middle_elided(chars: &[char], head: usize, tail: usize) -> String {
     let mut out = String::with_capacity(chars.len() + 1);
     out.extend(chars.iter().take(head));

@@ -79,6 +79,7 @@ pub enum Command {
     ToggleStickyScroll,
     ToggleWhitespace,
     ToggleIndentGuides,
+    ToggleIndent,
     ZoomIn,
     ZoomOut,
     ZoomReset,
@@ -393,6 +394,7 @@ impl Command {
             Command::ToggleStickyScroll => "view.toggleStickyScroll",
             Command::ToggleWhitespace => "view.toggleWhitespace",
             Command::ToggleIndentGuides => "view.toggleIndentGuides",
+            Command::ToggleIndent => "edit.toggleIndent",
             Command::ZoomIn => "view.zoomIn",
             Command::ZoomOut => "view.zoomOut",
             Command::ZoomReset => "view.zoomReset",
@@ -491,6 +493,7 @@ impl Command {
         Command::ToggleStickyScroll,
         Command::ToggleWhitespace,
         Command::ToggleIndentGuides,
+        Command::ToggleIndent,
         Command::ZoomIn,
         Command::ZoomOut,
         Command::ZoomReset,
@@ -584,6 +587,7 @@ impl Command {
             Command::ToggleStickyScroll => "切换粘性滚动 (Sticky Scroll)",
             Command::ToggleWhitespace => "切换空白字符显示",
             Command::ToggleIndentGuides => "切换缩进参考线",
+            Command::ToggleIndent => "切换缩进（空格 / 制表符）",
             Command::ZoomIn => "放大界面",
             Command::ZoomOut => "缩小界面",
             Command::ZoomReset => "重置界面缩放",
@@ -708,7 +712,8 @@ impl Command {
             | Command::TrimTrailingWhitespace
             | Command::ToggleAutoClose
             | Command::JumpBack
-            | Command::JumpForward => "编辑",
+            | Command::JumpForward
+            | Command::ToggleIndent => "编辑",
             Command::CopyPath | Command::RevealInExplorer | Command::RefreshExplorer => "工作区",
             Command::About | Command::Shortcuts => "帮助",
             Command::Plugins => "插件",
