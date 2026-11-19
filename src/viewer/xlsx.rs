@@ -13,6 +13,13 @@ use crate::viewer::ViewerEvent;
 use crate::viewer::image_view::format_bytes;
 use crate::viewer::zip_util::ZipArchive;
 
+/// Hard row cap per sheet, so a huge workbook cannot allocate millions of cells.
+pub const MAX_SHEET_ROWS: usize = 5000;
+/// Hard cap on columns kept per sheet (Excel allows 16384).
+pub const MAX_SHEET_COLS: usize = 512;
+/// Hard cap on parsed worksheets per workbook.
+pub const MAX_SHEETS: usize = 20;
+
 #[derive(Clone, Debug)]
 pub struct SheetData {
     pub name: String,
@@ -37,6 +44,8 @@ pub struct SpreadsheetViewer {
     selected: Option<(usize, usize)>,
     search: String,
     error: Option<String>,
+    /// Human-readable truncation notice when the parser hit a cap.
+    truncated: Option<String>,
 }
 
 impl SpreadsheetViewer {
@@ -47,7 +56,7 @@ impl SpreadsheetViewer {
             Err(err) => return Self::with_error(path, file_bytes, false, format!("读取失败: {err}")),
         };
         match parse_xlsx_bytes(&bytes) {
-            Ok(sheets) => Self {
+            Ok((sheets, truncated)) => Self {
                 path: path.to_path_buf(),
                 file_bytes,
                 is_text_tabular: false,
@@ -57,6 +66,7 @@ impl SpreadsheetViewer {
                 selected: None,
                 search: String::new(),
                 error: None,
+                truncated,
             },
             Err(err) => Self::with_error(path, file_bytes, false, err),
         }
@@ -84,6 +94,7 @@ impl SpreadsheetViewer {
             selected: None,
             search: String::new(),
             error: None,
+            truncated: None,
         }
     }
 
@@ -108,6 +119,7 @@ impl SpreadsheetViewer {
             selected: None,
             search: String::new(),
             error: Some(error),
+            truncated: None,
         }
     }
 
@@ -135,12 +147,26 @@ impl SpreadsheetViewer {
             .get(self.active_sheet)
             .map(|s| format!("{} 行 × {} 列", s.rows.len(), s.col_count))
             .unwrap_or_default();
+        let truncation = self
+            .truncated
+            .as_ref()
+            .map(|note| format!(" · {note}"))
+            .unwrap_or_default();
         ui.painter().text(
             Pos2::new(bar_rect.left() + 14.0, bar_rect.center().y),
             Align2::LEFT_CENTER,
-            format!("表格视图 · {} · {}", sheet_info, format_bytes(self.file_bytes)),
+            format!(
+                "表格视图 · {} · {}{}",
+                sheet_info,
+                format_bytes(self.file_bytes),
+                truncation
+            ),
             style.tiny(),
-            theme.text_dim,
+            if self.truncated.is_some() {
+                theme.warning
+            } else {
+                theme.text_dim
+            },
         );
 
         let mut rx = bar_rect.right() - 10.0;
@@ -508,7 +534,7 @@ fn parse_cell_ref(r: &str) -> Option<(usize, usize)> {
     Some((row.saturating_sub(1), col.saturating_sub(1)))
 }
 
-fn parse_xlsx_bytes(bytes: &[u8]) -> Result<Vec<SheetData>, String> {
+fn parse_xlsx_bytes(bytes: &[u8]) -> Result<(Vec<SheetData>, Option<String>), String> {
     let archive = ZipArchive::from_bytes(bytes.to_vec())?;
 
     // Shared strings
@@ -576,7 +602,14 @@ fn parse_xlsx_bytes(bytes: &[u8]) -> Result<Vec<SheetData>, String> {
     }
 
     let mut sheets = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
+    let mut rows_truncated = false;
+    let mut cols_truncated = false;
     for (name, path) in sheet_entries {
+        if sheets.len() >= MAX_SHEETS {
+            notes.push(format!("仅显示前 {MAX_SHEETS} 个工作表"));
+            break;
+        }
         let Ok(xml_str) = archive.read_entry_string(&path) else {
             continue;
         };
@@ -592,6 +625,10 @@ fn parse_xlsx_bytes(bytes: &[u8]) -> Result<Vec<SheetData>, String> {
                 .and_then(|r| r.parse::<usize>().ok())
                 .map(|r| r.saturating_sub(1))
                 .unwrap_or(rows.len());
+            if row_idx >= MAX_SHEET_ROWS {
+                rows_truncated = true;
+                break;
+            }
             if rows.len() <= row_idx {
                 rows.resize_with(row_idx + 1, Vec::new);
             }
@@ -602,6 +639,14 @@ fn parse_xlsx_bytes(bytes: &[u8]) -> Result<Vec<SheetData>, String> {
                     .and_then(parse_cell_ref)
                     .unwrap_or((row_idx, next_col));
                 next_col = col_idx + 1;
+                if r_idx >= MAX_SHEET_ROWS {
+                    rows_truncated = true;
+                    continue;
+                }
+                if col_idx >= MAX_SHEET_COLS {
+                    cols_truncated = true;
+                    continue;
+                }
                 max_col = max_col.max(col_idx + 1);
                 if rows.len() <= r_idx {
                     rows.resize_with(r_idx + 1, Vec::new);
@@ -678,7 +723,14 @@ fn parse_xlsx_bytes(bytes: &[u8]) -> Result<Vec<SheetData>, String> {
     if sheets.is_empty() {
         return Err("未能从 Excel 文件中找到工作表".to_string());
     }
-    Ok(sheets)
+    if rows_truncated {
+        notes.push(format!("表格超过 {MAX_SHEET_ROWS} 行，仅显示前 {MAX_SHEET_ROWS} 行"));
+    }
+    if cols_truncated {
+        notes.push(format!("列数超过 {MAX_SHEET_COLS} 列，仅显示前 {MAX_SHEET_COLS} 列"));
+    }
+    let truncated = (!notes.is_empty()).then(|| notes.join("；"));
+    Ok((sheets, truncated))
 }
 
 fn parse_delimited(text: &str, delim: char) -> Vec<Vec<CellValue>> {
@@ -801,7 +853,8 @@ mod tests {
             ("xl/sharedStrings.xml", ss.as_bytes()),
             ("xl/worksheets/sheet1.xml", s1.as_bytes()),
         ]);
-        let sheets = parse_xlsx_bytes(&zip).unwrap();
+        let (sheets, truncated) = parse_xlsx_bytes(&zip).unwrap();
+        assert!(truncated.is_none());
         assert_eq!(sheets.len(), 1);
         assert_eq!(sheets[0].name, "Sales");
         assert_eq!(sheets[0].rows[0][0].display, "Item");
@@ -819,7 +872,8 @@ mod tests {
             ("xl/_rels/workbook.xml.rels", rels.as_bytes()),
             ("xl/worksheets/sheet1.xml", s1.as_bytes()),
         ]);
-        let sheets = parse_xlsx_bytes(&zip).unwrap();
+        let (sheets, truncated) = parse_xlsx_bytes(&zip).unwrap();
+        assert!(truncated.is_none());
         assert_eq!(sheets.len(), 1);
         assert_eq!(sheets[0].name, "Data");
         assert_eq!(sheets[0].rows[0][0].display, "R1C1");
@@ -828,4 +882,30 @@ mod tests {
         assert_eq!(sheets[0].rows[1][1].display, "3.5");
         assert_eq!(sheets[0].col_count, 2);
     }
+
+    #[test]
+    fn xlsx_row_limit_truncates_with_notice() {
+        let wb = r#"<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheets><sheet xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" name="Big" sheetId="1" r:id="rId1"/></sheets></workbook>"#;
+        let rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>"#;
+        let mut sheet = String::from(
+            r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>"#,
+        );
+        for row in 1..=(MAX_SHEET_ROWS + 5) {
+            sheet.push_str(&format!(
+                r#"<row r="{row}"><c r="A{row}"><v>{row}</v></c></row>"#
+            ));
+        }
+        sheet.push_str("</sheetData></worksheet>");
+        let zip = build_test_zip(&[
+            ("xl/workbook.xml", wb.as_bytes()),
+            ("xl/_rels/workbook.xml.rels", rels.as_bytes()),
+            ("xl/worksheets/sheet1.xml", sheet.as_bytes()),
+        ]);
+        let (sheets, truncated) = parse_xlsx_bytes(&zip).unwrap();
+        assert_eq!(sheets.len(), 1);
+        assert_eq!(sheets[0].rows.len(), MAX_SHEET_ROWS);
+        let note = truncated.expect("row cap must surface a truncation notice");
+        assert!(note.contains("5000"), "note: {note}");
+    }
+
 }

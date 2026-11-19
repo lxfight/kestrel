@@ -217,13 +217,74 @@ pub struct TabSession {
     pub scroll: f32,
 }
 
+/// One editor group (split pane) of the restored window.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
+pub struct GroupSession {
+    pub tabs: Vec<TabSession>,
+    pub active: usize,
+}
+
+/// Saved shell instance: kind plus working directory, restored on startup.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TerminalSessionState {
+    pub shell: String,
+    pub cwd: String,
+}
+
+impl Default for TerminalSessionState {
+    fn default() -> Self {
+        Self {
+            shell: "default".to_string(),
+            cwd: String::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Session {
+    /// Flat tab list, kept for older builds and as the fallback when groups is empty.
     pub folder: Option<String>,
     pub tabs: Vec<TabSession>,
     pub active: usize,
     pub untitled: Vec<UntitledSession>,
+    /// Split layout; each group is an ordered tab list plus its active index.
+    pub groups: Vec<GroupSession>,
+    pub active_group: usize,
+    pub sidebar_visible: bool,
+    pub sidebar_width: f32,
+    pub sidebar_mode: String,
+    pub bottom_visible: bool,
+    pub bottom_tab: String,
+    pub bottom_height: f32,
+    pub terminals: Vec<TerminalSessionState>,
+    pub active_terminal: usize,
+    /// Last project-search query, restored into the search sidebar.
+    pub search_query: String,
+}
+
+impl Default for Session {
+    fn default() -> Self {
+        Self {
+            folder: None,
+            tabs: Vec::new(),
+            active: 0,
+            untitled: Vec::new(),
+            groups: Vec::new(),
+            active_group: 0,
+            sidebar_visible: true,
+            sidebar_width: 268.0,
+            sidebar_mode: "explorer".to_string(),
+            bottom_visible: false,
+            bottom_tab: "terminal".to_string(),
+            bottom_height: 240.0,
+            terminals: Vec::new(),
+            active_terminal: 0,
+            search_query: String::new(),
+        }
+    }
 }
 
 /// One unsaved buffer carried across restarts.
@@ -257,7 +318,7 @@ impl Session {
 
 #[cfg(test)]
 mod tests {
-    use super::{Session, Settings, UntitledSession};
+    use super::{GroupSession, Session, Settings, TabSession, TerminalSessionState, UntitledSession};
 
     #[test]
     fn autosave_is_enabled_by_default() {
@@ -270,6 +331,59 @@ mod tests {
         let session: Session = serde_json::from_str(json).unwrap();
         assert_eq!(session.tabs.len(), 1);
         assert!(session.untitled.is_empty());
+        // Fields introduced by the B5b session expansion fall back to usable defaults.
+        assert!(session.groups.is_empty());
+        assert!(session.sidebar_visible);
+        assert_eq!(session.sidebar_width, 268.0);
+        assert_eq!(session.sidebar_mode, "explorer");
+        assert!(!session.bottom_visible);
+        assert_eq!(session.bottom_tab, "terminal");
+        assert!(session.terminals.is_empty());
+        assert_eq!(session.search_query, "");
+    }
+
+    #[test]
+    fn session_roundtrips_split_panels_terminals_and_query() {
+        let session = Session {
+            groups: vec![
+                GroupSession {
+                    tabs: vec![TabSession {
+                        path: "a.rs".to_string(),
+                        caret: 7,
+                        scroll: 12.0,
+                    }],
+                    active: 0,
+                },
+                GroupSession::default(),
+            ],
+            active_group: 1,
+            sidebar_visible: false,
+            sidebar_width: 300.0,
+            sidebar_mode: "git".to_string(),
+            bottom_visible: true,
+            bottom_tab: "output".to_string(),
+            bottom_height: 321.0,
+            terminals: vec![TerminalSessionState {
+                shell: "cmd".to_string(),
+                cwd: "D:/work".to_string(),
+            }],
+            active_terminal: 0,
+            search_query: "fn main".to_string(),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&session).unwrap();
+        let back: Session = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.groups.len(), 2);
+        assert_eq!(back.groups[0].tabs[0].caret, 7);
+        assert_eq!(back.active_group, 1);
+        assert!(!back.sidebar_visible);
+        assert_eq!(back.sidebar_mode, "git");
+        assert!(back.bottom_visible);
+        assert_eq!(back.bottom_tab, "output");
+        assert_eq!(back.bottom_height, 321.0);
+        assert_eq!(back.terminals[0].shell, "cmd");
+        assert_eq!(back.terminals[0].cwd, "D:/work");
+        assert_eq!(back.search_query, "fn main");
     }
 
     #[test]

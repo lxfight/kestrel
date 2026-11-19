@@ -7,7 +7,8 @@ pub mod pdf;
 pub mod xlsx;
 pub mod zip_util;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, TryRecvError, channel};
 
 use egui::{Align2, CornerRadius, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, Vec2};
 
@@ -81,6 +82,37 @@ pub enum MultimodalViewer {
     Docx(DocxViewer),
     Spreadsheet(SpreadsheetViewer),
     Archive(ArchiveViewer),
+    /// Placeholder shown while a heavy format is parsed on a background thread.
+    Loading(MultimodalKind),
+}
+
+/// Parses the heavy viewer formats off the UI thread: opening a large workbook or a
+/// PDF must not stall a frame. The app polls this once per frame.
+pub struct ViewerLoader {
+    rx: Receiver<MultimodalViewer>,
+}
+
+impl ViewerLoader {
+    pub fn spawn(path: PathBuf, kind: MultimodalKind) -> Self {
+        let (tx, rx) = channel();
+        std::thread::Builder::new()
+            .name("kestrel-viewer-loader".into())
+            .spawn(move || {
+                let viewer = MultimodalViewer::load_binary(&path, kind);
+                let _ = tx.send(viewer);
+            })
+            .ok();
+        Self { rx }
+    }
+
+    /// None until the parse finishes; Some(Err(())) when the worker thread died.
+    pub fn poll(&mut self) -> Option<Result<MultimodalViewer, ()>> {
+        match self.rx.try_recv() {
+            Ok(viewer) => Some(Ok(viewer)),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => Some(Err(())),
+        }
+    }
 }
 
 impl MultimodalViewer {
@@ -108,6 +140,7 @@ impl MultimodalViewer {
             Self::Docx(_) => MultimodalKind::Docx,
             Self::Spreadsheet(_) => MultimodalKind::Xlsx,
             Self::Archive(_) => MultimodalKind::Archive,
+            Self::Loading(kind) => *kind,
         }
     }
 
@@ -135,6 +168,19 @@ impl MultimodalViewer {
             Self::Docx(v) => v.ui(ui, style),
             Self::Spreadsheet(v) => v.ui(ui, style),
             Self::Archive(v) => v.ui(ui, style),
+            Self::Loading(kind) => {
+                let theme = style.theme;
+                let rect = ui.max_rect();
+                ui.painter().rect_filled(rect, 0.0, theme.bg);
+                ui.painter().text(
+                    rect.center(),
+                    Align2::CENTER_CENTER,
+                    format!("正在后台加载{}…", kind.label()),
+                    style.small(),
+                    theme.text_dim,
+                );
+                Vec::new()
+            }
         }
     }
 }

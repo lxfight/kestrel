@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use egui::text::{LayoutJob, TextFormat};
 use egui::{
     Align2, Color32, CornerRadius, Event, FontId, ImeEvent, Key, Modifiers, Pos2, Rect, ScrollArea,
-    Sense, Stroke, Ui, Vec2,
+    Sense, Stroke, TextEdit, Ui, Vec2,
 };
 
 use crate::app::{BottomTab, KestrelApp};
@@ -18,6 +18,9 @@ use crate::ui::UiStyle;
 impl KestrelApp {
     pub fn terminal_panel_ui(&mut self, ui: &mut Ui, style: &UiStyle) {
         let theme = style.theme;
+        // Recomputed below when the grid owns the keyboard; global shortcuts read
+        // the previous frame's value so transient keys are not stolen mid-frame.
+        self.bottom.terminal_has_focus = false;
         // Header with tabs: PROBLEMS | OUTPUT | TERMINAL
         let (header, _) = ui.allocate_exact_size(
             Vec2::new(ui.available_width(), crate::theme::SP6),
@@ -412,10 +415,9 @@ impl KestrelApp {
 
     fn terminal_body_ui(&mut self, ui: &mut Ui, style: &UiStyle, clear: bool) {
         let theme = style.theme;
-        let (body, resp) = ui.allocate_exact_size(ui.available_size(), Sense::click());
-        ui.painter().rect_filled(body, 0.0, theme.input_bg);
-
         if self.bottom.terminals.is_empty() {
+            let (body, _) = ui.allocate_exact_size(ui.available_size(), Sense::hover());
+            ui.painter().rect_filled(body, 0.0, theme.input_bg);
             let button = Rect::from_center_size(body.center(), Vec2::new(150.0, 30.0));
             let bresp = ui.interact(button, ui.scope_id().with("new_terminal"), Sense::click());
             ui.painter().rect_filled(
@@ -446,9 +448,16 @@ impl KestrelApp {
             .min(self.bottom.terminals.len() - 1);
         self.bottom.active_terminal = active_idx;
 
-        if clear && let Some(terminal) = self.bottom.terminals.get_mut(active_idx) {
-            terminal.write(b"clear\r");
+        if clear {
+            self.bottom.terminals[active_idx].clear_screen();
         }
+
+        if self.bottom.terminals[active_idx].search.open {
+            self.terminal_search_bar_ui(ui, style, active_idx);
+        }
+
+        let (body, resp) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
+        ui.painter().rect_filled(body, 0.0, theme.input_bg);
 
         if resp.clicked() {
             resp.request_focus();
@@ -462,6 +471,7 @@ impl KestrelApp {
             self.bottom.terminal_focus = false;
         }
         let focused = resp.has_focus();
+        self.bottom.terminal_has_focus = focused;
 
         // Ctrl + wheel adjusts terminal font size; normal wheel scrolls history
         if resp.hovered() {
@@ -507,15 +517,43 @@ impl KestrelApp {
             self.bottom.terminal_size = (cols, rows);
         }
         terminal.poll();
-        if focused {
+
+        let origin = Pos2::new(body.left() + 8.0, body.top() + 3.0);
+        let (screen_rows, screen_cols) = {
+            let (rows_nz, cols_nz) = terminal.screen().size();
+            (rows_nz.get().min(rows), cols_nz.get().min(cols))
+        };
+
+        // Mouse selection maps the press point (not the post-threshold drag point)
+        // to a cell so the first cell stays inside the range.
+        if !terminal.search.open && focused {
+            if resp.drag_started()
+                && let Some(pos) = ui
+                    .input(|i| i.pointer.press_origin())
+                    .or_else(|| resp.interact_pointer_pos())
+            {
+                let (row, col) = cell_at(pos, origin, cell_w, cell_h, screen_rows, screen_cols);
+                terminal.begin_selection(row, col);
+            }
+            if resp.dragged()
+                && let Some(pos) = resp.interact_pointer_pos()
+            {
+                let (row, col) = cell_at(pos, origin, cell_w, cell_h, screen_rows, screen_cols);
+                terminal.update_selection(row, col);
+            }
+            if resp.clicked() {
+                terminal.clear_selection();
+            }
+        }
+        if terminal.search.open && resp.clicked() {
+            terminal.search.focus = true;
+        }
+
+        if focused && !terminal.search.open {
             terminal_input(ui, terminal);
         }
 
-        let origin = Pos2::new(body.left() + 8.0, body.top() + 3.0);
         let screen = terminal.screen();
-        let (screen_rows, screen_cols) = screen.size();
-        let screen_rows = screen_rows.get().min(rows);
-        let screen_cols = screen_cols.get().min(cols);
         let painter = ui.painter_at(body);
         for row in 0..screen_rows {
             let y = origin.y + row as f32 * cell_h;
@@ -635,6 +673,66 @@ impl KestrelApp {
             }
         }
 
+        // Selection and search hits sit above the glyphs as translucent washes so the
+        // ANSI foreground colors keep their contrast.
+        let visible_start = terminal.visible_start_row();
+        let text_right = origin.x + screen_cols as f32 * cell_w;
+        if let Some(selection) = terminal.selection {
+            let wash = Color32::from_rgba_unmultiplied(
+                theme.accent.r(),
+                theme.accent.g(),
+                theme.accent.b(),
+                56,
+            );
+            for row in 0..screen_rows {
+                if let Some((start, end)) = selection.row_span(row, screen_cols) {
+                    let x0 = origin.x + start as f32 * cell_w;
+                    let x1 = (origin.x + (end as f32 + 1.0) * cell_w).min(text_right);
+                    let y = origin.y + row as f32 * cell_h;
+                    painter.rect_filled(
+                        Rect::from_min_max(Pos2::new(x0, y), Pos2::new(x1, y + cell_h)),
+                        0.0,
+                        wash,
+                    );
+                }
+            }
+        }
+        if terminal.search.open {
+            let active = terminal
+                .search
+                .active
+                .and_then(|index| terminal.search.matches.get(index))
+                .copied();
+            let hit = Color32::from_rgba_unmultiplied(
+                theme.find_match.r(),
+                theme.find_match.g(),
+                theme.find_match.b(),
+                80,
+            );
+            let hot = Color32::from_rgba_unmultiplied(
+                theme.accent.r(),
+                theme.accent.g(),
+                theme.accent.b(),
+                110,
+            );
+            for hit_ref in &terminal.search.matches {
+                if hit_ref.row < visible_start || hit_ref.row >= visible_start + screen_rows as usize {
+                    continue;
+                }
+                let row = (hit_ref.row - visible_start) as f32;
+                let x0 = origin.x + hit_ref.start_col as f32 * cell_w;
+                let x1 = (origin.x + (hit_ref.end_col as f32 + 1.0) * cell_w).min(text_right);
+                let y = origin.y + row * cell_h;
+                let is_active =
+                    active.is_some_and(|a| a.row == hit_ref.row && a.start_col == hit_ref.start_col);
+                painter.rect_filled(
+                    Rect::from_min_max(Pos2::new(x0, y), Pos2::new(x1, y + cell_h)),
+                    0.0,
+                    if is_active { hot } else { hit },
+                );
+            }
+        }
+
         // Scrollback indicator pill if viewing history
         if terminal.scrollback_offset > 0 {
             let badge = Rect::from_min_size(
@@ -719,6 +817,105 @@ impl KestrelApp {
                 .request_repaint_after(std::time::Duration::from_millis(120));
         }
     }
+    /// Ctrl+F row above the grid: query field, live match counter, and
+    /// Enter / Shift+Enter navigation. Esc closes and returns focus to the grid.
+    fn terminal_search_bar_ui(&mut self, ui: &mut Ui, style: &UiStyle, idx: usize) {
+        let theme = style.theme;
+        let (bar, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::hover());
+        ui.painter().rect_filled(bar, 0.0, theme.panel_bg);
+        ui.painter().line_segment(
+            [
+                Pos2::new(bar.left(), bar.bottom() - 0.5),
+                Pos2::new(bar.right(), bar.bottom() - 0.5),
+            ],
+            Stroke::new(1.0, theme.border),
+        );
+
+        let dismissed = {
+            let Some(terminal) = self.bottom.terminals.get_mut(idx) else {
+                return;
+            };
+            let mut close = false;
+            let mut forward = false;
+            let mut backward = false;
+            if ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+                close = true;
+            } else if ui.input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::Enter)) {
+                backward = true;
+            } else if ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter)) {
+                forward = true;
+            }
+
+            if close {
+                terminal.close_search();
+            } else {
+                let input_w = (bar.width() * 0.42).clamp(150.0, 340.0);
+                let input_rect = Rect::from_min_size(
+                    Pos2::new(bar.left() + 10.0, bar.top() + 4.0),
+                    Vec2::new(input_w, 22.0),
+                );
+                let response = ui.put(
+                    input_rect,
+                    TextEdit::singleline(&mut terminal.search.query)
+                        .id(egui::Id::unique(("terminal_search", idx)))
+                        .hint_text("搜索终端输出")
+                        .font(style.small())
+                        .margin(Vec2::new(8.0, 3.0)),
+                );
+                if response.changed() {
+                    terminal.search.dirty = true;
+                    terminal.search.active = None;
+                }
+                if terminal.search.focus {
+                    response.request_focus();
+                    terminal.search.focus = false;
+                }
+                terminal.refresh_search();
+                if terminal.search.dirty {
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(160));
+                }
+                let counter = if terminal.search.query.is_empty() {
+                    String::new()
+                } else if terminal.search.matches.is_empty() {
+                    "0 项".to_string()
+                } else if terminal.search.truncated {
+                    format!(
+                        "{}+ 项（上限 {}）",
+                        terminal.search.matches.len(),
+                        crate::terminal::MAX_SEARCH_MATCHES
+                    )
+                } else {
+                    match terminal.search.active {
+                        Some(index) => {
+                            format!("{}/{} 项", index + 1, terminal.search.matches.len())
+                        }
+                        None => format!("{} 项", terminal.search.matches.len()),
+                    }
+                };
+                if !counter.is_empty() {
+                    ui.painter().text(
+                        Pos2::new(input_rect.right() + 12.0, bar.center().y),
+                        Align2::LEFT_CENTER,
+                        &counter,
+                        style.tiny(),
+                        if terminal.search.truncated {
+                            theme.warning
+                        } else {
+                            theme.text_dim
+                        },
+                    );
+                }
+                if forward || backward {
+                    terminal.search_step(forward);
+                }
+            }
+            !terminal.search.open
+        };
+        if dismissed {
+            self.bottom.terminal_focus = true;
+        }
+    }
 }
 
 fn paint_terminal_run(
@@ -748,20 +945,19 @@ fn paint_terminal_run(
 }
 
 fn is_wide_char(ch: char) -> bool {
-    matches!(
-        ch as u32,
-        0x1100..=0x115F
-            | 0x2E80..=0xA4CF
-            | 0xAC00..=0xD7A3
-            | 0xF900..=0xFAFF
-            | 0xFE30..=0xFE4F
-            | 0xFF00..=0xFF60
-            | 0xFFE0..=0xFFE6
-            | 0x1F300..=0x1FAFF
-            | 0x20000..=0x3FFFD
-    )
+    crate::terminal::char_width(ch) == 2
 }
 
+/// Map a pointer position to a terminal cell, clamped to the visible grid.
+fn cell_at(pos: Pos2, origin: Pos2, cell_w: f32, cell_h: f32, rows: u16, cols: u16) -> (u16, u16) {
+    let col = ((pos.x - origin.x) / cell_w)
+        .floor()
+        .clamp(0.0, cols.saturating_sub(1) as f32) as u16;
+    let row = ((pos.y - origin.y) / cell_h)
+        .floor()
+        .clamp(0.0, rows.saturating_sub(1) as f32) as u16;
+    (row, col)
+}
 fn color_to_ui(color: vt100::Color, theme: crate::theme::Theme, foreground: bool) -> Color32 {
     let default = if foreground {
         theme.text
@@ -871,6 +1067,35 @@ fn terminal_input(ui: &Ui, terminal: &mut crate::terminal::TerminalSession) {
                 modifiers,
                 ..
             } => {
+                let command = modifiers.ctrl || modifiers.command;
+                // Clipboard/search shortcuts are consumed before key_bytes, which
+                // would otherwise send Ctrl+Shift+C/V as 0x03/0x16 and Ctrl+F as 0x06.
+                if command && modifiers.shift {
+                    match key {
+                        Key::C => {
+                            if let Some(text) = terminal.selection_text() {
+                                ctx.copy_text(text);
+                            }
+                            continue;
+                        }
+                        Key::V => {
+                            if let Ok(mut clipboard) = arboard::Clipboard::new()
+                                && let Ok(text) = clipboard.get_text()
+                                && !text.is_empty()
+                            {
+                                terminal.write(b"\x1b[200~");
+                                terminal.write(text.as_bytes());
+                                terminal.write(b"\x1b[201~");
+                            }
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+                if command && key == Key::F {
+                    terminal.open_search();
+                    continue;
+                }
                 if let Some(bytes) = key_bytes(key, &modifiers) {
                     terminal.write(&bytes);
                 }

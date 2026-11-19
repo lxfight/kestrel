@@ -16,7 +16,9 @@ use crate::git::{GitFileStatus, GitService};
 use crate::highlight::Language;
 use crate::lsp::{DiagSeverity, OutlineSymbol};
 use crate::plugin::{Event, PluginHost};
-use crate::settings::{Session, Settings, TabSession, UntitledSession};
+use crate::settings::{
+    GroupSession, Session, Settings, TabSession, TerminalSessionState, UntitledSession,
+};
 use crate::terminal::ShellKind;
 use crate::theme::{Theme, ThemeKind};
 use crate::ui::UiStyle;
@@ -29,6 +31,14 @@ pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Watcher bursts wait this long before touching the file index.
 const INDEX_DEBOUNCE: Duration = Duration::from_millis(500);
 
+/// Files above this size open as a read-only preview instead of an editable buffer.
+pub const MAX_OPEN_FILE_BYTES: u64 = 8 * 1024 * 1024;
+const LARGE_FILE_TOAST: &str =
+    "文件超过 8MB，已用只读模式打开，语法高亮与 minimap 已关闭";
+
+fn is_large_file(size: u64) -> bool {
+    size > MAX_OPEN_FILE_BYTES
+}
 pub const LANGUAGES: &[Language] = &[
     Language::Rust,
     Language::Python,
@@ -70,6 +80,28 @@ pub enum SidebarMode {
     Git,
     Outline,
     Plugins,
+}
+impl SidebarMode {
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Explorer => "explorer",
+            Self::Search => "search",
+            Self::Git => "git",
+            Self::Outline => "outline",
+            Self::Plugins => "plugins",
+        }
+    }
+
+    pub fn from_str(name: &str) -> Self {
+        match name {
+            "search" => Self::Search,
+            "git" => Self::Git,
+            "outline" => Self::Outline,
+            "plugins" => Self::Plugins,
+            _ => Self::Explorer,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -230,14 +262,38 @@ pub enum BottomTab {
     Output,
 }
 
+impl BottomTab {
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Terminal => "terminal",
+            Self::Problems => "problems",
+            Self::Output => "output",
+        }
+    }
+
+    pub fn from_str(name: &str) -> Self {
+        match name {
+            "problems" => Self::Problems,
+            "output" => Self::Output,
+            _ => Self::Terminal,
+        }
+    }
+}
 pub struct BottomPanel {
     pub visible: bool,
     pub tab: BottomTab,
     pub height: f32,
     pub terminals: Vec<crate::terminal::TerminalSession>,
+
+    /// Saved shell specs for a panel that was closed on exit; spawned when reopened.
+    pub pending_terminals: Vec<(ShellKind, PathBuf)>,
     pub active_terminal: usize,
     pub terminal_size: (u16, u16),
     pub terminal_focus: bool,
+
+    /// Kept from the last frame so global shortcuts skip keys the terminal owns.
+    pub terminal_has_focus: bool,
 }
 
 impl BottomPanel {
@@ -247,9 +303,11 @@ impl BottomPanel {
             tab: BottomTab::Terminal,
             height: 240.0,
             terminals: Vec::new(),
+            pending_terminals: Vec::new(),
             active_terminal: 0,
             terminal_size: (0, 0),
             terminal_focus: false,
+            terminal_has_focus: false,
         }
     }
 }
@@ -574,6 +632,12 @@ pub struct KestrelApp {
     title_key: (Option<u64>, u64, bool),
     title_path: Option<PathBuf>,
     title_root: Option<PathBuf>,
+
+    /// Heavy multimodal viewers parsing on worker threads, keyed by editor id.
+    viewer_loads: Vec<(u64, crate::viewer::ViewerLoader)>,
+
+    /// Last periodic session write (layout, panels, terminals; not just buffers).
+    last_session_save: Instant,
 }
 
 impl KestrelApp {
@@ -658,6 +722,8 @@ impl KestrelApp {
             title_key: (None, 0, false),
             title_path: None,
             title_root: None,
+            viewer_loads: Vec::new(),
+            last_session_save: Instant::now(),
         };
         app.apply_dev_env();
         if app.workspace.root.is_none() && app.tabs.is_empty() && app.dev_ui.is_none() {
@@ -679,20 +745,61 @@ impl KestrelApp {
     // ------------------------------------------------------------------
 
     fn restore_session(&mut self) {
-        let session = Session::load();
-        if let Some(folder) = session.folder {
+        let mut session = Session::load();
+        if let Some(folder) = &session.folder {
             let path = PathBuf::from(folder);
             if path.is_dir() {
                 self.open_folder_quiet(path);
             }
         }
-        for tab in session.tabs {
-            let path = PathBuf::from(tab.path);
-            if path.is_file() {
-                self.open_file_quiet(path, Some((tab.caret, tab.scroll)));
+
+        // Split layout is rebuilt from the saved groups; the flat tab list is the
+        // fallback for sessions written before groups existed.
+        let mut restored_groups: Vec<(Vec<u64>, usize)> = Vec::new();
+        if session.groups.is_empty() {
+            for tab in &session.tabs {
+                let path = PathBuf::from(&tab.path);
+                if path.is_file() {
+                    self.open_file_quiet(path, Some((tab.caret, tab.scroll)));
+                }
+            }
+        } else {
+            for saved in &session.groups {
+                let mut ids = Vec::new();
+                let mut active = 0usize;
+                for (position, tab) in saved.tabs.iter().enumerate() {
+                    let path = PathBuf::from(&tab.path);
+                    if !path.is_file() {
+                        continue;
+                    }
+                    let before = self.tabs.len();
+                    self.open_file_quiet(path, Some((tab.caret, tab.scroll)));
+                    if self.tabs.len() > before {
+                        ids.push(self.tabs[self.tabs.len() - 1].id);
+                        if position == saved.active {
+                            active = ids.len() - 1;
+                        }
+                    }
+                }
+                if !ids.is_empty() {
+                    restored_groups.push((ids, active));
+                }
+            }
+            if !restored_groups.is_empty() {
+                self.groups = restored_groups
+                    .iter()
+                    .map(|(ids, active)| {
+                        let mut group = EditorGroup::new();
+                        group.tabs = ids.clone();
+                        group.active = *active;
+                        group
+                    })
+                    .collect();
+                self.active_group = session.active_group.min(self.groups.len() - 1);
+                self.sync_active();
             }
         }
-        for entry in session.untitled {
+        for entry in std::mem::take(&mut session.untitled) {
             let text = match entry.text {
                 Some(text) => text,
                 None => {
@@ -718,18 +825,76 @@ impl KestrelApp {
             self.tabs.push(editor);
             self.attach_editor_to_active_group(id);
         }
-        if !self.tabs.is_empty() {
-            let active = session.active.min(self.tabs.len() - 1);
-            self.active = active;
-            self.active_group = 0;
-            self.ensure_groups();
-            self.groups[0].active = self
-                .groups
-                .first()
-                .and_then(|group| group.index_of(self.tabs[active].id))
-                .unwrap_or(0);
-            if let Some(editor) = self.tabs.get_mut(active) {
-                editor.focus_requested = true;
+        if restored_groups.is_empty() {
+            if !self.tabs.is_empty() {
+                let active = session.active.min(self.tabs.len() - 1);
+                self.active = active;
+                self.active_group = 0;
+                self.ensure_groups();
+                let id = self.tabs[active].id;
+                if let Some(group) = self.groups.first_mut() {
+                    group.active = group.index_of(id).unwrap_or(0);
+                }
+                self.sync_active();
+            }
+        } else {
+            // Untitled buffers joined the groups; restore each group's active tab.
+            for (index, (_, active)) in restored_groups.iter().enumerate() {
+                if let Some(group) = self.groups.get_mut(index) {
+                    group.active = (*active).min(group.tabs.len().saturating_sub(1));
+                }
+            }
+            self.active_group = session.active_group.min(self.groups.len() - 1);
+            self.sync_active();
+        }
+        self.restore_panel_state(&session);
+        if let Some(editor) = self.tabs.get_mut(self.active) {
+            editor.focus_requested = true;
+        }
+    }
+
+    /// Restore sidebar/bottom-panel geometry, the search query, and terminal shells.
+    fn restore_panel_state(&mut self, session: &Session) {
+        self.sidebar.visible = session.sidebar_visible;
+        if session.sidebar_width >= 180.0 {
+            self.sidebar.width = session.sidebar_width;
+        }
+        self.sidebar.mode = SidebarMode::from_str(&session.sidebar_mode);
+        self.bottom.height = session.bottom_height.max(120.0);
+        self.bottom.tab = BottomTab::from_str(&session.bottom_tab);
+        let specs: Vec<(ShellKind, PathBuf)> = session
+            .terminals
+            .iter()
+            .take(4)
+            .filter_map(|entry| {
+                let cwd = PathBuf::from(&entry.cwd);
+                let cwd = if cwd.is_dir() {
+                    cwd
+                } else {
+                    self.workspace
+                        .root
+                        .clone()
+                        .or_else(|| std::env::current_dir().ok())?
+                };
+                Some((ShellKind::from_str(&entry.shell), cwd))
+            })
+            .collect();
+        if session.bottom_visible {
+            for (shell, cwd) in specs {
+                self.open_terminal_in(cwd, shell);
+            }
+            self.bottom.visible = true;
+            self.bottom.tab = BottomTab::from_str(&session.bottom_tab);
+            self.bottom.active_terminal = session
+                .active_terminal
+                .min(self.bottom.terminals.len().saturating_sub(1));
+        } else {
+            self.bottom.pending_terminals = specs;
+        }
+        if !session.search_query.is_empty() {
+            self.workspace.search_panel.query = session.search_query.clone();
+            if self.sidebar.mode == SidebarMode::Search {
+                self.workspace.search_panel.last_typed = Some(Instant::now());
             }
         }
     }
@@ -808,7 +973,20 @@ impl KestrelApp {
             "settings" => {
                 self.open_settings();
             }
-            "terminal" => self.toggle_terminal(),
+            "terminal" => {
+                self.toggle_terminal();
+                // Dev-only screenshot hook: expose the Ctrl+F search row and a cell
+                // selection without driving the mouse.
+                if let Ok(query) = std::env::var("KESTREL_DEV_QUERY")
+                    && let Some(term) = self.bottom.terminals.first_mut()
+                {
+                    term.open_search();
+                    term.search.query = query;
+                    term.search.dirty = true;
+                    term.begin_selection(1, 0);
+                    term.update_selection(2, 18);
+                }
+            }
             "output" => {
                 self.bottom.visible = true;
                 self.bottom.tab = BottomTab::Output;
@@ -878,6 +1056,31 @@ impl KestrelApp {
     }
 
     pub fn save_session(&self) {
+        let mut groups = Vec::new();
+        for group in &self.groups {
+            let mut tabs = Vec::new();
+            let mut active = 0usize;
+            for (position, id) in group.tabs.iter().enumerate() {
+                let Some(index) = self.tab_index(*id) else {
+                    continue;
+                };
+                let Some(path) = self.tabs[index].doc.path.as_ref() else {
+                    continue;
+                };
+                if position == group.active {
+                    active = tabs.len();
+                }
+                let editor = &self.tabs[index];
+                tabs.push(TabSession {
+                    path: path.to_string_lossy().to_string(),
+                    caret: editor.caret,
+                    scroll: editor.scroll_y,
+                });
+            }
+            if !tabs.is_empty() {
+                groups.push(GroupSession { tabs, active });
+            }
+        }
         let mut visual_order: Vec<usize> = Vec::with_capacity(self.tabs.len());
         for group in &self.groups {
             for id in &group.tabs {
@@ -908,6 +1111,30 @@ impl KestrelApp {
             .iter()
             .position(|index| *index == self.active)
             .unwrap_or(0);
+
+        // Closed panels keep their terminals as pending specs so the layout returns
+        // intact even when no shell was ever painted this run.
+        let terminals: Vec<TerminalSessionState> = if self.bottom.terminals.is_empty() {
+            self.bottom
+                .pending_terminals
+                .iter()
+                .take(4)
+                .map(|(shell, cwd)| TerminalSessionState {
+                    shell: shell.as_str().to_string(),
+                    cwd: cwd.to_string_lossy().to_string(),
+                })
+                .collect()
+        } else {
+            self.bottom
+                .terminals
+                .iter()
+                .take(4)
+                .map(|term| TerminalSessionState {
+                    shell: term.shell.as_str().to_string(),
+                    cwd: term.cwd.to_string_lossy().to_string(),
+                })
+                .collect()
+        };
         let session = Session {
             folder: self
                 .workspace
@@ -917,6 +1144,17 @@ impl KestrelApp {
             tabs,
             active,
             untitled: self.untitled_snapshot(),
+            groups,
+            active_group: self.active_group,
+            sidebar_visible: self.sidebar.visible,
+            sidebar_width: self.sidebar.width,
+            sidebar_mode: self.sidebar.mode.as_str().to_string(),
+            bottom_visible: self.bottom.visible,
+            bottom_tab: self.bottom.tab.as_str().to_string(),
+            bottom_height: self.bottom.height,
+            terminals,
+            active_terminal: self.bottom.active_terminal,
+            search_query: self.workspace.search_panel.query.clone(),
         };
         session.save();
     }
@@ -959,6 +1197,52 @@ impl KestrelApp {
         snapshots
     }
 
+    /// Kick off a background parse for a heavy viewer; the tab paints a Loading
+    /// placeholder until poll_viewer_loads swaps in the finished viewer.
+    fn spawn_viewer_load(&mut self, id: u64, path: PathBuf, kind: crate::viewer::MultimodalKind) {
+        // A preview tab can be reused for another file before the first parse lands;
+        // drop the stale loader so its result cannot overwrite the new tab.
+        self.viewer_loads.retain(|(load_id, _)| *load_id != id);
+        self.viewer_loads
+            .push((id, crate::viewer::ViewerLoader::spawn(path, kind)));
+    }
+
+    /// Collect finished viewer parses and drop loaders for tabs the user closed.
+    fn poll_viewer_loads(&mut self, ctx: &egui::Context) {
+        if self.viewer_loads.is_empty() {
+            return;
+        }
+        let mut finished: Vec<(u64, Option<crate::viewer::MultimodalViewer>)> = Vec::new();
+        for (id, loader) in &mut self.viewer_loads {
+            match loader.poll() {
+                Some(Ok(viewer)) => finished.push((*id, Some(viewer))),
+                Some(Err(())) => finished.push((*id, None)),
+                None => {}
+            }
+        }
+        if finished.is_empty() {
+            return;
+        }
+        let mut failed = false;
+        let mut done: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for (id, viewer) in finished {
+            done.insert(id);
+            if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) {
+                failed |= viewer.is_none();
+                tab.multimodal = viewer;
+                tab.invalidate_layout();
+            }
+        }
+        // Finished loaders must be dropped or the next poll reports the closed
+        // channel and clears the viewer that just arrived.
+        let open: std::collections::HashSet<u64> = self.tabs.iter().map(|tab| tab.id).collect();
+        self.viewer_loads
+            .retain(|(id, _)| open.contains(id) && !done.contains(id));
+        if failed {
+            self.toast("文件渲染加载失败", ToastKind::Error);
+        }
+        ctx.request_repaint();
+    }
     /// Changes fingerprint over unsaved buffers, so quiet periods trigger a recovery write.
     fn untitled_fingerprint(&self) -> u64 {
         let mut fingerprint = 0u64;
@@ -987,6 +1271,16 @@ impl KestrelApp {
             self.session_pending_since = None;
             self.save_session();
         }
+
+        // Periodic layout write: a crash should not lose splits, panel state, or the
+        // terminal set just because no untitled buffer changed. Screenshot runs must
+        // never overwrite the real session file.
+        if self.last_session_save.elapsed() >= Duration::from_secs(30)
+            && std::env::var_os("KESTREL_SHOT").is_none()
+        {
+            self.last_session_save = Instant::now();
+            self.save_session();
+        }
     }
 
     // ------------------------------------------------------------------
@@ -1004,13 +1298,19 @@ impl KestrelApp {
     }
 
     pub fn editor_style(&self) -> EditorStyle {
+
+        // A >8 MB document is a read-only preview: its minimap row scan is pure
+        // overhead (syntax highlighting is already off above 1.5 MB).
+        let large_active = self
+            .active_editor()
+            .is_some_and(|tab| tab.doc.len_bytes() as u64 > MAX_OPEN_FILE_BYTES);
         EditorStyle {
             theme: self.theme,
             font_size: self.settings.font_size,
             line_h: self.settings.line_px(),
             tab_size: self.settings.tab_size,
             insert_spaces: self.settings.insert_spaces,
-            show_minimap: self.settings.show_minimap,
+            show_minimap: self.settings.show_minimap && !large_active,
             show_line_numbers: self.settings.show_line_numbers,
             show_indent_guides: self.settings.show_indent_guides,
             show_whitespace: self.settings.show_whitespace,
@@ -1630,8 +1930,10 @@ impl KestrelApp {
             self.next_id += 1;
             let mut editor = Editor::new(doc, id, 0);
             editor.preview = as_preview;
-            editor.multimodal = Some(crate::viewer::MultimodalViewer::load_binary(&path, kind));
-            if as_preview
+
+            // Heavy formats parse on a worker thread; paint a placeholder meanwhile.
+            editor.multimodal = Some(crate::viewer::MultimodalViewer::Loading(kind));
+            let final_id = if as_preview
                 && let Some(prev_idx) = self
                     .tabs
                     .iter()
@@ -1641,24 +1943,34 @@ impl KestrelApp {
                 editor.id = keep_id;
                 self.tabs[prev_idx] = editor;
                 self.focus_tab(keep_id);
+                keep_id
             } else {
                 self.tabs.push(editor);
                 self.attach_editor_to_active_group(id);
-            }
+                id
+            };
+            self.spawn_viewer_load(final_id, path.clone(), kind);
             self.reveal_in_tree(&path);
             return;
         }
 
         let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let large = is_large_file(size);
         match Document::load(&path) {
             Ok(mut doc) => {
-                // If inside a Git repo, use HEAD blob as the diff baseline when available
-                if let Some(root) = &self.workspace.root
+                if large {
+                    // >8 MB: read-only preview. Syntax analysis is already gated at
+                    // 1.5 MB and the minimap is disabled by editor_style, so the tab
+                    // stays cheap to paint.
+                    doc.readonly = true;
+                } else if let Some(root) = &self.workspace.root
                     && let Some(head_text) = crate::git::read_head_blob(root, &path)
                 {
                     doc.baseline_text = Some(head_text.replace("\r\n", "\n").into());
                 }
-                if doc.lossy && doc.encoding != crate::doc::Encoding::Binary {
+                if large {
+                    self.toast(LARGE_FILE_TOAST, ToastKind::Warning);
+                } else if doc.lossy && doc.encoding != crate::doc::Encoding::Binary {
                     self.toast(
                         format!(
                             "文件按 {} 解码显示{}",
@@ -1680,7 +1992,7 @@ impl KestrelApp {
                         &path, &text, kind,
                     ));
                 }
-                if size > crate::editor::MAX_HIGHLIGHT_BYTES as u64 {
+                if !large && size > crate::editor::MAX_HIGHLIGHT_BYTES as u64 {
                     self.toast(
                         format!(
                             "{} 大于 {} MB，已关闭语法高亮以保证流畅",
@@ -1729,14 +2041,18 @@ impl KestrelApp {
                 let id = self.next_id;
                 self.next_id += 1;
                 let mut editor = Editor::new(doc, id, 0);
-                editor.multimodal = Some(crate::viewer::MultimodalViewer::load_binary(&path, kind));
+                editor.multimodal = Some(crate::viewer::MultimodalViewer::Loading(kind));
                 self.tabs.push(editor);
                 self.attach_editor_to_active_group(id);
+                self.spawn_viewer_load(id, path.clone(), kind);
             }
             return;
         }
+        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         if let Ok(mut doc) = Document::load(&path) {
-            if let Some(root) = &self.workspace.root
+            if is_large_file(size) {
+                doc.readonly = true;
+            } else if let Some(root) = &self.workspace.root
                 && let Some(head_text) = crate::git::read_head_blob(root, &path)
             {
                 doc.baseline_text = Some(head_text.replace("\r\n", "\n").into());
@@ -2295,8 +2611,10 @@ impl KestrelApp {
         // Terminals and the Git snapshot belong to the old project: drop them so
         // the next shell spawns in the new root instead of the old directory.
         self.bottom.terminals.clear();
+        self.bottom.pending_terminals.clear();
         self.bottom.active_terminal = 0;
         self.bottom.terminal_focus = false;
+        self.bottom.terminal_has_focus = false;
         self.git.clear();
         self.git.prime_fast(&path);
         self.git.log(format!("打开工作区: {}", path.display()));
@@ -3031,7 +3349,13 @@ impl KestrelApp {
     pub fn toggle_terminal(&mut self) {
         self.bottom.visible = !self.bottom.visible;
         if self.bottom.visible && self.bottom.terminals.is_empty() {
-            self.new_terminal();
+            let pending = std::mem::take(&mut self.bottom.pending_terminals);
+            for (shell, cwd) in pending.into_iter().take(4) {
+                self.open_terminal_in(cwd, shell);
+            }
+            if self.bottom.terminals.is_empty() {
+                self.new_terminal();
+            }
         }
     }
 
@@ -3582,6 +3906,7 @@ impl KestrelApp {
         let editor_focused = self
             .active_editor()
             .is_some_and(|tab| tab.has_focus && tab.ime_preedit.is_empty());
+        let terminal_focused = self.bottom.visible && self.bottom.terminal_has_focus;
         let mut handled = false;
         for &(command, default_shortcut) in DEFAULT_SHORTCUTS.iter() {
             if command.is_editor_command() && !editor_focused {
@@ -3592,6 +3917,11 @@ impl KestrelApp {
                 .get(&command)
                 .copied()
                 .unwrap_or(default_shortcut);
+            // Ctrl+Shift+V is both markdown-preview toggle and terminal paste; the
+            // focused terminal owns it so paste never swaps in a preview.
+            if terminal_focused && command == Command::ToggleMarkdownPreview {
+                continue;
+            }
             if !pressed
                 .iter()
                 .any(|(key, mods)| *key == shortcut.key && mods.matches_exact(shortcut.mods))
@@ -3739,6 +4069,7 @@ impl KestrelApp {
         if diff_loading {
             ctx.request_repaint_after(std::time::Duration::from_millis(80));
         }
+        self.poll_viewer_loads(ctx);
 
         if let Some(typed) = self.workspace.search_panel.last_typed
             && typed.elapsed() > Duration::from_millis(320)
@@ -3834,6 +4165,12 @@ impl KestrelApp {
         if let Some(delay) = Settings::save_delay() {
             ctx.request_repaint_after(delay);
         }
+        if !self.viewer_loads.is_empty() {
+            ctx.request_repaint_after(Duration::from_millis(60));
+        }
+        ctx.request_repaint_after(
+            Duration::from_secs(30).saturating_sub(self.last_session_save.elapsed()),
+        );
     }
 
     pub fn set_ui_zoom(&mut self, zoom: f32, ctx: &egui::Context) {
@@ -4405,5 +4742,13 @@ mod tests {
         };
         assert_eq!(resolve(Command::Save, default), save);
         assert_eq!(resolve(Command::Copy, default), default);
+    }
+
+    use super::{MAX_OPEN_FILE_BYTES, is_large_file};
+    #[test]
+    fn large_file_gate_uses_eight_megabyte_boundary() {
+        assert!(!is_large_file(0));
+        assert!(!is_large_file(MAX_OPEN_FILE_BYTES));
+        assert!(is_large_file(MAX_OPEN_FILE_BYTES + 1));
     }
 }
