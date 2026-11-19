@@ -1718,6 +1718,59 @@ impl KestrelApp {
         }
     }
 
+    /// Apply hunk-level Git actions parked by the diff view's hunk buttons. Git
+    /// runs here, outside the paint pass; each action reloads its diff tab and
+    /// the Git panel through the regular refresh path.
+    fn apply_diff_commands(&mut self) {
+        let Some(root) = self.workspace.root.clone() else {
+            return;
+        };
+        let mut commands = Vec::new();
+        for tab in &mut self.tabs {
+            let Some(diff) = tab.diff.as_mut() else {
+                continue;
+            };
+            let Some(command) = diff.pending.take() else {
+                continue;
+            };
+            let patch = diff
+                .data
+                .as_ref()
+                .and_then(|data| data.hunk_patch(command.hunk()));
+            commands.push((tab.id, command, patch, diff.staged));
+        }
+        for (tab_id, command, patch, staged) in commands {
+            let label = command.success_label();
+            let Some(patch) = patch else {
+                self.toast(
+                    format!("{label}失败: 差异块已失效，请刷新差异"),
+                    ToastKind::Error,
+                );
+                continue;
+            };
+            let result = match command {
+                crate::diff::DiffCommand::Stage { .. } => crate::git::stage_patch(&root, &patch),
+                crate::diff::DiffCommand::Unstage { .. } => {
+                    crate::git::unstage_patch(&root, &patch)
+                }
+                crate::diff::DiffCommand::Discard { .. } => {
+                    crate::git::discard_patch(&root, &patch, staged)
+                }
+            };
+            match result {
+                Ok(()) => self.toast(label, ToastKind::Success),
+                Err(error) => self.toast(
+                    format!("{label}失败: {}", error_summary(&error)),
+                    ToastKind::Error,
+                ),
+            }
+            // A partially applied discard already moved the index, so reload
+            // the diff and the panel after a failure too.
+            self.git.refresh(&root);
+            self.spawn_diff_load(tab_id);
+        }
+    }
+
     pub fn goto_definition_by_name(&mut self, symbol: &str) {
         let current_path = self.active_path();
         let current_symbols = self
@@ -3476,6 +3529,10 @@ impl KestrelApp {
         for term in &mut self.bottom.terminals {
             term.update();
         }
+
+        // Hunk buttons in diff tabs park a Git command on the tab; apply it
+        // outside the paint pass, then reload the diff and the Git panel.
+        self.apply_diff_commands();
 
         let mut diff_loading = false;
         for tab in &mut self.tabs {

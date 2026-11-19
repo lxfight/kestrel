@@ -1,8 +1,9 @@
 //! Native Git integration: branch detection, working-tree status, staging, commits, and line diffs.
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
@@ -991,6 +992,151 @@ pub fn read_head_blob(root: &Path, file_path: &Path) -> Option<String> {
     String::from_utf8(out.stdout).ok()
 }
 
+// ---------------------------------------------------------------------------
+// Hunk-level staging: read, split, filter and apply one patch block
+// ---------------------------------------------------------------------------
+
+/// Line range of one unified diff hunk header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HunkRange {
+    pub old_start: u32,
+    pub old_count: u32,
+    pub new_start: u32,
+    pub new_count: u32,
+}
+
+/// Raw `git diff --cached -U3 -- <rel_path>`; empty when nothing is staged.
+pub fn staged_patch(root: &Path, rel_path: &str) -> String {
+    diff_output(root, &["diff", "--cached", "-U3", "--", rel_path])
+}
+
+/// Raw `git diff -U3 -- <rel_path>`, i.e. index → working tree.
+pub fn worktree_patch(root: &Path, rel_path: &str) -> String {
+    diff_output(root, &["diff", "-U3", "--", rel_path])
+}
+
+fn diff_output(root: &Path, args: &[&str]) -> String {
+    let Ok(out) = git_cmd(root).args(args).output() else {
+        return String::new();
+    };
+    if !out.status.success() {
+        return String::new();
+    }
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// Split a unified diff into its file header and one block per hunk. Each hunk
+/// keeps its `@@` line, so the header plus one block is an appliable
+/// patch. Header counts are not validated here: `git apply` reports a
+/// mismatch precisely, and hand-built patches still split.
+pub fn split_hunks(patch: &str) -> (String, Vec<String>) {
+    let mut header = String::new();
+    let mut hunks: Vec<String> = Vec::new();
+    for line in patch.split_inclusive('\n') {
+        if line.starts_with("@@ ") {
+            hunks.push(line.to_string());
+        } else if let Some(hunk) = hunks.last_mut() {
+            hunk.push_str(line);
+        } else {
+            header.push_str(line);
+        }
+    }
+    // A hand-built patch may lack the final newline; `git apply` rejects
+    // an unterminated last hunk line.
+    if let Some(hunk) = hunks.last_mut()
+        && !hunk.ends_with('\n')
+    {
+        hunk.push('\n');
+    }
+    (header, hunks)
+}
+
+/// Parse `@@ -old_start,old_count +new_start,new_count @@`; omitted
+/// counts mean 1, as in `@@ -1 +1 @@`.
+pub fn parse_hunk_header(line: &str) -> Option<HunkRange> {
+    let rest = line.strip_prefix("@@ -")?;
+    let (old, rest) = rest.split_once(' ')?;
+    let (new, _) = rest.strip_prefix('+')?.split_once(' ')?;
+    let (old_start, old_count) = parse_hunk_range(old)?;
+    let (new_start, new_count) = parse_hunk_range(new)?;
+    Some(HunkRange {
+        old_start,
+        old_count,
+        new_start,
+        new_count,
+    })
+}
+
+fn parse_hunk_range(text: &str) -> Option<(u32, u32)> {
+    match text.split_once(',') {
+        Some((start, count)) => Some((start.parse().ok()?, count.parse().ok()?)),
+        None => Some((text.parse().ok()?, 1)),
+    }
+}
+
+/// File header plus one selected hunk: the patch handed to `git apply`.
+pub fn hunk_patch(header: &str, hunks: &[String], index: usize) -> Option<String> {
+    let hunk = hunks.get(index)?;
+    let mut patch = String::with_capacity(header.len() + hunk.len());
+    patch.push_str(header);
+    patch.push_str(hunk);
+    Some(patch)
+}
+
+/// Stage one filtered hunk into the index.
+pub fn stage_patch(root: &Path, patch: &str) -> Result<(), String> {
+    apply_patch(root, patch, true, false)
+}
+
+/// Remove one filtered hunk from the index (staged diff view).
+pub fn unstage_patch(root: &Path, patch: &str) -> Result<(), String> {
+    apply_patch(root, patch, true, true)
+}
+
+/// Restore one hunk. A staged hunk leaves the index first; the working tree
+/// still holds the change, so the same patch reverses there afterwards.
+pub fn discard_patch(root: &Path, patch: &str, staged: bool) -> Result<(), String> {
+    if staged {
+        apply_patch(root, patch, true, true)?;
+        apply_patch(root, patch, false, true)
+            .map_err(|error| format!("已取消暂存，但从工作区撤销失败: {error}"))
+    } else {
+        apply_patch(root, patch, false, true)
+    }
+}
+
+fn apply_patch(root: &Path, patch: &str, cached: bool, reverse: bool) -> Result<(), String> {
+    let mut cmd = git_cmd(root);
+    cmd.arg("apply");
+    if cached {
+        cmd.arg("--cached");
+    }
+    if reverse {
+        cmd.arg("--reverse");
+    }
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .map_err(|error| format!("无法执行 git apply: {error}"))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "无法写入补丁: stdin 不可用".to_string())?;
+    stdin
+        .write_all(patch.as_bytes())
+        .map_err(|error| format!("无法写入补丁: {error}"))?;
+    drop(stdin);
+    let out = child
+        .wait_with_output()
+        .map_err(|error| format!("git apply 失败: {error}"))?;
+    if !out.status.success() {
+        return Err(git_error(&out));
+    }
+    Ok(())
+}
+
 fn collect_git_snapshot(root: &Path, cancel: &AtomicBool) -> GitSnapshot {
     let mut snap = GitSnapshot::default();
     let Ok(out) = git_cmd(root)
@@ -1421,5 +1567,179 @@ mod tests {
         assert!(git.discard_confirm_armed());
         git.clear_discard_confirm();
         assert!(!git.discard_confirm_armed());
+    }
+
+    const TWO_HUNK_PATCH: &str = concat!(
+        "diff --git a/src/lib.rs b/src/lib.rs\n",
+        "index 1111111..2222222 100644\n",
+        "--- a/src/lib.rs\n",
+        "+++ b/src/lib.rs\n",
+        "@@ -1,4 +1,5 @@\n",
+        " fn main() {\n",
+        "-    let a = 1;\n",
+        "+    let a = 2;\n",
+        " }\n",
+        "+\n",
+        "@@ -20,3 +21,3 @@ fn tail() {\n",
+        " line 20\n",
+        "-line 21\n",
+        "+line 21 changed\n",
+        " line 22\n",
+    );
+
+    #[test]
+    fn split_hunks_keeps_header_and_blocks() {
+        let (header, hunks) = split_hunks(TWO_HUNK_PATCH);
+        assert_eq!(
+            header,
+            "diff --git a/src/lib.rs b/src/lib.rs\nindex 1111111..2222222 100644\n--- a/src/lib.rs\n+++ b/src/lib.rs\n"
+        );
+        assert_eq!(hunks.len(), 2);
+        assert!(hunks[0].starts_with("@@ -1,4 +1,5 @@\n"));
+        assert!(hunks[1].starts_with("@@ -20,3 +21,3 @@ fn tail()"));
+        assert!(hunks[1].ends_with(" line 22\n"));
+
+        let selected = hunk_patch(&header, &hunks, 1).expect("第二个块");
+        assert_eq!(selected, format!("{header}{}", hunks[1]));
+        assert!(hunk_patch(&header, &hunks, 2).is_none());
+    }
+
+    #[test]
+    fn split_hunks_handles_new_and_deleted_files() {
+        let added = "diff --git a/new.txt b/new.txt\n\
+            new file mode 100644\n\
+            index 0000000..1111111\n\
+            --- /dev/null\n\
+            +++ b/new.txt\n\
+            @@ -0,0 +1,2 @@\n\
+            +first\n\
+            +second\n";
+        let (header, hunks) = split_hunks(added);
+        assert!(header.contains("new file mode 100644"));
+        assert!(header.contains("--- /dev/null"));
+        assert_eq!(hunks, vec!["@@ -0,0 +1,2 @@\n+first\n+second\n"]);
+        assert_eq!(
+            parse_hunk_header(hunks[0].lines().next().unwrap()),
+            Some(HunkRange {
+                old_start: 0,
+                old_count: 0,
+                new_start: 1,
+                new_count: 2,
+            })
+        );
+
+        let deleted = "diff --git a/old.txt b/old.txt\n\
+            deleted file mode 100644\n\
+            index 1111111..0000000\n\
+            --- a/old.txt\n\
+            +++ /dev/null\n\
+            @@ -1,2 +0,0 @@\n\
+            -first\n\
+            -second\n";
+        let (header, hunks) = split_hunks(deleted);
+        assert!(header.contains("deleted file mode 100644"));
+        assert_eq!(hunks, vec!["@@ -1,2 +0,0 @@\n-first\n-second\n"]);
+        let range = parse_hunk_header(hunks[0].lines().next().unwrap()).unwrap();
+        assert_eq!((range.old_start, range.old_count), (1, 2));
+        assert_eq!((range.new_start, range.new_count), (0, 0));
+    }
+
+    #[test]
+    fn split_hunks_tolerates_zero_context_and_mismatched_counts() {
+        // Zero context lines and a header that claims 9 lines while the body
+        // holds two: splitting must not validate counts, git apply will.
+        let patch = "--- a/x\n+++ b/x\n@@ -4,0 +5,9 @@\n+one\n+two\n@@ -30,2 +30,2 @@\n context\n-old\n+new\n";
+        let (header, hunks) = split_hunks(patch);
+        assert_eq!(header, "--- a/x\n+++ b/x\n");
+        assert_eq!(hunks.len(), 2);
+        assert_eq!(hunks[0], "@@ -4,0 +5,9 @@\n+one\n+two\n");
+        assert_eq!(hunks[1], "@@ -30,2 +30,2 @@\n context\n-old\n+new\n");
+        assert_eq!(
+            parse_hunk_header("@@ -4 +5 @@"),
+            Some(HunkRange {
+                old_start: 4,
+                old_count: 1,
+                new_start: 5,
+                new_count: 1,
+            })
+        );
+
+        // A missing final newline is repaired so the hunk can be applied.
+        let (_, hunks) = split_hunks("--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b");
+        assert_eq!(hunks, vec!["@@ -1 +1 @@\n-a\n+b\n"]);
+        assert_eq!(split_hunks("Binary files a/x and b/x differ\n").1.len(), 0);
+    }
+
+    fn test_repo(tag: &str) -> PathBuf {
+        use std::sync::atomic::AtomicUsize;
+        static SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+        let id = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("kestrel-hunk-{}-{tag}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("创建临时仓库目录");
+        root
+    }
+
+    fn git_ok(root: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .current_dir(root)
+            .args([
+                "-c",
+                "user.name=Kestrel Test",
+                "-c",
+                "user.email=test@kestrel.invalid",
+                "-c",
+                "core.autocrlf=false",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .expect("git 不可用");
+        assert!(
+            out.status.success(),
+            "git {args:?} 失败: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn stage_patch_stages_only_the_selected_hunk() {
+        let root = test_repo("stage");
+        git_ok(&root, &["init", "-q"]);
+        let original: String = (1..=40).map(|line| format!("line {line}\n")).collect();
+        std::fs::write(root.join("file.txt"), &original).unwrap();
+        git_ok(&root, &["add", "file.txt"]);
+        git_ok(&root, &["commit", "-q", "-m", "base"]);
+
+        // Two edits far apart so git reports two separate hunks.
+        let edited = original
+            .replace("line 3\n", "line 3 changed\n")
+            .replace("line 33\n", "line 33 changed\n");
+        std::fs::write(root.join("file.txt"), &edited).unwrap();
+
+        let (header, hunks) = split_hunks(&worktree_patch(&root, "file.txt"));
+        assert_eq!(hunks.len(), 2, "两处修改应拆成两个 hunk");
+        let second = hunk_patch(&header, &hunks, 1).expect("第二个块");
+        stage_patch(&root, &second).expect("暂存第二个块");
+
+        let cached = staged_patch(&root, "file.txt");
+        assert!(
+            cached.contains("+line 33 changed"),
+            "暂存区应只有第二个块: {cached}"
+        );
+        assert!(
+            !cached.contains("line 3 changed"),
+            "暂存区不应包含第一个块: {cached}"
+        );
+        let (_, remaining) = split_hunks(&worktree_patch(&root, "file.txt"));
+        assert_eq!(remaining.len(), 1, "工作区只剩第一个块");
+        assert!(remaining[0].contains("line 3 changed"));
+
+        // Reverse the same filtered patch: the index is clean again.
+        unstage_patch(&root, &second).expect("取消暂存第二个块");
+        assert!(staged_patch(&root, "file.txt").is_empty());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

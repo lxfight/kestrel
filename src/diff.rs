@@ -14,7 +14,7 @@ use egui::{
 };
 
 use crate::editor::EditorStyle;
-use crate::git::{self, GitFileStatus};
+use crate::git::{self, GitFileStatus, HunkRange};
 use crate::highlight::{HighlightState, Language, Span};
 use crate::icons::{self, Icon};
 use crate::theme::Theme;
@@ -54,6 +54,26 @@ pub struct InlineRow {
     pub hl: Option<(u32, u32)>,
 }
 
+/// One Git hunk placed in the view: the header row it introduces and how many
+/// lines it touches.
+pub struct HunkMeta {
+    pub header: String,
+    pub added: usize,
+    pub removed: usize,
+    pub first_row: usize,
+    pub inline_row: usize,
+}
+
+impl HunkMeta {
+    pub fn start(&self, inline: bool) -> usize {
+        if inline {
+            self.inline_row
+        } else {
+            self.first_row
+        }
+    }
+}
+
 pub struct FileDiff {
     pub rel_path: String,
     pub staged: bool,
@@ -69,6 +89,11 @@ pub struct FileDiff {
     pub inline_rows: Vec<InlineRow>,
     /// Row indices where a change block starts (navigation targets).
     pub changes: Vec<usize>,
+    /// File header and raw hunks of the backing Git patch; the per-hunk buttons
+    /// apply exactly these and nothing for untracked/binary files.
+    pub patch_header: String,
+    pub patch_hunks: Vec<String>,
+    pub hunks: Vec<HunkMeta>,
     pub coarse: bool,
     max_chars: usize,
 }
@@ -76,6 +101,20 @@ pub struct FileDiff {
 impl FileDiff {
     pub fn change_count(&self) -> usize {
         self.changes.len()
+    }
+
+    /// File header plus one hunk only: the patch handed to `git apply`.
+    pub fn hunk_patch(&self, index: usize) -> Option<String> {
+        git::hunk_patch(&self.patch_header, &self.patch_hunks, index)
+    }
+
+    /// View row of a content row once the hunk header rows above it are counted.
+    pub fn display_row(&self, row: usize, inline: bool) -> usize {
+        row + self
+            .hunks
+            .iter()
+            .filter(|hunk| hunk.start(inline) <= row)
+            .count()
     }
 }
 
@@ -103,6 +142,8 @@ pub struct DiffTab {
     pub pending_scroll_row: Option<usize>,
     pub h_scroll: f32,
     pub tab_size: usize,
+    /// Hunk button command for `KestrelApp` to apply outside the paint pass.
+    pub pending: Option<DiffCommand>,
 }
 
 impl DiffTab {
@@ -122,6 +163,7 @@ impl DiffTab {
             pending_scroll_row: None,
             h_scroll: 0.0,
             tab_size: 4,
+            pending: None,
         }
     }
 
@@ -137,6 +179,7 @@ impl DiffTab {
         self.error = None;
         self.current_change = 0;
         self.h_scroll = 0.0;
+        self.pending = None;
         let (tx, rx) = channel();
         std::thread::Builder::new()
             .name("kestrel-diff".into())
@@ -195,6 +238,32 @@ pub enum DiffAction {
     None,
     OpenFile(PathBuf),
     Refresh,
+}
+
+/// A Git hunk command raised by a hunk header button. The `DiffAction` dispatch
+/// lives in `ui/mod.rs`, which this batch does not touch, so the view parks the
+/// command on the tab and `KestrelApp::pump_background` drains it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DiffCommand {
+    Stage { hunk: usize },
+    Unstage { hunk: usize },
+    Discard { hunk: usize },
+}
+
+impl DiffCommand {
+    pub fn hunk(self) -> usize {
+        match self {
+            Self::Stage { hunk } | Self::Unstage { hunk } | Self::Discard { hunk } => hunk,
+        }
+    }
+
+    pub fn success_label(self) -> &'static str {
+        match self {
+            Self::Stage { .. } => "已暂存所选差异块",
+            Self::Unstage { .. } => "已取消暂存所选差异块",
+            Self::Discard { .. } => "已丢弃所选差异块",
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -369,6 +438,13 @@ pub fn load_file_diff(
         .max()
         .unwrap_or(0);
     let inline_rows = build_inline_rows(&rows);
+    let patch = if staged {
+        git::staged_patch(root, &rel_path)
+    } else {
+        git::worktree_patch(root, &rel_path)
+    };
+    let (patch_header, patch_hunks) = git::split_hunks(&patch);
+    let hunks = place_hunks(&patch_hunks, &rows, &inline_rows);
 
     Ok(FileDiff {
         rel_path,
@@ -384,9 +460,87 @@ pub fn load_file_diff(
         rows,
         inline_rows,
         changes,
+        patch_header,
+        patch_hunks,
+        hunks,
         coarse,
         max_chars,
     })
+}
+
+/// Place every raw patch hunk on the view row where its header belongs. The UI
+/// diff algorithm may pair lines differently than git, but line numbers stay
+/// exact, so a hunk starts at the first row whose old/new line falls inside it.
+fn place_hunks(raw: &[String], rows: &[DiffRow], inline_rows: &[InlineRow]) -> Vec<HunkMeta> {
+    let mut hunks = Vec::with_capacity(raw.len());
+    let mut row_cursor = 0;
+    let mut inline_cursor = 0;
+    for text in raw {
+        let header = text
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim_end_matches('\r')
+            .to_string();
+        let mut added = 0;
+        let mut removed = 0;
+        for line in text.lines().skip(1) {
+            if line.starts_with('+') {
+                added += 1;
+            } else if line.starts_with('-') {
+                removed += 1;
+            }
+        }
+        if let Some(range) = git::parse_hunk_header(&header) {
+            row_cursor = find_hunk_row(rows, range, row_cursor);
+            inline_cursor = find_hunk_inline_row(inline_rows, range, inline_cursor);
+        }
+        hunks.push(HunkMeta {
+            header,
+            added,
+            removed,
+            first_row: row_cursor,
+            inline_row: inline_cursor,
+        });
+    }
+    hunks
+}
+
+fn find_hunk_row(rows: &[DiffRow], range: HunkRange, from: usize) -> usize {
+    let old_end = range.old_start as u64 + range.old_count as u64;
+    let new_end = range.new_start as u64 + range.new_count as u64;
+    let hit = |row: &DiffRow| {
+        row.left.is_some_and(|line| {
+            let line = line as u64 + 1;
+            line >= range.old_start as u64 && line < old_end
+        }) || row.right.is_some_and(|line| {
+            let line = line as u64 + 1;
+            line >= range.new_start as u64 && line < new_end
+        })
+    };
+    let start = from.min(rows.len());
+    rows[start..]
+        .iter()
+        .position(hit)
+        .map_or(start, |offset| start + offset)
+}
+
+fn find_hunk_inline_row(rows: &[InlineRow], range: HunkRange, from: usize) -> usize {
+    let old_end = range.old_start as u64 + range.old_count as u64;
+    let new_end = range.new_start as u64 + range.new_count as u64;
+    let hit = |row: &InlineRow| {
+        let line = row.line as u64 + 1;
+        if row.left_side {
+            line >= range.old_start as u64 && line < old_end
+        } else {
+            line >= range.new_start as u64 && line < new_end
+        }
+    };
+    let start = from.min(rows.len());
+    rows[start..]
+        .iter()
+        .position(hit)
+        .map_or(start, |offset| start + offset)
 }
 
 fn build_inline_rows(rows: &[DiffRow]) -> Vec<InlineRow> {
@@ -966,17 +1120,28 @@ pub fn diff_ui(
         .auto_shrink([false, false])
         .id_salt(("diff_scroll", data.rel_path.as_str(), data.staged));
     if let Some(row) = tab.pending_scroll_row.take() {
+        let row = data.display_row(row, tab.inline);
         scroll = scroll.vertical_scroll_offset((row as f32 - 2.0).max(0.0) * line_h);
     }
     let out = scroll.show(ui, |ui| {
         let width = ui.available_width();
-        let rows = if tab.inline {
+        let inline = tab.inline;
+        let content_rows = if inline {
             data.inline_rows.len()
         } else {
             data.rows.len()
         };
+        // Each hunk header takes a row of its own, so the view height and the
+        // scroll mapping count one extra line per hunk.
+        let hunk_starts: Vec<usize> = data
+            .hunks
+            .iter()
+            .enumerate()
+            .map(|(index, hunk)| hunk.start(inline) + index)
+            .collect();
+        let total_rows = content_rows + hunk_starts.len();
         let (rect, resp) = ui.allocate_exact_size(
-            Vec2::new(width, rows as f32 * line_h),
+            Vec2::new(width, total_rows as f32 * line_h),
             Sense::click(),
         );
         resp.context_menu(|ui| {
@@ -1008,14 +1173,33 @@ pub fn diff_ui(
         let clip = ui.clip_rect().intersect(rect);
         let first = (((clip.top() - rect.top()) / line_h).floor().max(0.0)) as usize;
         let last = ((((clip.bottom() - rect.top()) / line_h).ceil()) as usize)
-            .min(rows);
+            .min(total_rows);
         if first >= last {
             return;
         }
         let painter = ui.painter().with_clip_rect(clip);
         let line_number_color = theme.text_faint;
-        for row_index in first..last {
-            let y = rect.top() + row_index as f32 * line_h;
+        let mut header_cursor = hunk_starts.partition_point(|&start| start < first);
+        for display_index in first..last {
+            let y = rect.top() + display_index as f32 * line_h;
+            if header_cursor < hunk_starts.len() && hunk_starts[header_cursor] == display_index {
+                hunk_header_ui(
+                    ui,
+                    &painter,
+                    data,
+                    tab,
+                    header_cursor,
+                    rect.left(),
+                    y,
+                    width,
+                    line_h,
+                    style,
+                    theme,
+                );
+                header_cursor += 1;
+                continue;
+            }
+            let row_index = display_index - header_cursor;
             if tab.inline {
                 let layout = InlineLayout { gutter_w };
                 paint_inline_row(
@@ -1121,6 +1305,118 @@ pub fn diff_ui(
 
     tab.data = data_holder;
     action
+}
+
+/// Hunk header row: `@@ … @@` summary plus the per-hunk Git buttons.
+#[allow(clippy::too_many_arguments)]
+fn hunk_header_ui(
+    ui: &Ui,
+    painter: &egui::Painter,
+    data: &FileDiff,
+    tab: &mut DiffTab,
+    index: usize,
+    x: f32,
+    y: f32,
+    width: f32,
+    line_h: f32,
+    style: &UiStyle,
+    theme: Theme,
+) {
+    let Some(hunk) = data.hunks.get(index) else {
+        return;
+    };
+    let line = Rect::from_min_size(Pos2::new(x, y), Vec2::new(width, line_h));
+    painter.rect_filled(line, 0.0, theme.input_bg.gamma_multiply(0.85));
+    painter.line_segment(
+        [line.left_top(), line.right_top()],
+        Stroke::new(1.0, theme.border),
+    );
+    painter.text(
+        Pos2::new(line.left() + 14.0, line.center().y),
+        Align2::LEFT_CENTER,
+        format!("{}  +{} -{}", hunk.header, hunk.added, hunk.removed),
+        style.tiny(),
+        theme.text_faint,
+    );
+
+    // Right-to-left: discard sits outermost, the stage/unstage action next to it.
+    let mut right = line.right() - 6.0;
+    if hunk_button(
+        ui,
+        painter,
+        &mut right,
+        line,
+        style,
+        theme,
+        ("hunk_discard", data.rel_path.as_str(), data.staged, index),
+        "丢弃",
+        theme.git_deleted,
+    ) {
+        tab.pending = Some(DiffCommand::Discard { hunk: index });
+    }
+    let (label, color, command) = if tab.staged {
+        (
+            "取消暂存",
+            theme.accent,
+            DiffCommand::Unstage { hunk: index },
+        )
+    } else {
+        (
+            "暂存此块",
+            theme.git_added,
+            DiffCommand::Stage { hunk: index },
+        )
+    };
+    if hunk_button(
+        ui,
+        painter,
+        &mut right,
+        line,
+        style,
+        theme,
+        ("hunk_apply", data.rel_path.as_str(), data.staged, index),
+        label,
+        color,
+    ) {
+        tab.pending = Some(command);
+    }
+}
+
+/// Small text button laid out right-to-left inside a hunk header row.
+#[allow(clippy::too_many_arguments)]
+fn hunk_button(
+    ui: &Ui,
+    painter: &egui::Painter,
+    right: &mut f32,
+    line: Rect,
+    style: &UiStyle,
+    theme: Theme,
+    salt: (&str, &str, bool, usize),
+    label: &str,
+    color: Color32,
+) -> bool {
+    let width = measure_width(ui, style, label, style.tiny()) + 14.0;
+    let rect = Rect::from_min_size(
+        Pos2::new(*right - width, line.top() + 2.0),
+        Vec2::new(width, line.height() - 4.0),
+    );
+    *right -= width + 6.0;
+    let response = ui.interact(rect, ui.scope_id().with(salt), Sense::click());
+    if response.hovered() {
+        painter.rect_filled(rect, CornerRadius::same(4), theme.hover);
+    }
+    painter.text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        label,
+        style.tiny(),
+        if response.hovered() {
+            theme.text
+        } else {
+            color
+        },
+    );
+    response.clicked()
 }
 
 struct InlineLayout {
@@ -1479,4 +1775,143 @@ mod tests {
         assert_eq!(line_text(text, &line_starts(text), 1), "b");
         assert_eq!(split_lines(text), vec!["a", "b"]);
     }
+
+    #[test]
+    fn patch_hunks_are_placed_on_their_rows() {
+        let (rows, _, _) = compute_rows(&["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"], &["a", "b", "C", "d", "e", "f", "g", "h", "I", "j"]);
+        let inline_rows = build_inline_rows(&rows);
+        let patch = "--- a/x\n+++ b/x\n@@ -2,3 +2,3 @@\n b\n-c\n+C\n d\n@@ -8,3 +8,3 @@\n h\n-i\n+I\n j\n";
+        let (header, raw) = git::split_hunks(patch);
+        assert_eq!(header, "--- a/x\n+++ b/x\n");
+        let hunks = place_hunks(&raw, &rows, &inline_rows);
+        assert_eq!(hunks.len(), 2);
+        assert_eq!(hunks[0].header, "@@ -2,3 +2,3 @@");
+        assert_eq!((hunks[0].added, hunks[0].removed), (1, 1));
+        assert_eq!((hunks[0].first_row, hunks[0].inline_row), (1, 1));
+        assert_eq!((hunks[1].first_row, hunks[1].inline_row), (7, 8));
+        assert_eq!(hunks[1].start(false), 7);
+        assert_eq!(hunks[1].start(true), 8);
+    }
+
+    fn git_test(root: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .current_dir(root)
+            .args([
+                "-c",
+                "user.name=Kestrel Test",
+                "-c",
+                "user.email=test@kestrel.invalid",
+                "-c",
+                "core.autocrlf=false",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .expect("git 不可用");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Temp repo with two far-apart edits in file.txt, i.e. two hunks.
+    fn two_change_repo(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+        let id = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("kestrel-diff-{tag}-{}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        git_test(&root, &["init", "-q"]);
+        let original: String = (1..=40).map(|line| format!("line {line}\n")).collect();
+        std::fs::write(root.join("file.txt"), &original).unwrap();
+        git_test(&root, &["add", "file.txt"]);
+        git_test(&root, &["commit", "-q", "-m", "base"]);
+        let edited = original
+            .replace("line 3\n", "line 3 changed\n")
+            .replace("line 33\n", "line 33 changed\n");
+        std::fs::write(root.join("file.txt"), &edited).unwrap();
+        root
+    }
+
+    #[test]
+    fn load_file_diff_attaches_applicable_hunks() {
+        let root = two_change_repo("load");
+        let path = root.join("file.txt");
+        let data = load_file_diff(&root, &path, false, GitFileStatus::Modified, None, 4).unwrap();
+        assert_eq!(data.hunks.len(), 2);
+        assert!(data.hunk_patch(0).unwrap().contains("+line 3 changed"));
+        assert!(data.hunk_patch(1).unwrap().contains("+line 33 changed"));
+        assert!(data.hunk_patch(2).is_none());
+        assert_eq!(data.hunks[0].added, 1);
+        assert!(data.hunks[1].first_row > data.hunks[0].first_row);
+
+        // The staged view reads the cached patch the same way.
+        git_test(&root, &["add", "file.txt"]);
+        let staged = load_file_diff(&root, &path, true, GitFileStatus::Modified, None, 4).unwrap();
+        assert_eq!(staged.hunks.len(), 2);
+        assert!(staged.hunk_patch(1).unwrap().contains("+line 33 changed"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn diff_ui_paints_hunk_headers_without_panicking() {
+        let root = two_change_repo("ui");
+        let path = root.join("file.txt");
+        let data = load_file_diff(&root, &path, false, GitFileStatus::Modified, None, 4).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(data.hunks.len(), 2);
+
+        let theme = Theme::dark();
+        let style = UiStyle {
+            theme,
+            ui_family: egui::FontFamily::Proportional,
+            ui_bold_family: egui::FontFamily::Proportional,
+            mono_family: egui::FontFamily::Monospace,
+            ui_size: 13.0,
+        };
+        let editor_style = EditorStyle {
+            theme,
+            font_size: 13.0,
+            line_h: 18.0,
+            tab_size: 4,
+            insert_spaces: true,
+            show_minimap: false,
+            show_line_numbers: true,
+            show_indent_guides: false,
+            show_whitespace: false,
+            show_sticky_scroll: false,
+            show_git_gutter: false,
+            autocomplete: false,
+            word_wrap: false,
+            scroll_past_end: false,
+            ui_size: 13.0,
+            ui_family: egui::FontFamily::Proportional,
+            mono_family: egui::FontFamily::Monospace,
+        };
+        let mut tab = DiffTab::new(
+            path,
+            "file.txt".to_string(),
+            false,
+            GitFileStatus::Modified,
+        );
+        tab.data = Some(data);
+        let ctx = egui::Context::default();
+        // Two passes: egui resolves widget interaction against the previous
+        // frame, so the second pass exercises the real button rects.
+        for _ in 0..2 {
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let action = diff_ui(ui, &style, &editor_style, &mut tab);
+                    assert!(matches!(action, DiffAction::None));
+                });
+            });
+            output.textures_delta.clear();
+        }
+        assert!(tab.pending.is_none());
+    }
 }
+
