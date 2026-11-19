@@ -264,58 +264,85 @@ pub fn paint_codicon(painter: &Painter, rect: Rect, ch: char, color: Color32) {
     );
 }
 
+/// Pick the dark- or light-theme variant of a badge color.
+const fn tint(dark: bool, dark_rgb: [u8; 3], light_rgb: [u8; 3]) -> Color32 {
+    let c = if dark { dark_rgb } else { light_rgb };
+    Color32::from_rgb(c[0], c[1], c[2])
+}
+
 /// Semantic color for a file extension.
-pub fn file_color(ext: &str) -> Color32 {
+///
+/// The light set is the darkened variant: the pastel badges tuned for a dark
+/// background sit at 1.5-2.5:1 on the light editor surface.
+pub fn file_color(ext: &str, dark: bool) -> Color32 {
     match ext.to_ascii_lowercase().as_str() {
-        "rs" => Color32::from_rgb(0xE4, 0x7B, 0x45),
-        "py" | "pyi" | "pyw" => Color32::from_rgb(0x4B, 0x9C, 0xD3),
-        "js" | "mjs" | "cjs" => Color32::from_rgb(0xF0, 0xDB, 0x4F),
-        "jsx" => Color32::from_rgb(0x61, 0xDA, 0xFB),
-        "ts" | "mts" | "cts" => Color32::from_rgb(0x31, 0x78, 0xC6),
-        "tsx" => Color32::from_rgb(0x58, 0xC4, 0xDC),
-        "json" | "jsonc" | "json5" => Color32::from_rgb(0xF0, 0xC6, 0x54),
-        "toml" => Color32::from_rgb(0xC8, 0x8A, 0xF0),
-        "md" | "markdown" | "mdx" => Color32::from_rgb(0x6C, 0xB6, 0xFF),
-        "html" | "htm" | "vue" | "svelte" => Color32::from_rgb(0xE4, 0x4D, 0x26),
-        "css" | "scss" | "less" => Color32::from_rgb(0x56, 0x9C, 0xD6),
-        "go" => Color32::from_rgb(0x00, 0xAD, 0xD8),
-        "c" => Color32::from_rgb(0x65, 0x9A, 0xD2),
-        "h" | "hpp" | "hh" => Color32::from_rgb(0xB0, 0x8A, 0xE0),
-        "cpp" | "cc" | "cxx" => Color32::from_rgb(0x5B, 0x9B, 0xE5),
-        "java" | "jar" | "class" => Color32::from_rgb(0xE8, 0x7B, 0x35),
-        "cs" => Color32::from_rgb(0x9B, 0x6F, 0xE0),
-        "sh" | "bash" | "zsh" | "ps1" | "bat" | "cmd" => Color32::from_rgb(0x73, 0xC9, 0x91),
-        "yml" | "yaml" => Color32::from_rgb(0xE0, 0x6C, 0x75),
-        "lock" => Color32::from_rgb(0xD1, 0x9A, 0x66),
-        "gitignore" | "gitattributes" | "gitmodules" => Color32::from_rgb(0xF1, 0x4E, 0x32),
-        "png" | "jpg" | "jpeg" | "gif" | "svg" | "ico" | "webp" | "bmp" | "tif" | "tiff" => {
-            Color32::from_rgb(0xC6, 0x78, 0xDD)
+        "rs" => tint(dark, [0xE4, 0x7B, 0x45], [0xB5, 0x45, 0x1A]),
+        "py" | "pyi" | "pyw" => tint(dark, [0x4B, 0x9C, 0xD3], [0x1F, 0x5F, 0xBF]),
+        "js" | "mjs" | "cjs" => tint(dark, [0xF0, 0xDB, 0x4F], [0x8A, 0x6A, 0x00]),
+        "jsx" => tint(dark, [0x61, 0xDA, 0xFB], [0x0B, 0x6E, 0x80]),
+        "ts" | "mts" | "cts" => tint(dark, [0x31, 0x78, 0xC6], [0x2A, 0x5F, 0xA8]),
+        "tsx" => tint(dark, [0x58, 0xC4, 0xDC], [0x0E, 0x6E, 0x80]),
+        "json" | "jsonc" | "json5" => tint(dark, [0xF0, 0xC6, 0x54], [0x8A, 0x5A, 0x00]),
+        "toml" => tint(dark, [0xC8, 0x8A, 0xF0], [0x7A, 0x34, 0xA8]),
+        "md" | "markdown" | "mdx" => tint(dark, [0x6C, 0xB6, 0xFF], [0x1F, 0x5F, 0xBF]),
+        "html" | "htm" | "vue" | "svelte" => tint(dark, [0xE4, 0x4D, 0x26], [0xB3, 0x36, 0x1A]),
+        "css" | "scss" | "less" => tint(dark, [0x56, 0x9C, 0xD6], [0x2A, 0x5F, 0xA8]),
+        "go" => tint(dark, [0x00, 0xAD, 0xD8], [0x00, 0x69, 0x7A]),
+        "c" => tint(dark, [0x65, 0x9A, 0xD2], [0x2A, 0x5F, 0xA8]),
+        "h" | "hpp" | "hh" => tint(dark, [0xB0, 0x8A, 0xE0], [0x6B, 0x3F, 0xA0]),
+        "cpp" | "cc" | "cxx" => tint(dark, [0x5B, 0x9B, 0xE5], [0x1F, 0x5F, 0xBF]),
+        "java" | "jar" | "class" => tint(dark, [0xE8, 0x7B, 0x35], [0xA8, 0x50, 0x1A]),
+        "cs" => tint(dark, [0x9B, 0x6F, 0xE0], [0x6B, 0x3F, 0xA0]),
+        "sh" | "bash" | "zsh" | "ps1" | "bat" | "cmd" => {
+            tint(dark, [0x73, 0xC9, 0x91], [0x1F, 0x6E, 0x2E])
         }
-        "pdf" => Color32::from_rgb(0xE0, 0x52, 0x52),
-        "docx" | "doc" => Color32::from_rgb(0x2B, 0x7C, 0xD3),
-        "xlsx" | "xlsm" | "xls" | "csv" | "tsv" => Color32::from_rgb(0x21, 0xA3, 0x66),
-        "zip" | "tar" | "gz" | "7z" | "rar" => Color32::from_rgb(0xD1, 0x9A, 0x66),
-        "exe" | "dll" | "so" | "dylib" | "bin" => Color32::from_rgb(0x98, 0xA2, 0xB3),
-        _ => Color32::from_rgb(0x8A, 0x96, 0xAA),
+        "yml" | "yaml" => tint(dark, [0xE0, 0x6C, 0x75], [0xB3, 0x26, 0x1E]),
+        "lock" => tint(dark, [0xD1, 0x9A, 0x66], [0x8A, 0x5A, 0x00]),
+        "gitignore" | "gitattributes" | "gitmodules" => {
+            tint(dark, [0xF1, 0x4E, 0x32], [0xB3, 0x26, 0x1E])
+        }
+        "png" | "jpg" | "jpeg" | "gif" | "svg" | "ico" | "webp" | "bmp" | "tif" | "tiff" => {
+            tint(dark, [0xC6, 0x78, 0xDD], [0x82, 0x26, 0xA8])
+        }
+        "pdf" => tint(dark, [0xE0, 0x52, 0x52], [0xB3, 0x26, 0x1E]),
+        "docx" | "doc" => tint(dark, [0x2B, 0x7C, 0xD3], [0x1F, 0x5F, 0xBF]),
+        "xlsx" | "xlsm" | "xls" | "csv" | "tsv" => {
+            tint(dark, [0x21, 0xA3, 0x66], [0x1F, 0x6E, 0x2E])
+        }
+        "zip" | "tar" | "gz" | "7z" | "rar" => {
+            tint(dark, [0xD1, 0x9A, 0x66], [0x8A, 0x5A, 0x00])
+        }
+        "exe" | "dll" | "so" | "dylib" | "bin" => {
+            tint(dark, [0x98, 0xA2, 0xB3], [0x5A, 0x62, 0x72])
+        }
+        _ => tint(dark, [0x8A, 0x96, 0xAA], [0x5A, 0x62, 0x72]),
     }
 }
 
 /// Semantic accent color for well-known directory names.
-pub fn folder_color(name: &str, default_color: Color32) -> Color32 {
+///
+/// Unknown names fall back to the caller-supplied color, so the tree inherits
+/// the theme text color instead of a fixed blue-grey.
+pub fn folder_color(name: &str, default_color: Color32, dark: bool) -> Color32 {
     match name.to_ascii_lowercase().as_str() {
-        "src" | "source" | "lib" => Color32::from_rgb(0x5A, 0xA3, 0xF2),
-        "ui" | "views" | "components" | "theme" => Color32::from_rgb(0xC8, 0x8A, 0xF0),
-        "editor" | "core" | "engine" => Color32::from_rgb(0x67, 0xD6, 0xC6),
-        "workspace" | "project" => Color32::from_rgb(0xEF, 0xBF, 0x7D),
-        "highlight" | "syntax" | "lsp" => Color32::from_rgb(0x8F, 0xD3, 0xA0),
-        "docs" | "doc" => Color32::from_rgb(0x7B, 0xB6, 0xFF),
-        "scripts" | "tools" | "bin" => Color32::from_rgb(0x56, 0xB6, 0xC2),
-        "tests" | "test" | "benches" => Color32::from_rgb(0x6D, 0xD4, 0x9A),
-        "assets" | "resources" | "icons" | "images" => Color32::from_rgb(0xE5, 0xC0, 0x7B),
-        ".git" | ".github" | ".vscode" => Color32::from_rgb(0xF0, 0x88, 0x3E),
-        "target" | "dist" | "build" | "out" | "node_modules" => Color32::from_rgb(0x76, 0x80, 0x94),
-        _ if default_color != Color32::TRANSPARENT => default_color,
-        _ => Color32::from_rgb(0x8E, 0x9E, 0xB8),
+        "src" | "source" | "lib" => tint(dark, [0x5A, 0xA3, 0xF2], [0x2F, 0x6F, 0xDE]),
+        "ui" | "views" | "components" | "theme" => {
+            tint(dark, [0xC8, 0x8A, 0xF0], [0x7A, 0x34, 0xA8])
+        }
+        "editor" | "core" | "engine" => tint(dark, [0x67, 0xD6, 0xC6], [0x0E, 0x74, 0x90]),
+        "workspace" | "project" => tint(dark, [0xEF, 0xBF, 0x7D], [0x8A, 0x5A, 0x00]),
+        "highlight" | "syntax" | "lsp" => tint(dark, [0x8F, 0xD3, 0xA0], [0x2E, 0x7D, 0x32]),
+        "docs" | "doc" => tint(dark, [0x7B, 0xB6, 0xFF], [0x1F, 0x5F, 0xBF]),
+        "scripts" | "tools" | "bin" => tint(dark, [0x56, 0xB6, 0xC2], [0x0B, 0x6E, 0x80]),
+        "tests" | "test" | "benches" => tint(dark, [0x6D, 0xD4, 0x9A], [0x1F, 0x6E, 0x2E]),
+        "assets" | "resources" | "icons" | "images" => {
+            tint(dark, [0xE5, 0xC0, 0x7B], [0x8A, 0x6A, 0x1F])
+        }
+        ".git" | ".github" | ".vscode" => tint(dark, [0xF0, 0x88, 0x3E], [0xB0, 0x4A, 0x18]),
+        "target" | "dist" | "build" | "out" | "node_modules" => {
+            tint(dark, [0x76, 0x80, 0x94], [0x5A, 0x62, 0x72])
+        }
+        _ => default_color,
     }
 }
 
@@ -336,6 +363,7 @@ pub fn paint_path_icon(
     is_dir: bool,
     expanded: bool,
     fallback_color: Color32,
+    dark: bool,
 ) {
     let name = path
         .file_name()
@@ -343,7 +371,7 @@ pub fn paint_path_icon(
         .unwrap_or_default()
         .to_ascii_lowercase();
     if is_dir {
-        let color = folder_color(&name, fallback_color);
+        let color = folder_color(&name, fallback_color, dark);
         paint_folder_duotone(painter, rect, color, expanded);
         return;
     }
@@ -356,29 +384,29 @@ pub fn paint_path_icon(
     // Special filenames first.
     match name.as_str() {
         ".gitignore" | ".gitattributes" | ".gitmodules" => {
-            paint_codicon(painter, rect, '\u{ea68}', Color32::from_rgb(0xF1, 0x4E, 0x32));
+            paint_codicon(painter, rect, '\u{ea68}', file_color("gitignore", dark));
             return;
         }
         "cargo.lock" | "package-lock.json" | "pnpm-lock.yaml" | "yarn.lock" | "uv.lock" => {
-            paint_codicon(painter, rect, '\u{ea75}', Color32::from_rgb(0xD1, 0x9A, 0x66));
+            paint_codicon(painter, rect, '\u{ea75}', file_color("lock", dark));
             return;
         }
         "cargo.toml" => {
-            paint_badge(painter, rect, "CG", Color32::from_rgb(0xE4, 0x7B, 0x45));
+            paint_badge(painter, rect, "CG", file_color("rs", dark));
             return;
         }
         "license" | "license.md" | "license.txt" => {
-            paint_codicon(painter, rect, '\u{eb12}', Color32::from_rgb(0xE5, 0xC0, 0x7B));
+            paint_codicon(painter, rect, '\u{eb12}', folder_color("assets", Color32::TRANSPARENT, dark));
             return;
         }
         "readme.md" | "readme" => {
-            paint_codicon(painter, rect, '\u{eb1d}', Color32::from_rgb(0x6C, 0xB6, 0xFF));
+            paint_codicon(painter, rect, '\u{eb1d}', file_color("md", dark));
             return;
         }
         _ => {}
     }
 
-    let color = file_color(&ext);
+    let color = file_color(&ext, dark);
     match ext.as_str() {
         "rs" => paint_badge(painter, rect, "RS", color),
         "ts" | "mts" | "cts" => paint_badge(painter, rect, "TS", color),

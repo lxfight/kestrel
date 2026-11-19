@@ -1,12 +1,13 @@
 //! Command palette / quick open / goto line / symbol outline / branch switcher overlay.
 
 use egui::{
-    Align2, Area, CornerRadius, Frame, Key, Margin, Order, Pos2, Rect, Sense, Stroke, Ui, Vec2,
+    Align2, Area, CornerRadius, Frame, Key, Margin, Order, Pos2, Rect, Sense, Stroke, Ui, UiBuilder,
+    Vec2,
 };
 
 use crate::app::{KestrelApp, PaletteItem, PaletteMode};
 use crate::icons::{self, Icon};
-use crate::ui::UiStyle;
+use crate::ui::{widgets, UiStyle};
 
 const MAX_ROWS: usize = 12;
 const ROW_H: f32 = 30.0;
@@ -106,49 +107,8 @@ impl KestrelApp {
                     ui.set_width(620.0);
                     ui.horizontal(|ui| {
                         ui.add_space(12.0);
-                        let (rect, resp) =
-                            ui.allocate_exact_size(Vec2::new(596.0, 42.0), Sense::click());
-                        let input_id = ui.scope_id().with("palette_query");
-                        if self.palette.focus {
-                            ui.memory_mut(|m| m.request_focus(input_id));
-                            self.palette.focus = false;
-                        }
-                        if resp.clicked() {
-                            ui.memory_mut(|m| m.request_focus(input_id));
-                        }
-                        let focused = ui.memory(|m| m.focused()) == Some(input_id);
-                        if focused {
-                            let events = ui.input(|i| i.events.clone());
-                            for event in events {
-                                match event {
-                                    egui::Event::Text(text) => {
-                                        self.palette.query.push_str(&text);
-                                        self.palette.needs_filter = true;
-                                        self.palette.selected = 0;
-                                    }
-                                    egui::Event::Ime(egui::ImeEvent::Commit(text)) => {
-                                        self.palette.query.push_str(&text);
-                                        self.palette.needs_filter = true;
-                                        self.palette.selected = 0;
-                                    }
-                                    egui::Event::Paste(text) => {
-                                        self.palette.query.push_str(&text);
-                                        self.palette.needs_filter = true;
-                                        self.palette.selected = 0;
-                                    }
-                                    egui::Event::Key {
-                                        key: Key::Backspace,
-                                        pressed: true,
-                                        ..
-                                    } => {
-                                        self.palette.query.pop();
-                                        self.palette.needs_filter = true;
-                                        self.palette.selected = 0;
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
+                        let (rect, _) =
+                            ui.allocate_exact_size(Vec2::new(596.0, 42.0), Sense::hover());
                         let icon_rect = Rect::from_center_size(
                             Pos2::new(rect.left() + 16.0, rect.center().y),
                             Vec2::splat(16.0),
@@ -167,54 +127,32 @@ impl KestrelApp {
                             theme.accent,
                             1.4,
                         );
-                        let shown = if self.palette.query.is_empty() {
-                            query_hint.to_string()
-                        } else {
-                            self.palette.query.clone()
-                        };
-                        let color = if self.palette.query.is_empty() {
-                            theme.text_faint
-                        } else {
-                            theme.text
-                        };
-                        let font = style.font(14.5);
-                        ui.painter().text(
-                            Pos2::new(rect.left() + 34.0, rect.center().y),
-                            Align2::LEFT_CENTER,
-                            &shown,
-                            font.clone(),
-                            color,
+                        // A real text editor: IME preedit, selection, caret and
+                        // horizontal clipping all come from egui instead of hand-rolled state.
+                        let edit_rect = Rect::from_min_max(
+                            Pos2::new(rect.left() + 34.0, rect.top() + 9.0),
+                            Pos2::new(rect.right() - 8.0, rect.bottom() - 9.0),
                         );
-                        if focused {
-                            let t = ui.input(|i| i.time);
-                            if ((t - self.palette.blink_base) * 1.8).fract() < 0.62 {
-                                let width = if self.palette.query.is_empty() {
-                                    0.0
-                                } else {
-                                    ui.ctx().fonts_mut(|fonts| {
-                                        fonts
-                                            .layout_job(egui::text::LayoutJob::simple_singleline(
-                                                shown.clone(),
-                                                font.clone(),
-                                                color,
-                                            ))
-                                            .rect
-                                            .width()
-                                    })
-                                };
-                                let caret_x = rect.left() + 34.0 + width + 1.0;
-                                ui.painter().rect_filled(
-                                    Rect::from_min_size(
-                                        Pos2::new(caret_x, rect.center().y - 10.0),
-                                        Vec2::new(2.0, 20.0),
-                                    ),
-                                    CornerRadius::same(1),
-                                    theme.accent,
-                                );
-                            }
+                        let output = ui
+                            .scope_builder(UiBuilder::new().max_rect(edit_rect), |ui| {
+                                egui::TextEdit::singleline(&mut self.palette.query)
+                                    .frame(Frame::NONE)
+                                    .font(style.emph())
+                                    .text_color(theme.text)
+                                    .hint_text(query_hint)
+                                    .desired_width(edit_rect.width())
+                                    .margin(Margin::ZERO)
+                                    .show(ui)
+                            })
+                            .inner;
+                        if self.palette.focus {
+                            output.response.request_focus();
+                            self.palette.focus = false;
                         }
-                        if resp.clicked() {
-                            self.palette.blink_base = ui.input(|i| i.time);
+                        self.palette.blink_base = ui.input(|i| i.time);
+                        if output.response.changed() {
+                            self.palette.needs_filter = true;
+                            self.palette.selected = 0;
                         }
                     });
                     ui.painter().line_segment(
@@ -291,18 +229,21 @@ impl KestrelApp {
                         let Some(item) = item else {
                             continue;
                         };
-                        let (row_rect, row_resp) = ui.allocate_exact_size(
+                        let (row_rect, _) = ui.allocate_exact_size(
                             Vec2::new(ui.available_width(), ROW_H),
-                            Sense::click(),
+                            Sense::hover(),
                         );
-                        let hovered = row_resp.hovered();
-                        if selected || hovered {
-                            ui.painter().rect_filled(
-                                row_rect.shrink2(Vec2::new(6.0, 1.0)),
-                                CornerRadius::same(6),
-                                if selected { theme.active } else { theme.hover },
-                            );
-                        }
+                        let state = if selected {
+                            widgets::RowState::selected_row()
+                        } else {
+                            widgets::RowState::idle()
+                        };
+                        let row_resp = widgets::paint_row(
+                            ui,
+                            row_rect.shrink2(Vec2::new(6.0, 1.0)),
+                            &theme,
+                            state,
+                        );
                         if selected {
                             ui.painter().rect_filled(
                                 Rect::from_min_size(
@@ -410,6 +351,7 @@ impl KestrelApp {
                     false,
                     false,
                     theme.text_dim,
+                    theme.kind.is_dark(),
                 );
                 x += 24.0;
             }
