@@ -9,7 +9,7 @@ use egui::FontFamily;
 
 use crate::commands::{Command, Shortcut};
 use crate::devshot;
-use crate::doc::{Document, SaveOutcome};
+use crate::doc::{Document, Encoding, SaveOutcome};
 use crate::editor::{Editor, EditorStyle, FormatOutcome};
 use crate::fuzzy;
 use crate::git::{GitFileStatus, GitService};
@@ -638,6 +638,17 @@ pub struct KestrelApp {
 
     /// Last periodic session write (layout, panels, terminals; not just buffers).
     last_session_save: Instant,
+    /// Navigation history behind / ahead of the caret (Alt+← / Alt+→).
+    jump_back: Vec<JumpPoint>,
+    jump_forward: Vec<JumpPoint>,
+}
+
+/// A navigation target recorded by goto-definition / goto-line / symbol jumps.
+#[derive(Clone)]
+struct JumpPoint {
+    tab_id: u64,
+    path: Option<PathBuf>,
+    byte: usize,
 }
 
 impl KestrelApp {
@@ -724,6 +735,8 @@ impl KestrelApp {
             title_root: None,
             viewer_loads: Vec::new(),
             last_session_save: Instant::now(),
+            jump_back: Vec::new(),
+            jump_forward: Vec::new(),
         };
         app.apply_dev_env();
         if app.workspace.root.is_none() && app.tabs.is_empty() && app.dev_ui.is_none() {
@@ -2262,6 +2275,22 @@ impl KestrelApp {
         }
     }
 
+    /// Remember the current caret as a jump target for Alt+←.
+    fn record_jump_point(&mut self) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        self.jump_back.push(JumpPoint {
+            tab_id: tab.id,
+            path: tab.doc.path.clone(),
+            byte: tab.doc.char_to_byte(tab.caret),
+        });
+        if self.jump_back.len() > 100 {
+            self.jump_back.remove(0);
+        }
+        self.jump_forward.clear();
+    }
+
     pub fn goto_definition_by_name(&mut self, symbol: &str) {
         let current_path = self.active_path();
         let current_symbols = self
@@ -2275,6 +2304,7 @@ impl KestrelApp {
             &current_symbols,
             &files,
         ) {
+            self.record_jump_point();
             if let Some(path) = target_path {
                 self.open_file_at(path, byte_offset);
             } else if let Some(tab) = self.tabs.get_mut(self.active) {
@@ -2287,6 +2317,50 @@ impl KestrelApp {
             self.toast(format!("已跳转到 `{symbol}` 定义 (第 {line} 行)"), ToastKind::Info);
         } else {
             self.toast(format!("未找到符号 `{symbol}` 的定义"), ToastKind::Warning);
+        }
+    }
+
+    /// Alt+← / Alt+→ walk the recorded navigation history.
+    fn jump_history(&mut self, back: bool) {
+        let target = if back {
+            self.jump_back.pop()
+        } else {
+            self.jump_forward.pop()
+        };
+        let Some(target) = target else {
+            return;
+        };
+        if let Some(tab) = self.tabs.get(self.active) {
+            let current = JumpPoint {
+                tab_id: tab.id,
+                path: tab.doc.path.clone(),
+                byte: tab.doc.char_to_byte(tab.caret),
+            };
+            if back {
+                self.jump_forward.push(current);
+            } else {
+                self.jump_back.push(current);
+            }
+        }
+        self.navigate_to_jump(target);
+    }
+
+    fn navigate_to_jump(&mut self, target: JumpPoint) {
+        if let Some(index) = self.tabs.iter().position(|tab| tab.id == target.tab_id) {
+            if index != self.active {
+                self.activate_tab(index);
+            }
+            if let Some(tab) = self.tabs.get_mut(index) {
+                let ch = tab.doc.byte_to_char(target.byte);
+                tab.caret = ch;
+                tab.anchor = ch;
+                tab.ensure_visible = true;
+                tab.focus_requested = true;
+            }
+            return;
+        }
+        if let Some(path) = target.path {
+            self.open_file_at(path, target.byte);
         }
     }
 
@@ -2494,6 +2568,64 @@ impl KestrelApp {
             SaveOutcome::Failed(err) => {
                 self.toast(format!("另存为失败: {err}"), ToastKind::Error);
             }
+        }
+    }
+
+    fn reopen_active_with_encoding(&mut self, encoding: Encoding) {
+        let result = self
+            .tabs
+            .get_mut(self.active)
+            .map(|tab| tab.reopen_with_encoding(encoding));
+        match result {
+            Some(Ok(())) => self.toast(
+                format!("已按 {} 重新解码当前文件", encoding.as_str()),
+                ToastKind::Info,
+            ),
+            Some(Err(err)) => self.toast(format!("重新打开失败: {err}"), ToastKind::Error),
+            None => {}
+        }
+    }
+
+    fn save_active_as_encoding(&mut self, encoding: Encoding) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        let default_name = if tab.doc.path.is_some() {
+            tab.title()
+        } else {
+            "untitled.txt".to_string()
+        };
+        let mut dialog = rfd::FileDialog::new().set_file_name(default_name);
+        if let Some(root) = &self.workspace.root {
+            dialog = dialog.set_directory(root);
+        }
+        let Some(path) = dialog.save_file() else {
+            return;
+        };
+        let result = self
+            .tabs
+            .get_mut(self.active)
+            .map(|tab| tab.save_as_with_encoding(path.clone(), encoding));
+        let name = path.display().to_string();
+        match result {
+            Some(SaveOutcome::Saved) => {
+                self.toast(format!("已保存为 {name}"), ToastKind::Success);
+                self.reveal_in_tree(&path);
+                if let Some(root) = self.workspace.root.clone() {
+                    self.git.refresh(&root);
+                }
+            }
+            Some(SaveOutcome::DiskChanged) => self.toast(
+                format!("另存为失败: {name} 已在磁盘上被修改"),
+                ToastKind::Warning,
+            ),
+            Some(SaveOutcome::ReadOnly) => {
+                self.toast(format!("没有权限写入 {name}"), ToastKind::Warning)
+            }
+            Some(SaveOutcome::Failed(err)) => {
+                self.toast(format!("另存为失败: {err}"), ToastKind::Error)
+            }
+            None => {}
         }
     }
 
@@ -3309,6 +3441,7 @@ impl KestrelApp {
             }
             Some(PaletteItem::Symbol(sym)) => {
                 self.close_palette();
+                self.record_jump_point();
                 if let Some(tab) = self.tabs.get_mut(self.active) {
                     let ch = tab.doc.byte_to_char(sym.byte_offset);
                     tab.caret = ch;
@@ -3328,6 +3461,7 @@ impl KestrelApp {
             }
             None => {
                 if self.palette.mode == PaletteMode::GotoLine {
+                    self.record_jump_point();
                     let line: usize = self.palette.query.trim().parse().unwrap_or(1);
                     if let Some(tab) = self.tabs.get_mut(self.active) {
                         let line = line.max(1).min(tab.doc.line_count()) - 1;
@@ -3431,6 +3565,16 @@ impl KestrelApp {
                         | Command::SaveAs
                         | Command::SaveAll
                         | Command::FormatDocument
+                        | Command::ToggleEol
+                        | Command::TrimTrailingWhitespace
+                        | Command::ReopenUtf8
+                        | Command::ReopenUtf8Bom
+                        | Command::ReopenUtf16Le
+                        | Command::ReopenUtf16Be
+                        | Command::SaveAsUtf8
+                        | Command::SaveAsUtf8Bom
+                        | Command::SaveAsUtf16Le
+                        | Command::SaveAsUtf16Be
                 ))
         {
             return;
@@ -3452,6 +3596,22 @@ impl KestrelApp {
             Command::CloseTab => self.close_active_tab(),
             Command::CloseAllTabs => self.close_all_tabs(),
             Command::ReloadFile => self.reload_active(),
+            Command::ToggleEol => {
+                let next = self.tabs.get_mut(self.active).and_then(Editor::toggle_eol);
+                if let Some(eol) = next {
+                    self.toast(format!("行尾已切换为 {}", eol.as_str()), ToastKind::Info);
+                } else if self.active_editor().is_some() {
+                    self.toast("只读文件无法切换行尾", ToastKind::Warning);
+                }
+            }
+            Command::ReopenUtf8 => self.reopen_active_with_encoding(Encoding::Utf8),
+            Command::ReopenUtf8Bom => self.reopen_active_with_encoding(Encoding::Utf8Bom),
+            Command::ReopenUtf16Le => self.reopen_active_with_encoding(Encoding::Utf16Le),
+            Command::ReopenUtf16Be => self.reopen_active_with_encoding(Encoding::Utf16Be),
+            Command::SaveAsUtf8 => self.save_active_as_encoding(Encoding::Utf8),
+            Command::SaveAsUtf8Bom => self.save_active_as_encoding(Encoding::Utf8Bom),
+            Command::SaveAsUtf16Le => self.save_active_as_encoding(Encoding::Utf16Le),
+            Command::SaveAsUtf16Be => self.save_active_as_encoding(Encoding::Utf16Be),
             Command::Undo => {
                 if let Some(tab) = self.tabs.get_mut(self.active)
                     && tab.doc.can_undo()
@@ -3617,6 +3777,49 @@ impl KestrelApp {
                     tab.unfold_all();
                 }
             }
+            Command::SelectExpand => {
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    tab.expand_selection();
+                }
+            }
+            Command::SelectShrink => {
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    tab.shrink_selection();
+                }
+            }
+            Command::JumpToBracket => {
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    tab.jump_to_matching_bracket();
+                }
+            }
+            Command::TrimTrailingWhitespace => {
+                let removed = self
+                    .tabs
+                    .get_mut(self.active)
+                    .map(Editor::trim_trailing_whitespace);
+                match removed {
+                    Some(0) => self.toast("没有行尾空白需要清理", ToastKind::Info),
+                    Some(count) => self.toast(
+                        format!("已清理 {count} 行的行尾空白"),
+                        ToastKind::Success,
+                    ),
+                    None => {}
+                }
+            }
+            Command::ToggleAutoClose => {
+                self.settings.auto_close_pairs = !self.settings.auto_close_pairs;
+                self.settings.save();
+                self.toast(
+                    if self.settings.auto_close_pairs {
+                        "已开启自动闭合括号"
+                    } else {
+                        "已关闭自动闭合括号"
+                    },
+                    ToastKind::Info,
+                );
+            }
+            Command::JumpBack => self.jump_history(true),
+            Command::JumpForward => self.jump_history(false),
             Command::ShowPalette => self.open_palette(PaletteMode::Commands),
             Command::QuickOpen => self.open_palette(PaletteMode::QuickOpen),
             Command::ToggleSidebar => self.sidebar.visible = !self.sidebar.visible,
@@ -4300,6 +4503,11 @@ impl eframe::App for KestrelApp {
         let target_zoom = self.settings.ui_zoom.clamp(0.7, 1.8);
         if (ctx.zoom_factor() - target_zoom).abs() > 0.001 {
             ctx.set_zoom_factor(target_zoom);
+        }
+        // The canvas reads pairing from the focused editor; keep it in step with
+        // the settings toggle (which the command palette can flip at runtime).
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            tab.auto_close = self.settings.auto_close_pairs;
         }
         self.pump_background(&ctx);
         self.plugin_tick(&ctx);
