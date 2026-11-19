@@ -203,19 +203,27 @@ impl KestrelApp {
     pub(crate) fn save_tab_raw(&mut self, index: usize) {
         let result = self.tabs.get_mut(index).map(|tab| {
             let result = tab.doc.save();
-            if result.is_ok() {
+            if matches!(result, crate::doc::SaveOutcome::Saved) {
                 tab.preview = false;
                 tab.diff_version = 0;
             }
             result
         });
         match result {
-            Some(Ok(())) => {
+            Some(crate::doc::SaveOutcome::Saved) => {
                 if let Some(root) = self.workspace.root.clone() {
                     self.git.refresh(&root);
                 }
             }
-            Some(Err(err)) => self.toast(format!("保存失败: {err}"), ToastKind::Error),
+            Some(crate::doc::SaveOutcome::DiskChanged) => {
+                self.toast("保存失败: 文件已在磁盘上被修改", ToastKind::Warning)
+            }
+            Some(crate::doc::SaveOutcome::ReadOnly) => {
+                self.toast("保存失败: 文件只读", ToastKind::Warning)
+            }
+            Some(crate::doc::SaveOutcome::Failed(err)) => {
+                self.toast(format!("保存失败: {err}"), ToastKind::Error)
+            }
             None => {}
         }
     }

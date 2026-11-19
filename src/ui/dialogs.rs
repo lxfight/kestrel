@@ -276,7 +276,66 @@ impl KestrelApp {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         keep = false;
                     }
-                    Some(2) | None => {}
+                    Some(2) => keep = false,
+                    None => {}
+                    _ => {}
+                }
+            }
+            Dialog::ConfirmCloseAll => {
+                let dirty = self.dirty_tabs();
+                let mut action: Option<u8> = None;
+                Modal::new(Id::unique("confirm_close_all_modal"))
+                    .frame(Self::modal_frame(&style))
+                    .show(ctx, |ui| {
+                        ui.set_width(420.0);
+                        ui.label(
+                            egui::RichText::new("有未保存的文件")
+                                .font(style.font(16.0))
+                                .color(theme.text),
+                        );
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new("关闭所有编辑器不会退出应用。")
+                                .font(style.small())
+                                .color(theme.text_dim),
+                        );
+                        ui.add_space(8.0);
+                        for name in dirty.iter().take(8) {
+                            ui.label(
+                                egui::RichText::new(format!("•  {name}"))
+                                    .font(style.small())
+                                    .color(theme.text_dim),
+                            );
+                        }
+                        ui.add_space(16.0);
+                        ui.horizontal(|ui| {
+                            if Self::modal_button(ui, &style, "保存并关闭", true) {
+                                action = Some(0);
+                            }
+                            if Self::modal_button(ui, &style, "全部关闭", false) {
+                                action = Some(1);
+                            }
+                            if Self::modal_button(ui, &style, "取消", false) {
+                                action = Some(2);
+                            }
+                        });
+                    });
+                match action {
+                    Some(0) => {
+                        self.save_all();
+                        if self.tabs.iter().any(|t| t.is_dirty()) {
+                            self.toast("存在无法自动保存的未命名文件", ToastKind::Warning);
+                        } else {
+                            self.close_all_tabs_force();
+                            keep = false;
+                        }
+                    }
+                    Some(1) => {
+                        self.close_all_tabs_force();
+                        keep = false;
+                    }
+                    Some(2) => keep = false,
+                    None => {}
                     _ => {}
                 }
             }
@@ -315,11 +374,13 @@ impl KestrelApp {
                                 self.save_active();
                                 if !self.tabs[index].is_dirty() {
                                     self.close_tab_force_in_group(group, index);
+                                    keep = false;
                                 }
                             } else {
                                 self.save_active_as();
                                 if self.tabs.get(index).is_some_and(|t| !t.is_dirty()) {
                                     self.close_tab_force_in_group(group, index);
+                                    keep = false;
                                 }
                             }
                         }
@@ -328,8 +389,10 @@ impl KestrelApp {
                         if index < self.tabs.len() {
                             self.close_tab_force_in_group(group, index);
                         }
+                        keep = false;
                     }
-                    Some(2) | None => {}
+                    Some(2) => keep = false,
+                    None => {}
                     _ => {}
                 }
             }
@@ -365,8 +428,11 @@ impl KestrelApp {
                             }
                         });
                     });
-                if action == Some(true) {
-                    self.delete_path(path);
+                if let Some(confirm) = action {
+                    keep = false;
+                    if confirm {
+                        self.delete_path(path);
+                    }
                 }
             }
             Dialog::ConfirmOpenFolder(path) => {
@@ -407,10 +473,15 @@ impl KestrelApp {
                             self.toast("存在无法自动保存的未命名文件", ToastKind::Warning);
                         } else {
                             self.open_folder_quiet(path);
+                            keep = false;
                         }
                     }
-                    Some(1) => self.open_folder_quiet(path),
-                    Some(2) | None => {}
+                    Some(1) => {
+                        self.open_folder_quiet(path);
+                        keep = false;
+                    }
+                    Some(2) => keep = false,
+                    None => {}
                     _ => {}
                 }
             }

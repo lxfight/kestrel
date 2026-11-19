@@ -50,6 +50,16 @@ impl Encoding {
     }
 }
 
+/// Result of writing a document back to its file.
+#[derive(Debug)]
+pub enum SaveOutcome {
+    Saved,
+    /// The file changed on disk since it was loaded/saved; nothing was written.
+    DiskChanged,
+    ReadOnly,
+    Failed(io::Error),
+}
+
 /// Coalescing class for undo grouping.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum EditKind {
@@ -82,8 +92,12 @@ pub struct Document {
     pub bom: bool,
     pub encoding: Encoding,
     pub version: u64,
-    pub saved_version: u64,
-    pub modified_time: Option<SystemTime>,
+    /// FNV-1a of the text at the last successful load/save; dirty means hash mismatch.
+    pub saved_text_hash: u64,
+    /// mtime of the file as of the last load/save, used to spot external edits.
+    pub disk_modified_at: Option<SystemTime>,
+    /// `(version, hash)` cache so `content_hash` only walks the rope after an edit.
+    hash_cache: std::cell::Cell<(u64, u64)>,
     pub undo: Vec<UndoGroup>,
     pub redo: Vec<UndoGroup>,
     pub readonly: bool,
@@ -105,6 +119,7 @@ impl Document {
         } else {
             None
         };
+        let saved_text_hash = hash_bytes(text.as_bytes());
         Self {
             rope,
             path: None,
@@ -112,8 +127,9 @@ impl Document {
             bom: false,
             encoding: Encoding::Utf8,
             version: 1,
-            saved_version: 0,
-            modified_time: None,
+            saved_text_hash,
+            disk_modified_at: None,
+            hash_cache: std::cell::Cell::new((1, saved_text_hash)),
             undo: Vec::new(),
             redo: Vec::new(),
             readonly: false,
@@ -195,6 +211,7 @@ impl Document {
             None
         };
         let rope = Rope::from_str(&normalized);
+        let saved_text_hash = hash_rope(&rope);
         Ok(Self {
             rope,
             path: Some(path.to_path_buf()),
@@ -202,8 +219,9 @@ impl Document {
             bom,
             encoding,
             version: 1,
-            saved_version: 1,
-            modified_time,
+            saved_text_hash,
+            disk_modified_at: modified_time,
+            hash_cache: std::cell::Cell::new((1, saved_text_hash)),
             undo: Vec::new(),
             redo: Vec::new(),
             readonly,
@@ -225,22 +243,23 @@ impl Document {
         self.lossy = fresh.lossy;
         self.baseline_text = fresh.baseline_text;
         self.version += 1;
-        self.saved_version = self.version;
-        self.modified_time = fresh.modified_time;
+        self.saved_text_hash = fresh.saved_text_hash;
+        self.disk_modified_at = fresh.disk_modified_at;
+        self.hash_cache.set((self.version, fresh.saved_text_hash));
         self.undo.clear();
         self.redo.clear();
         Ok(())
     }
 
-    pub fn save(&mut self) -> io::Result<()> {
+    pub fn save(&mut self) -> SaveOutcome {
         let Some(path) = self.path.clone() else {
-            return Err(io::Error::new(io::ErrorKind::NotFound, "文件尚未命名"));
+            return SaveOutcome::Failed(io::Error::new(io::ErrorKind::NotFound, "文件尚未命名"));
         };
-        if self.encoding == Encoding::Binary {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "二进制文件已设为只读保护，无法直接保存",
-            ));
+        if self.readonly || self.encoding == Encoding::Binary {
+            return SaveOutcome::ReadOnly;
+        }
+        if self.disk_changed() {
+            return SaveOutcome::DiskChanged;
         }
         let mut out = String::with_capacity(self.rope.len_bytes() + 2);
         for chunk in self.rope.chunks() {
@@ -273,21 +292,56 @@ impl Document {
                 bytes.extend_from_slice(out.as_bytes());
             }
         }
-        std::fs::write(&path, bytes)?;
-        self.saved_version = self.version;
-        self.modified_time = std::fs::metadata(&path)
-            .ok()
-            .and_then(|m| m.modified().ok());
-        Ok(())
+        let tmp = temp_path(&path);
+        let written = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, &path));
+        if let Err(err) = written {
+            let _ = std::fs::remove_file(&tmp);
+            return if err.kind() == io::ErrorKind::PermissionDenied {
+                SaveOutcome::ReadOnly
+            } else {
+                SaveOutcome::Failed(err)
+            };
+        }
+        self.saved_text_hash = self.content_hash();
+        self.disk_modified_at = disk_mtime(&path);
+        SaveOutcome::Saved
     }
 
-    pub fn save_as(&mut self, path: PathBuf) -> io::Result<()> {
+    pub fn save_as(&mut self, path: PathBuf) -> SaveOutcome {
+        self.disk_modified_at = disk_mtime(&path);
         self.path = Some(path);
         self.save()
     }
 
+    /// FNV-1a fingerprint of the whole buffer, cached by document version.
+    pub fn content_hash(&self) -> u64 {
+        let (version, hash) = self.hash_cache.get();
+        if version == self.version {
+            return hash;
+        }
+        let hash = hash_rope(&self.rope);
+        self.hash_cache.set((self.version, hash));
+        hash
+    }
+
     pub fn is_dirty(&self) -> bool {
-        self.version != self.saved_version
+        self.content_hash() != self.saved_text_hash
+    }
+
+    /// Mark the buffer as unsaved content that has no file to fall back to.
+    pub fn mark_dirty(&mut self) {
+        self.saved_text_hash = !self.content_hash();
+    }
+
+    /// True when the file on disk no longer matches the mtime recorded at load/save.
+    pub fn disk_changed(&self) -> bool {
+        let Some(path) = self.path.as_deref() else {
+            return false;
+        };
+        let Some(known) = self.disk_modified_at else {
+            return false;
+        };
+        disk_mtime(path) != Some(known)
     }
 
     pub fn file_name(&self) -> String {
@@ -598,6 +652,42 @@ impl Document {
     }
 }
 
+const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+fn hash_bytes(bytes: &[u8]) -> u64 {
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in bytes {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+fn hash_rope(rope: &Rope) -> u64 {
+    let mut hash = FNV_OFFSET_BASIS;
+    for chunk in rope.chunks() {
+        for byte in chunk.as_bytes() {
+            hash ^= *byte as u64;
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+    }
+    hash
+}
+
+fn disk_mtime(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path)
+        .ok()
+        .and_then(|meta| meta.modified().ok())
+}
+
+/// Sibling temp file so the final rename stays on one filesystem and is atomic.
+fn temp_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".kestrel-tmp");
+    path.with_file_name(name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -640,7 +730,7 @@ mod tests {
         assert_eq!(doc.encoding, Encoding::Utf8Bom);
         assert_eq!(doc.text(), "one\ntwo\n");
         doc.edit(0, 0, "x", EditKind::Other, (0, 0), (1, 1));
-        doc.save().unwrap();
+        assert!(matches!(doc.save(), SaveOutcome::Saved));
         let bytes = std::fs::read(&path).unwrap();
         assert_eq!(bytes, b"\xEF\xBB\xBFxone\r\ntwo\r\n");
         let _ = std::fs::remove_file(&path);
@@ -657,7 +747,7 @@ mod tests {
         let mut doc = Document::load(&path).unwrap();
         assert_eq!(doc.encoding, Encoding::Utf16Le);
         assert_eq!(doc.text(), "hello\n世界");
-        doc.save().unwrap();
+        assert!(matches!(doc.save(), SaveOutcome::Saved));
         let saved = std::fs::read(&path).unwrap();
         assert_eq!(saved, raw);
         let _ = std::fs::remove_file(&path);
@@ -690,6 +780,49 @@ mod tests {
         doc.edit(0, 0, "z", EditKind::Typing, (0, 0), (1, 1));
         assert!(!doc.can_redo());
         assert_eq!(doc.text(), "za");
+    }
+
+    #[test]
+    fn save_clears_dirty_and_undo_restores_clean_state() {
+        let path = temp_path("dirty.txt");
+        std::fs::write(&path, "one\n").unwrap();
+        let mut doc = Document::load(&path).unwrap();
+        assert!(!doc.is_dirty());
+        doc.edit(0, 0, "x", EditKind::Other, (0, 0), (1, 1));
+        assert!(doc.is_dirty());
+        assert!(matches!(doc.save(), SaveOutcome::Saved));
+        assert!(!doc.is_dirty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "xone\n");
+        doc.edit(0, 1, "y", EditKind::Other, (0, 0), (1, 1));
+        assert!(doc.is_dirty());
+        doc.undo();
+        assert!(!doc.is_dirty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn own_save_does_not_look_like_an_external_change() {
+        let path = temp_path("selfwrite.txt");
+        std::fs::write(&path, "one\n").unwrap();
+        let mut doc = Document::load(&path).unwrap();
+        doc.edit(0, 0, "x", EditKind::Other, (0, 0), (1, 1));
+        assert!(matches!(doc.save(), SaveOutcome::Saved));
+        assert!(!doc.disk_changed());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn external_edit_makes_save_report_disk_changed() {
+        let path = temp_path("conflict.txt");
+        std::fs::write(&path, "mine\n").unwrap();
+        let mut doc = Document::load(&path).unwrap();
+        doc.edit(0, 0, "x", EditKind::Other, (0, 0), (1, 1));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&path, "theirs\n").unwrap();
+        assert!(matches!(doc.save(), SaveOutcome::DiskChanged));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "theirs\n");
+        assert!(doc.is_dirty());
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

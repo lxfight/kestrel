@@ -7,14 +7,14 @@ use egui::FontFamily;
 
 use crate::commands::{Command, Shortcut};
 use crate::devshot;
-use crate::doc::Document;
+use crate::doc::{Document, SaveOutcome};
 use crate::editor::{Editor, EditorStyle};
 use crate::fuzzy;
 use crate::git::{GitFileStatus, GitService};
 use crate::highlight::Language;
 use crate::lsp::OutlineSymbol;
 use crate::plugin::{Event, PluginHost};
-use crate::settings::{Session, Settings, TabSession};
+use crate::settings::{Session, Settings, TabSession, UntitledSession};
 use crate::terminal::ShellKind;
 use crate::theme::{Theme, ThemeKind};
 use crate::ui::UiStyle;
@@ -45,6 +45,19 @@ pub const LANGUAGES: &[Language] = &[
     Language::Markdown,
     Language::Plain,
 ];
+
+/// Atomic-save temp files are ours; ignore their watcher events.
+fn is_save_temp(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| ext == "kestrel-tmp")
+}
+
+fn language_from_name(name: &str) -> Language {
+    LANGUAGES
+        .iter()
+        .copied()
+        .find(|language| language.name() == name)
+        .unwrap_or(Language::Plain)
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SidebarMode {
@@ -237,6 +250,7 @@ pub enum Dialog {
     Shortcuts,
     Settings,
     ConfirmClose,
+    ConfirmCloseAll,
     ConfirmCloseTab(usize, usize),
     ConfirmDelete(PathBuf),
     ConfirmOpenFolder(PathBuf),
@@ -362,6 +376,12 @@ pub struct KestrelApp {
     pub last_title: String,
     pub last_autosave: Instant,
     pub last_reload_check: Instant,
+    /// Paths already announced as reloaded / as conflicting (watcher fires in bursts).
+    pub reload_notified: std::collections::HashSet<PathBuf>,
+    pub conflict_notified: std::collections::HashSet<PathBuf>,
+    pub autosave_notice: Option<Instant>,
+    session_fingerprint: u64,
+    session_pending_since: Option<Instant>,
     pub frame: u64,
     pub shot_frame: u64,
     pub dev_ui: Option<String>,
@@ -435,6 +455,11 @@ impl KestrelApp {
             last_title: String::new(),
             last_autosave: Instant::now(),
             last_reload_check: Instant::now(),
+            reload_notified: std::collections::HashSet::new(),
+            conflict_notified: std::collections::HashSet::new(),
+            autosave_notice: None,
+            session_fingerprint: 0,
+            session_pending_since: None,
             frame: 0,
             shot_frame: 0,
             dev_ui: None,
@@ -471,6 +496,32 @@ impl KestrelApp {
             if path.is_file() {
                 self.open_file_quiet(path, Some((tab.caret, tab.scroll)));
             }
+        }
+        for entry in session.untitled {
+            let text = match entry.text {
+                Some(text) => text,
+                None => {
+                    let Some(path) = entry.path else { continue };
+                    let Ok(text) = std::fs::read_to_string(&path) else {
+                        continue;
+                    };
+                    text
+                }
+            };
+            let mut doc = Document::from_text(&text);
+            if !text.is_empty() {
+                doc.mark_dirty();
+            }
+            self.next_untitled += 1;
+            let id = self.next_id;
+            self.next_id += 1;
+            let mut editor = Editor::new(doc, id, self.next_untitled);
+            editor.set_language(language_from_name(&entry.language));
+            editor.caret = entry.caret.min(editor.doc.len_chars());
+            editor.anchor = editor.caret;
+            editor.ensure_visible = false;
+            self.tabs.push(editor);
+            self.attach_editor_to_active_group(id);
         }
         if !self.tabs.is_empty() {
             let active = session.active.min(self.tabs.len() - 1);
@@ -669,8 +720,77 @@ impl KestrelApp {
                 .map(|p| p.to_string_lossy().to_string()),
             tabs,
             active,
+            untitled: self.untitled_snapshot(),
         };
         session.save();
+    }
+
+    /// Capture unsaved buffers; text above `MAX_INLINE_UNTITLED` moves to a recovery file.
+    fn untitled_snapshot(&self) -> Vec<UntitledSession> {
+        const MAX_INLINE_UNTITLED: usize = 512 * 1024;
+        let mut snapshots = Vec::new();
+        for (index, editor) in self.tabs.iter().enumerate() {
+            if editor.doc.path.is_some() || editor.doc.readonly || editor.virtual_title.is_some() {
+                continue;
+            }
+            let text = editor.doc.text();
+            let recovery = if text.len() > MAX_INLINE_UNTITLED {
+                let dir = Settings::recovery_dir();
+                let path = dir.join(format!("untitled-{index}.txt"));
+                std::fs::create_dir_all(&dir)
+                    .and_then(|()| std::fs::write(&path, &text))
+                    .ok()
+                    .map(|()| path.to_string_lossy().to_string())
+            } else {
+                None
+            };
+            let entry = match recovery {
+                Some(path) => UntitledSession {
+                    text: None,
+                    path: Some(path),
+                    language: editor.language.name().to_string(),
+                    caret: editor.caret,
+                },
+                None => UntitledSession {
+                    text: Some(text),
+                    path: None,
+                    language: editor.language.name().to_string(),
+                    caret: editor.caret,
+                },
+            };
+            snapshots.push(entry);
+        }
+        snapshots
+    }
+
+    /// Changes fingerprint over unsaved buffers, so quiet periods trigger a recovery write.
+    fn untitled_fingerprint(&self) -> u64 {
+        let mut fingerprint = 0u64;
+        for tab in &self.tabs {
+            if tab.doc.path.is_none() && !tab.doc.readonly && tab.virtual_title.is_none() {
+                fingerprint = fingerprint
+                    .wrapping_mul(31)
+                    .wrapping_add(tab.doc.version)
+                    .wrapping_mul(31)
+                    .wrapping_add(tab.untitled_index as u64 + 1);
+            }
+        }
+        fingerprint
+    }
+
+    /// Write the session 2 seconds after the last unsaved-buffer change.
+    fn session_autosave(&mut self) {
+        let fingerprint = self.untitled_fingerprint();
+        if fingerprint != self.session_fingerprint {
+            self.session_fingerprint = fingerprint;
+            self.session_pending_since = Some(Instant::now());
+        }
+        if let Some(pending) = self.session_pending_since
+            && pending.elapsed() >= Duration::from_secs(2)
+        {
+            self.session_pending_since = None;
+            self.save_session();
+        }
     }
 
     // ------------------------------------------------------------------
@@ -1270,8 +1390,7 @@ impl KestrelApp {
 
     pub fn new_untitled(&mut self) {
         self.next_untitled += 1;
-        let mut doc = Document::from_text("");
-        doc.saved_version = doc.version;
+        let doc = Document::from_text("");
         let id = self.next_id;
         self.next_id += 1;
         let mut editor = Editor::new(doc, id, self.next_untitled);
@@ -1311,7 +1430,6 @@ impl KestrelApp {
             let mut doc = Document::from_text("");
             doc.path = Some(path.clone());
             doc.readonly = true;
-            doc.saved_version = doc.version;
             let id = self.next_id;
             self.next_id += 1;
             let mut editor = Editor::new(doc, id, 0);
@@ -1412,7 +1530,6 @@ impl KestrelApp {
                 let mut doc = Document::from_text("");
                 doc.path = Some(path.clone());
                 doc.readonly = true;
-                doc.saved_version = doc.version;
                 let id = self.next_id;
                 self.next_id += 1;
                 let mut editor = Editor::new(doc, id, 0);
@@ -1466,7 +1583,6 @@ impl KestrelApp {
     /// Open a read-only virtual document (git revision, diff, etc.) in the active group.
     pub fn open_virtual_text(&mut self, title: String, text: String, language: Language) {
         let mut doc = Document::from_text(&text);
-        doc.saved_version = doc.version;
         doc.readonly = true;
         let id = self.next_id;
         self.next_id += 1;
@@ -1525,7 +1641,6 @@ impl KestrelApp {
             .unwrap_or((GitFileStatus::Modified, None));
         let language = Language::from_path(&path);
         let mut doc = Document::from_text("");
-        doc.saved_version = doc.version;
         doc.readonly = true;
         let id = self.next_id;
         self.next_id += 1;
@@ -1720,9 +1835,14 @@ impl KestrelApp {
 
     pub fn close_all_tabs(&mut self) {
         if self.tabs.iter().any(|t| t.is_dirty()) {
-            self.dialog = Some(Dialog::ConfirmClose);
+            self.dialog = Some(Dialog::ConfirmCloseAll);
             return;
         }
+        self.close_all_tabs_force();
+    }
+
+    /// Close every editor tab, keeping the window and workspace open.
+    pub fn close_all_tabs_force(&mut self) {
         self.tabs.clear();
         self.active = 0;
         self.reset_groups();
@@ -1744,24 +1864,30 @@ impl KestrelApp {
         let result = {
             let tab = &mut self.tabs[index];
             let result = tab.doc.save();
-            if result.is_ok() {
+            if matches!(result, SaveOutcome::Saved) {
                 tab.preview = false;
                 tab.diff_version = 0;
             }
             result
         };
+        let name = self.tabs[index].title();
         match result {
-            Ok(()) => {
-                let name = self.tabs[index].title();
+            SaveOutcome::Saved => {
                 self.toast(format!("已保存 {name}"), ToastKind::Success);
                 if let Some(root) = self.workspace.root.clone() {
                     self.git.refresh(&root);
                 }
                 self.emit_plugin_event_for(Event::Saved, doc_id);
             }
-            Err(err) => {
-                let name = self.tabs[index].title();
-                self.toast(format!("保存 {name} 失败: {err}"), ToastKind::Error);
+            SaveOutcome::DiskChanged => self.toast(
+                format!("保存 {name} 已取消: 文件已在磁盘上被修改"),
+                ToastKind::Warning,
+            ),
+            SaveOutcome::ReadOnly => {
+                self.toast(format!("{name} 为只读文件，无法保存"), ToastKind::Warning)
+            }
+            SaveOutcome::Failed(err) => {
+                self.toast(format!("保存 {name} 失败: {err}"), ToastKind::Error)
             }
         }
     }
@@ -1784,7 +1910,7 @@ impl KestrelApp {
         };
         let tab = &mut self.tabs[self.active];
         match tab.doc.save_as(path.clone()) {
-            Ok(()) => {
+            SaveOutcome::Saved => {
                 tab.preview = false;
                 tab.set_language(Language::from_path(&path));
                 self.toast(format!("已保存 {}", path.display()), ToastKind::Success);
@@ -1793,7 +1919,14 @@ impl KestrelApp {
                     self.git.refresh(&root);
                 }
             }
-            Err(err) => {
+            SaveOutcome::DiskChanged => self.toast(
+                format!("另存为失败: {} 已在磁盘上被修改", path.display()),
+                ToastKind::Warning,
+            ),
+            SaveOutcome::ReadOnly => {
+                self.toast(format!("没有权限写入 {}", path.display()), ToastKind::Warning)
+            }
+            SaveOutcome::Failed(err) => {
                 self.toast(format!("另存为失败: {err}"), ToastKind::Error);
             }
         }
@@ -1807,23 +1940,29 @@ impl KestrelApp {
             .map(|editor| editor.id)
             .collect();
         let mut saved = 0;
+        let mut blocked = 0;
+        let mut failed = 0;
         for id in ids {
             self.emit_plugin_event_for(Event::BeforeSave, id);
             let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else {
                 continue;
             };
-            let ok = {
+            let outcome = {
                 let tab = &mut self.tabs[index];
                 let result = tab.doc.save();
-                if result.is_ok() {
+                if matches!(result, SaveOutcome::Saved) {
                     tab.preview = false;
                     tab.diff_version = 0;
                 }
-                result.is_ok()
+                result
             };
-            if ok {
-                saved += 1;
-                self.emit_plugin_event_for(Event::Saved, id);
+            match outcome {
+                SaveOutcome::Saved => {
+                    saved += 1;
+                    self.emit_plugin_event_for(Event::Saved, id);
+                }
+                SaveOutcome::DiskChanged | SaveOutcome::ReadOnly => blocked += 1,
+                SaveOutcome::Failed(_) => failed += 1,
             }
         }
         if saved > 0 {
@@ -1832,6 +1971,12 @@ impl KestrelApp {
                 self.git.refresh(&root);
             }
         }
+        if blocked + failed > 0 {
+            self.toast(
+                format!("有 {blocked} 个文件磁盘已变更或只读，{failed} 个写入失败"),
+                ToastKind::Warning,
+            );
+        }
     }
 
     pub fn reload_active(&mut self) {
@@ -1839,6 +1984,35 @@ impl KestrelApp {
             match tab.doc.reload() {
                 Ok(()) => self.toast("已从磁盘重新加载", ToastKind::Info),
                 Err(err) => self.toast(format!("重新加载失败: {err}"), ToastKind::Error),
+            }
+        }
+    }
+
+    /// React to an external change of an open file. Writes done by this app are
+    /// recognised by the mtime recorded in the document and ignored.
+    fn handle_disk_change(&mut self, path: &Path) {
+        let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.doc.path.as_deref() == Some(path))
+        else {
+            return;
+        };
+        if !self.tabs[index].doc.disk_changed() {
+            return;
+        }
+        let title = self.tabs[index].title();
+        if self.tabs[index].is_dirty() {
+            if self.conflict_notified.insert(path.to_path_buf()) {
+                self.toast(
+                    format!("{title} 已在磁盘上被修改，未自动重新加载"),
+                    ToastKind::Warning,
+                );
+            }
+        } else if self.tabs[index].doc.reload().is_ok() {
+            self.tabs[index].invalidate_layout();
+            if self.reload_notified.insert(path.to_path_buf()) {
+                self.toast(format!("{title} 已从磁盘重新加载"), ToastKind::Info);
             }
         }
     }
@@ -2169,6 +2343,22 @@ impl KestrelApp {
             .iter()
             .map(|r| r.path.clone())
             .collect();
+        let dirty_open: Vec<String> = matched_paths
+            .iter()
+            .filter_map(|path| {
+                self.tabs
+                    .iter()
+                    .find(|tab| tab.doc.path.as_deref() == Some(path.as_path()) && tab.is_dirty())
+                    .map(|tab| tab.title())
+            })
+            .collect();
+        if !dirty_open.is_empty() {
+            self.toast(
+                format!("{} 有未保存修改，全项目替换已中止", dirty_open.join("、")),
+                ToastKind::Warning,
+            );
+            return;
+        }
         let mut total_files = 0usize;
         let mut total_hits = 0usize;
 
@@ -2183,6 +2373,7 @@ impl KestrelApp {
                     .tabs
                     .iter_mut()
                     .find(|t| t.doc.path.as_deref() == Some(path.as_path()))
+                    && !tab.is_dirty()
                 {
                     let _ = tab.doc.reload();
                     tab.invalidate_layout();
@@ -3112,33 +3303,18 @@ impl KestrelApp {
             let events = watcher.poll();
             if !events.is_empty() {
                 for path in &events {
+                    if is_save_temp(path) {
+                        continue;
+                    }
                     if let Some(parent) = path.parent() {
                         self.workspace.tree.reload_dir(parent);
                     }
                 }
                 for path in events {
-                    let mut message: Option<(String, ToastKind)> = None;
-                    if path.exists()
-                        && let Some(tab) = self
-                            .tabs
-                            .iter_mut()
-                            .find(|t| t.doc.path.as_deref() == Some(path.as_path()))
-                    {
-                        if tab.is_dirty() {
-                            message = Some((
-                                format!("{} 已在磁盘上被修改，未自动重新加载", tab.title()),
-                                ToastKind::Warning,
-                            ));
-                        } else if tab.doc.reload().is_ok() {
-                            message = Some((
-                                format!("{} 已从磁盘重新加载", tab.title()),
-                                ToastKind::Info,
-                            ));
-                        }
+                    if is_save_temp(&path) {
+                        continue;
                     }
-                    if let Some((text, kind)) = message {
-                        self.toast(text, kind);
-                    }
+                    self.handle_disk_change(&path);
                     let diff_tabs: Vec<u64> = self
                         .tabs
                         .iter()
@@ -3188,19 +3364,35 @@ impl KestrelApp {
         if self.settings.autosave && self.last_autosave.elapsed() > Duration::from_millis(900) {
             self.last_autosave = Instant::now();
             let mut any_saved = false;
+            let mut blocked = 0usize;
             for editor in &mut self.tabs {
-                if editor.is_dirty()
-                    && editor.doc.path.is_some()
-                    && editor.last_edit.elapsed() > Duration::from_millis(1200)
-                    && editor.doc.save().is_ok()
+                if !editor.is_dirty()
+                    || editor.doc.path.is_none()
+                    || editor.last_edit.elapsed() <= Duration::from_millis(1200)
                 {
-                    editor.preview = false;
-                    editor.diff_version = 0;
-                    any_saved = true;
+                    continue;
+                }
+                match editor.doc.save() {
+                    SaveOutcome::Saved => {
+                        editor.preview = false;
+                        editor.diff_version = 0;
+                        any_saved = true;
+                    }
+                    SaveOutcome::DiskChanged | SaveOutcome::ReadOnly | SaveOutcome::Failed(_) => {
+                        blocked += 1;
+                    }
                 }
             }
             if any_saved && let Some(root) = self.workspace.root.clone() {
                 self.git.refresh(&root);
+            }
+            if blocked > 0 && self.autosave_notice.is_none_or(|at| at.elapsed() > Duration::from_secs(10))
+            {
+                self.autosave_notice = Some(Instant::now());
+                self.toast(
+                    format!("自动保存跳过 {blocked} 个文件: 磁盘已变更、只读或写入失败"),
+                    ToastKind::Warning,
+                );
             }
         }
 
@@ -3210,42 +3402,19 @@ impl KestrelApp {
             && self.last_reload_check.elapsed() > Duration::from_millis(500)
         {
             self.last_reload_check = Instant::now();
-            let mut changes: Vec<(String, ToastKind)> = Vec::new();
-            for editor in &mut self.tabs {
-                let Some(path) = editor.doc.path.clone() else {
-                    continue;
-                };
-                let Ok(meta) = std::fs::metadata(&path) else {
-                    continue;
-                };
-                let Ok(modified) = meta.modified() else {
-                    continue;
-                };
-                let changed = editor
-                    .doc
-                    .modified_time
-                    .is_some_and(|old| modified > old + Duration::from_millis(20));
-                if changed {
-                    if editor.is_dirty() {
-                        changes.push((
-                            format!("{} 已在磁盘上被修改", editor.title()),
-                            ToastKind::Warning,
-                        ));
-                    } else if editor.doc.reload().is_ok() {
-                        changes.push((
-                            format!("{} 已从磁盘重新加载", editor.title()),
-                            ToastKind::Info,
-                        ));
-                    }
-                }
-            }
-            for (text, kind) in changes {
-                self.toast(text, kind);
+            let paths: Vec<PathBuf> = self
+                .tabs
+                .iter()
+                .filter_map(|tab| tab.doc.path.clone())
+                .collect();
+            for path in paths {
+                self.handle_disk_change(&path);
             }
             if let Some(root) = self.workspace.root.clone() {
                 self.git.refresh(&root);
             }
         }
+        self.session_autosave();
         self.window_focused = focused;
 
         self.toasts

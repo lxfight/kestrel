@@ -107,6 +107,10 @@ impl Settings {
         Self::config_dir().join("keybindings.json")
     }
 
+    pub fn recovery_dir() -> PathBuf {
+        Self::config_dir().join("recovery")
+    }
+
     fn session_path() -> PathBuf {
         Self::config_dir().join("session.json")
     }
@@ -166,6 +170,19 @@ pub struct Session {
     pub folder: Option<String>,
     pub tabs: Vec<TabSession>,
     pub active: usize,
+    pub untitled: Vec<UntitledSession>,
+}
+
+/// One unsaved buffer carried across restarts.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UntitledSession {
+    /// Inline text; `None` when the text lives in the recovery file instead.
+    pub text: Option<String>,
+    /// Recovery file for buffers too large to inline (>512 KB).
+    pub path: Option<String>,
+    pub language: String,
+    pub caret: usize,
 }
 
 impl Session {
@@ -187,10 +204,36 @@ impl Session {
 
 #[cfg(test)]
 mod tests {
-    use super::Settings;
+    use super::{Session, Settings, UntitledSession};
 
     #[test]
     fn autosave_is_enabled_by_default() {
         assert!(Settings::default().autosave);
+    }
+
+    #[test]
+    fn legacy_session_without_untitled_still_parses() {
+        let json = r#"{"folder":null,"tabs":[{"path":"a.rs","caret":3,"scroll":0.0}],"active":0}"#;
+        let session: Session = serde_json::from_str(json).unwrap();
+        assert_eq!(session.tabs.len(), 1);
+        assert!(session.untitled.is_empty());
+    }
+
+    #[test]
+    fn untitled_entry_roundtrips() {
+        let session = Session {
+            untitled: vec![UntitledSession {
+                text: Some("hi".to_string()),
+                path: None,
+                language: "Rust".to_string(),
+                caret: 2,
+            }],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&session).unwrap();
+        let back: Session = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.untitled.len(), 1);
+        assert_eq!(back.untitled[0].text.as_deref(), Some("hi"));
+        assert_eq!(back.untitled[0].caret, 2);
     }
 }
