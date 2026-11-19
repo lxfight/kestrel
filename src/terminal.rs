@@ -7,6 +7,7 @@
 use std::io::{Read, Write};
 use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::{Duration, Instant};
 
@@ -63,6 +64,7 @@ impl vt100::Callbacks for TermCallbacks {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ShellKind {
     Default,
+    PowerShell7,
     PowerShell,
     Cmd,
     GitBash,
@@ -73,7 +75,9 @@ pub enum ShellKind {
 impl ShellKind {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Default | Self::PowerShell => "PowerShell",
+            Self::Default => "PowerShell",
+            Self::PowerShell7 => "PowerShell 7",
+            Self::PowerShell => "Windows PowerShell",
             Self::Cmd => "Command Prompt",
             Self::GitBash => "Git Bash",
             Self::Wsl => "WSL",
@@ -83,6 +87,7 @@ impl ShellKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Default => "default",
+            Self::PowerShell7 => "pwsh",
             Self::PowerShell => "powershell",
             Self::Cmd => "cmd",
             Self::GitBash => "gitbash",
@@ -92,6 +97,7 @@ impl ShellKind {
 
     pub fn from_str(name: &str) -> Self {
         match name {
+            "pwsh" => Self::PowerShell7,
             "powershell" => Self::PowerShell,
             "cmd" => Self::Cmd,
             "gitbash" => Self::GitBash,
@@ -107,6 +113,104 @@ impl ShellKind {
             _ => b"clear\r",
         }
     }
+}
+
+/// One shell installed on this machine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShellProfile {
+    pub kind: ShellKind,
+    pub label: &'static str,
+}
+
+/// Known Git for Windows locations, most common first.
+const GIT_BASH_PATHS: &[&str] = &[
+    "C:/Program Files/Git/bin/bash.exe",
+    "C:/Program Files (x86)/Git/bin/bash.exe",
+    "C:/Program Files/Git/usr/bin/bash.exe",
+];
+
+fn profile(kind: ShellKind) -> ShellProfile {
+    ShellProfile {
+        kind,
+        label: kind.label(),
+    }
+}
+
+/// Detect which shells are installed. Pure: the exists callback decides
+/// availability, so tests never depend on the host. Always returns at least
+/// one profile.
+pub fn probe_profiles(exists: impl Fn(&str) -> bool) -> Vec<ShellProfile> {
+    let mut profiles = Vec::new();
+    if exists("pwsh.exe") {
+        profiles.push(profile(ShellKind::PowerShell7));
+    }
+    if exists("powershell.exe") {
+        profiles.push(profile(ShellKind::PowerShell));
+    }
+    if exists("cmd.exe") {
+        profiles.push(profile(ShellKind::Cmd));
+    }
+    let git_bash = GIT_BASH_PATHS.iter().any(|path| exists(path)) || exists("bash.exe");
+    if git_bash {
+        profiles.push(profile(ShellKind::GitBash));
+    }
+    if exists("wsl.exe") {
+        profiles.push(profile(ShellKind::Wsl));
+    }
+    if profiles.is_empty() {
+        profiles.push(profile(ShellKind::Cmd));
+    }
+    profiles
+}
+
+/// Cached probe over the real file system; no process is spawned.
+pub fn available_profiles() -> &'static [ShellProfile] {
+    static PROFILES: LazyLock<Vec<ShellProfile>> = LazyLock::new(|| probe_profiles(shell_exists));
+    PROFILES.as_slice()
+}
+
+fn shell_exists(name: &str) -> bool {
+    // COMSPEC names cmd.exe even when the app PATH cannot resolve it.
+    if name.eq_ignore_ascii_case("cmd.exe") && std::env::var_os("COMSPEC").is_some() {
+        return true;
+    }
+    let path = Path::new(name);
+    if path.is_absolute() {
+        return path.is_file();
+    }
+    command_in_path(name).is_some()
+}
+
+/// Resolve a bare command name through PATH and PATHEXT.
+fn command_in_path(name: &str) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    let exts: Vec<String> = if cfg!(windows) && Path::new(name).extension().is_none() {
+        std::env::var("PATHEXT")
+            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
+            .split(';')
+            .filter(|ext| !ext.is_empty())
+            .map(str::to_string)
+            .collect()
+    } else {
+        vec![String::new()]
+    };
+    std::env::split_paths(&path_var).find_map(|dir| {
+        exts.iter().find_map(|ext| {
+            let mut file = name.to_string();
+            file.push_str(ext);
+            let candidate = dir.join(file);
+            candidate.is_file().then_some(candidate)
+        })
+    })
+}
+
+fn git_bash_path() -> Option<PathBuf> {
+    GIT_BASH_PATHS
+        .iter()
+        .map(|path| Path::new(*path))
+        .find(|path| path.is_file())
+        .map(Path::to_path_buf)
+        .or_else(|| command_in_path("bash.exe"))
 }
 
 /// Inclusive cell range over the visible terminal grid.
@@ -285,6 +389,16 @@ impl TerminalSession {
 
     pub fn screen(&self) -> &vt100::Screen {
         self.parser.screen()
+    }
+
+    /// Plain text of one visible row; the scrollback offset is not applied.
+    pub fn row_text(&self, row: u16) -> String {
+        let cols = self.parser.screen().size().1.get();
+        self.parser
+            .screen()
+            .rows(0, cols)
+            .nth(usize::from(row))
+            .unwrap_or_default()
     }
 
     // ------------------------------------------------------------------
@@ -585,6 +699,120 @@ pub fn char_width(ch: char) -> u16 {
     if wide { 2 } else { 1 }
 }
 
+/// Characters that end a clickable URL in terminal output.
+fn url_boundary(ch: char) -> bool {
+    ch.is_whitespace()
+        || matches!(
+            ch,
+            '"' | '\''
+                | '<'
+                | '>'
+                | '|'
+                | '，'
+                | '。'
+                | '；'
+                | '：'
+                | '！'
+                | '？'
+                | '、'
+                | '（'
+                | '）'
+                | '【'
+                | '】'
+                | '《'
+                | '》'
+                | '“'
+                | '”'
+                | '‘'
+                | '’'
+                | '…'
+                | '—'
+        )
+        || ('\u{2500}'..='\u{257F}').contains(&ch)
+}
+
+/// URL under a Ctrl+click. The cell counts display columns from the left edge
+/// of the row, so wide characters shift the URL start exactly like the grid.
+pub fn url_at_cell(line: &str, cell: u16) -> Option<String> {
+    let mut col = 0u16;
+    let mut index = 0usize;
+    while index < line.len() {
+        let rest = &line[index..];
+        if rest.starts_with("https://") || rest.starts_with("http://") {
+            let end = rest
+                .char_indices()
+                .find(|(_, ch)| url_boundary(*ch))
+                .map_or(rest.len(), |(offset, _)| offset);
+            let url = rest[..end].trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']', '}']);
+            let width: u16 = url.chars().map(char_width).sum();
+            if cell >= col && cell < col.saturating_add(width) {
+                return Some(url.to_string());
+            }
+            col = col.saturating_add(rest[..end].chars().map(char_width).sum::<u16>());
+            index += end;
+            continue;
+        }
+        let ch = rest.chars().next()?;
+        col = col.saturating_add(char_width(ch));
+        index += ch.len_utf8();
+    }
+    None
+}
+
+/// Quote a path for the running shell. Only paths with shell-special
+/// characters need the double quotes cmd and PowerShell both honour.
+pub fn quote_path(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    let needs_quotes = text.chars().any(|ch| {
+        ch.is_whitespace()
+            || matches!(
+                ch,
+                '"' | '\''
+                    | '&'
+                    | '|'
+                    | '<'
+                    | '>'
+                    | '^'
+                    | '('
+                    | ')'
+                    | '%'
+                    | ';'
+                    | ','
+                    | '='
+                    | '!'
+                    | '*'
+                    | '?'
+            )
+    });
+    if needs_quotes {
+        format!("\"{text}\"")
+    } else {
+        text.into_owned()
+    }
+}
+
+/// Open a URL with the platform default browser.
+pub fn open_url(url: &str) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW: cmd /C start would otherwise flash a console.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let _ = std::process::Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(url).spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    }
+}
+
 /// Cell column (0-based) of a byte offset inside a row string.
 fn column_of_byte(line: &str, byte: usize) -> u16 {
     let mut col = 0u16;
@@ -618,17 +846,24 @@ fn spawn_shell_kind(
     };
 
     match kind {
+        ShellKind::PowerShell7 => try_spawn("pwsh.exe", Some("-NoLogo"))
+            .map(|child| (child, "PowerShell 7", ShellKind::PowerShell7))
+            .or_else(|| spawn_shell_default(slave, cwd)),
+        ShellKind::PowerShell => try_spawn("powershell.exe", Some("-NoLogo"))
+            .map(|child| (child, "Windows PowerShell", ShellKind::PowerShell))
+            .or_else(|| spawn_shell_default(slave, cwd)),
         ShellKind::Cmd => try_spawn("cmd.exe", None)
             .map(|child| (child, "Command Prompt", ShellKind::Cmd))
             .or_else(|| spawn_shell_default(slave, cwd)),
-        ShellKind::GitBash => try_spawn("C:\\Program Files\\Git\\bin\\bash.exe", Some("--login"))
-            .or_else(|| try_spawn("bash", None))
+        ShellKind::GitBash => git_bash_path()
+            .and_then(|path| try_spawn(path.to_string_lossy().as_ref(), Some("--login")))
+            .or_else(|| try_spawn("bash.exe", None))
             .map(|child| (child, "Git Bash", ShellKind::GitBash))
             .or_else(|| spawn_shell_default(slave, cwd)),
         ShellKind::Wsl => try_spawn("wsl.exe", None)
             .map(|child| (child, "WSL", ShellKind::Wsl))
             .or_else(|| spawn_shell_default(slave, cwd)),
-        ShellKind::Default | ShellKind::PowerShell => spawn_shell_default(slave, cwd),
+        ShellKind::Default => spawn_shell_default(slave, cwd),
     }
 }
 
@@ -648,11 +883,22 @@ fn spawn_shell_default(
     };
 
     if cfg!(windows) {
-        try_spawn("powershell.exe", Some("-NoLogo"))
-            .map(|child| (child, "PowerShell", ShellKind::PowerShell))
-            .or_else(|| {
-                try_spawn("cmd.exe", None).map(|child| (child, "Command Prompt", ShellKind::Cmd))
-            })
+        // Default resolves to the first PowerShell the probe found.
+        let first_powershell = available_profiles()
+            .iter()
+            .find(|profile| matches!(profile.kind, ShellKind::PowerShell7 | ShellKind::PowerShell))
+            .map(|profile| profile.kind);
+        if first_powershell == Some(ShellKind::PowerShell7)
+            && let Some(child) = try_spawn("pwsh.exe", Some("-NoLogo"))
+        {
+            return Some((child, "PowerShell 7", ShellKind::PowerShell7));
+        }
+        if first_powershell == Some(ShellKind::PowerShell)
+            && let Some(child) = try_spawn("powershell.exe", Some("-NoLogo"))
+        {
+            return Some((child, "Windows PowerShell", ShellKind::PowerShell));
+        }
+        try_spawn("cmd.exe", None).map(|child| (child, "Command Prompt", ShellKind::Cmd))
     } else {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
         try_spawn(&shell, None)
@@ -730,7 +976,84 @@ mod tests {
     fn clear_command_matches_shell_kind() {
         assert_eq!(ShellKind::Cmd.clear_command(), b"cls\r");
         assert_eq!(ShellKind::PowerShell.clear_command(), b"clear\r");
+        assert_eq!(ShellKind::PowerShell7.clear_command(), b"clear\r");
         assert_eq!(ShellKind::GitBash.clear_command(), b"clear\r");
+    }
+
+    #[test]
+    fn probe_profiles_falls_back_to_cmd() {
+        let only_cmd = probe_profiles(|name| name == "cmd.exe");
+        let kinds: Vec<ShellKind> = only_cmd.iter().map(|profile| profile.kind).collect();
+        assert_eq!(kinds, vec![ShellKind::Cmd]);
+
+        let none = probe_profiles(|_| false);
+        assert_eq!(none.len(), 1);
+        assert_eq!(none[0].kind, ShellKind::Cmd);
+        assert_eq!(none[0].label, "Command Prompt");
+    }
+
+    #[test]
+    fn probe_profiles_orders_available_shells() {
+        let profiles = probe_profiles(|name| {
+            matches!(name, "pwsh.exe" | "powershell.exe" | "bash.exe" | "wsl.exe")
+        });
+        let kinds: Vec<ShellKind> = profiles.iter().map(|profile| profile.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ShellKind::PowerShell7,
+                ShellKind::PowerShell,
+                ShellKind::GitBash,
+                ShellKind::Wsl
+            ]
+        );
+        let labels: Vec<&str> = profiles.iter().map(|profile| profile.label).collect();
+        assert_eq!(
+            labels,
+            vec!["PowerShell 7", "Windows PowerShell", "Git Bash", "WSL"]
+        );
+
+        // Known Git for Windows install paths satisfy the Git Bash probe.
+        let git = probe_profiles(|name| name == "C:/Program Files/Git/bin/bash.exe");
+        assert_eq!(git.len(), 1);
+        assert_eq!(git[0].kind, ShellKind::GitBash);
+    }
+
+    #[test]
+    fn url_at_cell_maps_columns_to_url() {
+        let line = "visit https://example.com/docs now";
+        assert_eq!(url_at_cell(line, 0), None);
+        assert_eq!(
+            url_at_cell(line, 6).as_deref(),
+            Some("https://example.com/docs")
+        );
+        assert_eq!(
+            url_at_cell(line, 20).as_deref(),
+            Some("https://example.com/docs")
+        );
+        assert_eq!(
+            url_at_cell(line, 29).as_deref(),
+            Some("https://example.com/docs")
+        );
+        assert_eq!(url_at_cell(line, 30), None);
+    }
+
+    #[test]
+    fn url_at_cell_handles_tokens_and_wide_prefix() {
+        let line = "中文 http://a.example/b 和 http://c.example";
+        assert_eq!(url_at_cell(line, 4), None);
+        assert_eq!(url_at_cell(line, 5).as_deref(), Some("http://a.example/b"));
+        assert_eq!(url_at_cell(line, 26), None);
+        assert_eq!(url_at_cell(line, 27).as_deref(), Some("http://c.example"));
+    }
+
+    #[test]
+    fn quote_path_quotes_only_when_needed() {
+        assert_eq!(quote_path(Path::new(r"C:\code\main.rs")), r"C:\code\main.rs");
+        assert_eq!(
+            quote_path(Path::new(r"C:\Program Files\kestrel\a.txt")),
+            r#""C:\Program Files\kestrel\a.txt""#
+        );
     }
 
     #[test]

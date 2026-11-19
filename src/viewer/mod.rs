@@ -74,6 +74,8 @@ impl MultimodalKind {
 pub enum ViewerEvent {
     CopyText(String),
     OpenUrl(String),
+    /// 归档内条目解压后的临时文件路径，交给 app 走现有打开流程。
+    OpenPath(PathBuf),
 }
 
 pub enum MultimodalViewer {

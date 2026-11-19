@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::time::{Duration, Instant};
 
-/// Number of commits the SCM history section loads.
+/// Commits loaded per history page; the panel appends one page at a time.
 pub const COMMIT_HISTORY_LIMIT: usize = 20;
 const COMMIT_HISTORY_REFRESH: Duration = Duration::from_secs(5);
 const CONFIRM_WINDOW: Duration = Duration::from_secs(3);
@@ -40,6 +40,65 @@ impl GitFileStatus {
     }
 }
 
+/// Which side of a conflicted merge to keep.
+#[allow(dead_code)] // the SCM sidebar batch constructs both sides
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ConflictSide {
+    Ours,
+    Theirs,
+}
+
+impl ConflictSide {
+    #[allow(dead_code)] // the SCM sidebar batch reads this label
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ours => "我的",
+            Self::Theirs => "对方的",
+        }
+    }
+}
+
+/// Porcelain merge conflict pair, i.e. what each side did to the file.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ConflictKind {
+    BothModified,
+    BothAdded,
+    BothDeleted,
+    AddedByUs,
+    AddedByThem,
+    DeletedByUs,
+    DeletedByThem,
+}
+
+impl ConflictKind {
+    #[allow(dead_code)] // the SCM sidebar batch renders this label
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::BothModified => "双方修改",
+            Self::BothAdded => "双方新增",
+            Self::BothDeleted => "双方删除",
+            Self::AddedByUs => "我方新增",
+            Self::AddedByThem => "对方新增",
+            Self::DeletedByUs => "我方删除",
+            Self::DeletedByThem => "对方删除",
+        }
+    }
+
+    /// Map the two porcelain status columns; None when the pair is not a conflict.
+    fn from_pair(x: char, y: char) -> Option<Self> {
+        Some(match (x, y) {
+            ('D', 'D') => Self::BothDeleted,
+            ('A', 'U') => Self::AddedByUs,
+            ('U', 'D') => Self::DeletedByThem,
+            ('U', 'A') => Self::AddedByThem,
+            ('D', 'U') => Self::DeletedByUs,
+            ('A', 'A') => Self::BothAdded,
+            ('U', 'U') => Self::BothModified,
+            _ => return None,
+        })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct GitChange {
     pub path: PathBuf,
@@ -48,6 +107,9 @@ pub struct GitChange {
     pub orig_path: Option<String>,
     pub status: GitFileStatus,
     pub staged: bool,
+    /// Set for unmerged paths; the SCM panel offers use mine / use theirs.
+    #[allow(dead_code)] // the SCM sidebar batch renders this marker
+    pub conflict: Option<ConflictKind>,
 }
 
 /// One entry of the SCM history list.
@@ -79,6 +141,11 @@ enum WriteKind {
     Stash,
     Discard,
     Undo,
+    Fetch,
+    Pull,
+    Push,
+    Publish,
+    Resolve,
 }
 
 impl WriteKind {
@@ -91,12 +158,26 @@ impl WriteKind {
             Self::Stash => "储藏",
             Self::Discard => "丢弃更改",
             Self::Undo => "撤销提交",
+            Self::Fetch => "获取远端",
+            Self::Pull => "拉取",
+            Self::Push => "推送",
+            Self::Publish => "发布分支",
+            Self::Resolve => "解决冲突",
         }
     }
 
-    /// Every write except discarding can move HEAD or the index.
+    /// Writes that can move HEAD or the branch history; they invalidate the log.
     fn rewrites_history(self) -> bool {
-        self != Self::Discard
+        matches!(
+            self,
+            Self::Commit
+                | Self::Checkout
+                | Self::Branch
+                | Self::Merge
+                | Self::Undo
+                | Self::Pull
+                | Self::Publish
+        )
     }
 }
 
@@ -157,12 +238,37 @@ pub enum LineDiffKind {
 pub struct GitSnapshot {
     pub is_repo: bool,
     pub branch: String,
+    /// Tracking branch from git status -b, e.g. origin/main; empty when unset.
+    pub upstream: String,
     pub ahead: usize,
     pub behind: usize,
     pub branches: Vec<String>,
     pub changes: Vec<GitChange>,
     pub stashes: Vec<GitStash>,
     pub by_path: HashMap<PathBuf, GitFileStatus>,
+    /// Unmerged paths in canonical working-tree order.
+    pub conflicts: Vec<PathBuf>,
+}
+
+impl GitSnapshot {
+    pub fn has_upstream(&self) -> bool {
+        !self.upstream.is_empty()
+    }
+}
+
+/// SCM panel header data for the sync button: the UI reads this once per frame.
+#[allow(dead_code)] // consumed by the SCM sidebar batch
+#[derive(Clone, Debug, Default)]
+pub struct SyncState {
+    pub is_repo: bool,
+    pub branch: String,
+    pub upstream: String,
+    pub ahead: usize,
+    pub behind: usize,
+    /// A background Git write is in flight; disable the sync actions meanwhile.
+    pub busy: bool,
+    pub conflicts: usize,
+    pub dirty: usize,
 }
 
 pub struct GitService {
@@ -193,7 +299,8 @@ pub struct GitService {
     pub commits: Vec<GitCommit>,
     pub expanded_commit: Option<String>,
     pub commit_files: HashMap<String, Vec<CommitFile>>,
-    commits_rx: Option<Receiver<Vec<GitCommit>>>,
+    commits_rx: Option<Receiver<(usize, Vec<GitCommit>)>>,
+    commits_has_more: bool,
     commit_files_rx: Option<Receiver<(String, Vec<CommitFile>)>>,
     loading_commit_files: Option<String>,
     discard_confirm_until: Option<Instant>,
@@ -240,6 +347,7 @@ impl GitService {
             expanded_commit: None,
             commit_files: HashMap::new(),
             commits_rx: None,
+            commits_has_more: true,
             commit_files_rx: None,
             loading_commit_files: None,
             discard_confirm_until: None,
@@ -257,6 +365,7 @@ impl GitService {
         self.commit_files.clear();
         self.expanded_commit = None;
         self.commits_rx = None;
+        self.commits_has_more = true;
         self.commit_files_rx = None;
         self.loading_commit_files = None;
         self.branch_panel_open = false;
@@ -308,6 +417,50 @@ impl GitService {
         }
         self.refresh_at
             .map(|at| at.saturating_duration_since(Instant::now()).max(Duration::from_millis(1)))
+    }
+
+    // ------------------------------------------------------------------
+    // Remote sync state for the SCM panel header
+    // ------------------------------------------------------------------
+
+    /// Everything the sync button needs: tracking branch, ahead/behind, busy.
+    #[allow(dead_code)] // wired by the SCM sidebar batch
+    pub fn sync_state(&self) -> SyncState {
+        SyncState {
+            is_repo: self.snapshot.is_repo,
+            branch: self.snapshot.branch.clone(),
+            upstream: self.snapshot.upstream.clone(),
+            ahead: self.snapshot.ahead,
+            behind: self.snapshot.behind,
+            busy: self.write_pending > 0,
+            conflicts: self.snapshot.conflicts.len(),
+            dirty: self.snapshot.changes.len(),
+        }
+    }
+
+    #[allow(dead_code)] // wired by the SCM sidebar batch
+    pub fn can_pull(&self) -> bool {
+        self.snapshot.is_repo && self.snapshot.behind > 0 && self.write_pending == 0
+    }
+
+    #[allow(dead_code)] // wired by the SCM sidebar batch
+    pub fn can_push(&self) -> bool {
+        self.snapshot.is_repo && self.snapshot.ahead > 0 && self.write_pending == 0
+    }
+
+    /// True when the branch exists locally but never reached a remote.
+    #[allow(dead_code)] // wired by the SCM sidebar batch
+    pub fn can_publish(&self) -> bool {
+        self.snapshot.is_repo
+            && self.snapshot.upstream.is_empty()
+            && !self.snapshot.branch.is_empty()
+            && self.snapshot.branch != "HEAD"
+            && self.write_pending == 0
+    }
+
+    #[allow(dead_code)] // wired by the SCM sidebar batch
+    pub fn busy(&self) -> bool {
+        self.write_pending > 0
     }
 
     /// Poll finished scans and writes, then start the debounced scan when due.
@@ -464,12 +617,26 @@ impl GitService {
             return;
         }
         self.last_commits_load = Instant::now();
-        let root = root.to_path_buf();
+        self.commits_has_more = true;
+        self.spawn_commit_page(root.to_path_buf(), 0);
+    }
+
+    /// Load the next page; the SCM panel's load-more row calls this.
+    #[allow(dead_code)] // wired by the SCM sidebar batch
+    pub fn load_more_commits(&mut self, root: &Path) {
+        if self.commits_rx.is_some() || !self.commits_has_more {
+            return;
+        }
+        self.spawn_commit_page(root.to_path_buf(), self.commits.len());
+    }
+
+    fn spawn_commit_page(&mut self, root: PathBuf, offset: usize) {
         let (tx, rx) = channel();
         std::thread::Builder::new()
             .name("kestrel-git-log".into())
             .spawn(move || {
-                let _ = tx.send(collect_commits(&root));
+                let page = collect_commits(&root, offset, COMMIT_HISTORY_LIMIT);
+                let _ = tx.send((offset, page));
             })
             .ok();
         self.commits_rx = Some(rx);
@@ -482,8 +649,13 @@ impl GitService {
         let mut updated = false;
         loop {
             match rx.try_recv() {
-                Ok(commits) => {
-                    self.commits = commits;
+                Ok((offset, page)) => {
+                    self.commits_has_more = page_is_full(page.len());
+                    if offset == 0 {
+                        self.commits = page;
+                    } else {
+                        append_commits(&mut self.commits, page);
+                    }
                     updated = true;
                 }
                 Err(TryRecvError::Empty) => {
@@ -494,6 +666,18 @@ impl GitService {
             }
         }
         updated
+    }
+
+    /// Whether another history page may exist.
+    #[allow(dead_code)] // wired by the SCM sidebar batch
+    pub fn has_more_commits(&self) -> bool {
+        self.commits_has_more
+    }
+
+    /// Distinguishes loading more from the initial page when drawing the footer.
+    #[allow(dead_code)] // wired by the SCM sidebar batch
+    pub fn commits_loading_more(&self) -> bool {
+        self.commits_rx.is_some() && !self.commits.is_empty()
     }
 
     /// Kick off a background `git show --name-status` for one commit and cache the result.
@@ -873,6 +1057,177 @@ impl GitService {
         });
         Ok(String::new())
     }
+
+    // ------------------------------------------------------------------
+    // Remote sync: fetch / pull / push travel the same background write queue
+    // ------------------------------------------------------------------
+
+    /// git fetch --prune; ahead/behind refresh through the normal status scan.
+    #[allow(dead_code)] // wired by the SCM sidebar batch
+    pub fn fetch(&mut self, root: &Path) {
+        self.submit(root, WriteKind::Fetch, move |root| {
+            let out = git_net_cmd(root)
+                .args(["fetch", "--prune"])
+                .output()
+                .map_err(|error| format!("无法执行 git fetch: {error}"))?;
+            if !out.status.success() {
+                return Err(friendly_remote_error(&git_error(&out)));
+            }
+            Ok(("已获取远端更新".to_string(), Vec::new()))
+        });
+    }
+
+    /// git pull --no-edit. Conflicts stay in the worktree and appear as
+    /// conflicted entries on the next status scan.
+    #[allow(dead_code)] // wired by the SCM sidebar batch
+    pub fn pull(&mut self, root: &Path) -> Result<(), String> {
+        if !self.snapshot.is_repo {
+            let message = "当前目录不是 Git 仓库".to_string();
+            self.reject_now(root, WriteKind::Pull, message.clone());
+            return Err(message);
+        }
+        if !self.snapshot.has_upstream() {
+            let message = NO_UPSTREAM_HINT.to_string();
+            self.reject_now(root, WriteKind::Pull, message.clone());
+            return Err(message);
+        }
+        self.submit(root, WriteKind::Pull, move |root| {
+            let out = git_net_cmd(root)
+                .args(["pull", "--no-edit"])
+                .output()
+                .map_err(|error| format!("无法执行 git pull: {error}"))?;
+            if !out.status.success() {
+                return Err(friendly_remote_error(&git_error(&out)));
+            }
+            Ok(("已拉取远端更新".to_string(), Vec::new()))
+        });
+        Ok(())
+    }
+
+    /// git push; a branch without an upstream is rejected with a publish hint.
+    #[allow(dead_code)] // wired by the SCM sidebar batch
+    pub fn push(&mut self, root: &Path) -> Result<(), String> {
+        if !self.snapshot.is_repo {
+            let message = "当前目录不是 Git 仓库".to_string();
+            self.reject_now(root, WriteKind::Push, message.clone());
+            return Err(message);
+        }
+        if !self.snapshot.has_upstream() {
+            let message = NO_UPSTREAM_HINT.to_string();
+            self.reject_now(root, WriteKind::Push, message.clone());
+            return Err(message);
+        }
+        self.submit(root, WriteKind::Push, move |root| {
+            let out = git_net_cmd(root)
+                .arg("push")
+                .output()
+                .map_err(|error| format!("无法执行 git push: {error}"))?;
+            if !out.status.success() {
+                return Err(friendly_remote_error(&git_error(&out)));
+            }
+            Ok(("已推送到远端".to_string(), Vec::new()))
+        });
+        Ok(())
+    }
+
+    /// First push of a branch: git push -u origin <branch>.
+    #[allow(dead_code)] // wired by the SCM sidebar batch
+    pub fn publish_branch(&mut self, root: &Path) -> Result<(), String> {
+        let branch = self.snapshot.branch.clone();
+        if !self.snapshot.is_repo || branch.is_empty() || branch == "HEAD" {
+            let message = "当前没有可发布的分支".to_string();
+            self.reject_now(root, WriteKind::Publish, message.clone());
+            return Err(message);
+        }
+        let shown = branch.clone();
+        self.submit(root, WriteKind::Publish, move |root| {
+            let out = git_net_cmd(root)
+                .args(["push", "-u", "origin", &branch])
+                .output()
+                .map_err(|error| format!("无法执行 git push: {error}"))?;
+            if !out.status.success() {
+                return Err(friendly_remote_error(&git_error(&out)));
+            }
+            Ok((format!("已发布分支 {shown} 并关联 origin"), Vec::new()))
+        });
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Conflict resolution: keep one side, then stage the result
+    // ------------------------------------------------------------------
+
+    /// git checkout --ours/--theirs followed by git add; when the chosen side
+    /// deleted the file the checkout fails, so accept the deletion with git rm.
+    #[allow(dead_code)] // wired by the SCM sidebar batch
+    pub fn resolve_conflict(&mut self, root: &Path, path: &Path, side: ConflictSide) {
+        let rel = path.strip_prefix(root).unwrap_or(path).to_path_buf();
+        let shown = rel.display().to_string();
+        let full = path.to_path_buf();
+        self.submit(root, WriteKind::Resolve, move |root| {
+            let flag = match side {
+                ConflictSide::Ours => "--ours",
+                ConflictSide::Theirs => "--theirs",
+            };
+            let out = git_cmd(root)
+                .arg("checkout")
+                .arg(flag)
+                .arg("--")
+                .arg(&rel)
+                .output()
+                .map_err(|error| format!("无法执行 git checkout: {error}"))?;
+            if !out.status.success() {
+                let removed = git_cmd(root)
+                    .arg("rm")
+                    .arg("--")
+                    .arg(&rel)
+                    .output()
+                    .map_err(|error| format!("无法执行 git rm: {error}"))?;
+                if !removed.status.success() {
+                    return Err(git_error(&out));
+                }
+                return Ok((
+                    format!("已按{}版本解决冲突并暂存: {shown}", side.label()),
+                    vec![full],
+                ));
+            }
+            let added = git_cmd(root)
+                .arg("add")
+                .arg("--")
+                .arg(&rel)
+                .output()
+                .map_err(|error| format!("无法执行 git add: {error}"))?;
+            if !added.status.success() {
+                return Err(git_error(&added));
+            }
+            Ok((
+                format!("已按{}版本解决冲突并暂存: {shown}", side.label()),
+                vec![full],
+            ))
+        });
+    }
+
+    /// Resolve every conflicted file in the current snapshot with one side.
+    #[allow(dead_code)] // wired by the SCM sidebar batch
+    pub fn resolve_all_conflicts(&mut self, root: &Path, side: ConflictSide) {
+        let paths = self.snapshot.conflicts.clone();
+        for path in paths {
+            self.resolve_conflict(root, &path, side);
+        }
+    }
+
+    /// Surface an immediate local rejection through the same toast pipeline as
+    /// background results, so a caller that ignores the Result still sees it.
+    fn reject_now(&mut self, root: &Path, kind: WriteKind, message: String) {
+        self.log(format!("{}: {message}", kind.label()));
+        self.ready_ops.push(GitOpResult {
+            label: kind.label(),
+            result: Err(message),
+            touched: Vec::new(),
+            root: root.to_path_buf(),
+            kind,
+        });
+    }
 }
 
 fn confirm_armed(until: Option<Instant>) -> bool {
@@ -907,6 +1262,65 @@ fn git_error(out: &std::process::Output) -> String {
     } else {
         stdout
     }
+}
+
+/// Shown when a pull/push has no tracking branch yet.
+#[allow(dead_code)] // used by the remote write methods wired in the SCM batch
+const NO_UPSTREAM_HINT: &str =
+    "当前分支尚未关联远端分支，请先「发布分支」(git push -u origin <branch>)";
+
+/// Network Git must never block the worker thread on a credential prompt.
+#[allow(dead_code)] // used by the remote write methods wired in the SCM batch
+fn git_net_cmd(root: &Path) -> Command {
+    let mut cmd = git_cmd(root);
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
+    cmd.env("GCM_INTERACTIVE", "never");
+    if std::env::var_os("GIT_SSH_COMMAND").is_none() {
+        cmd.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
+    }
+    cmd
+}
+
+/// Turn raw Git stderr into one actionable Chinese line; unknown errors pass through.
+fn friendly_remote_error(raw: &str) -> String {
+    let lower = raw.to_lowercase();
+    if lower.contains("no upstream")
+        || lower.contains("has no upstream branch")
+        || lower.contains("no tracking information")
+        || lower.contains("not currently on a branch")
+    {
+        return NO_UPSTREAM_HINT.to_string();
+    }
+    if lower.contains("authentication failed")
+        || lower.contains("could not read username")
+        || lower.contains("could not read password")
+        || lower.contains("permission denied")
+        || lower.contains("terminal prompts disabled")
+        || lower.contains("invalid username or password")
+    {
+        return "凭据验证失败：在终端执行一次 git fetch 完成登录，或检查 SSH key 与凭据管理器"
+            .to_string();
+    }
+    if lower.contains("could not resolve")
+        || lower.contains("unable to access")
+        || lower.contains("connection timed out")
+        || lower.contains("failed to connect")
+        || lower.contains("network is unreachable")
+        || lower.contains("connection refused")
+        || lower.contains("operation timed out")
+    {
+        return "网络不可用或远端不可达：检查代理、DNS 与远端地址后重试".to_string();
+    }
+    if lower.contains("not possible to fast-forward")
+        || lower.contains("divergent branches")
+        || lower.contains("need to specify how to reconcile")
+    {
+        return "本地与远端已分叉：先合并或变基，再推送".to_string();
+    }
+    if lower.contains("fetch first") || lower.contains("non-fast-forward") {
+        return "远端已有新提交，请先拉取再推送".to_string();
+    }
+    raw.trim().to_string()
 }
 
 /// Background `git commit`; returns the success summary line or the Git error text.
@@ -1181,14 +1595,13 @@ fn collect_git_snapshot(root: &Path, cancel: &AtomicBool) -> GitSnapshot {
     snap
 }
 
-fn collect_commits(root: &Path) -> Vec<GitCommit> {
-    let Ok(out) = git_cmd(root)
-        .args([
-            "log",
-            "--max-count=20",
-            "--pretty=format:%H%x1f%h%x1f%an%x1f%ar%x1f%s",
-        ])
-        .output()
+fn collect_commits(root: &Path, skip: usize, limit: usize) -> Vec<GitCommit> {
+    let mut cmd = git_cmd(root);
+    cmd.arg("log")
+        .arg(format!("--max-count={limit}"))
+        .arg(format!("--skip={skip}"))
+        .arg("--pretty=format:%H%x1f%h%x1f%an%x1f%ar%x1f%s");
+    let Ok(out) = cmd.output()
     else {
         return Vec::new();
     };
@@ -1232,6 +1645,23 @@ pub fn parse_commit_log(text: &str) -> Vec<GitCommit> {
 }
 
 /// Parse `git stash list --pretty=format:%gd%x1f%s` output.
+/// A page is "full" when more commits may follow; short or empty ends the list.
+fn page_is_full(count: usize) -> bool {
+    count >= COMMIT_HISTORY_LIMIT
+}
+
+/// Append one page, skipping commits already shown: a force-push can shift the
+/// boundary, which would otherwise duplicate the last row of the previous page.
+fn append_commits(target: &mut Vec<GitCommit>, page: Vec<GitCommit>) -> bool {
+    let before = target.len();
+    for commit in page {
+        if !target.iter().any(|existing| existing.hash == commit.hash) {
+            target.push(commit);
+        }
+    }
+    target.len() != before
+}
+
 pub fn parse_stash_list(text: &str) -> Vec<GitStash> {
     let mut stashes = Vec::new();
     for (position, line) in text.lines().enumerate() {
@@ -1281,14 +1711,22 @@ pub fn parse_porcelain_status(text: &str, root: &Path, snap: &mut GitSnapshot) {
     for line in text.lines() {
         if let Some(branch_line) = line.strip_prefix("## ") {
             // e.g. "main...origin/main [ahead 1, behind 2]" or "No commits yet on main"
-            let branch_part = branch_line
-                .split("...")
-                .next()
-                .unwrap_or(branch_line)
-                .split(' ')
-                .next_back()
-                .unwrap_or("HEAD");
-            snap.branch = branch_part.trim().to_string();
+            let head = branch_line.split_whitespace().next().unwrap_or(branch_line);
+            if let Some((local, upstream)) = head.split_once("...") {
+                snap.branch = local.trim().to_string();
+                snap.upstream = upstream.trim().to_string();
+            } else if branch_line.contains("(no branch)") {
+                snap.branch = "HEAD".to_string();
+                snap.upstream.clear();
+            } else {
+                snap.branch = branch_line
+                    .split(' ')
+                    .next_back()
+                    .unwrap_or("HEAD")
+                    .trim()
+                    .to_string();
+                snap.upstream.clear();
+            }
             if let Some(bracket_start) = branch_line.find('[')
                 && let Some(bracket_end) = branch_line[bracket_start..].find(']')
             {
@@ -1321,6 +1759,21 @@ pub fn parse_porcelain_status(text: &str, root: &Path, snap: &mut GitSnapshot) {
         };
         let full_path = root.join(rel_path.replace('/', std::path::MAIN_SEPARATOR_STR));
 
+        if let Some(kind) = ConflictKind::from_pair(x, y) {
+            snap.by_path
+                .insert(full_path.clone(), GitFileStatus::Conflicted);
+            snap.conflicts.push(full_path.clone());
+            snap.changes.push(GitChange {
+                path: full_path,
+                rel_path,
+                orig_path,
+                status: GitFileStatus::Conflicted,
+                staged: false,
+                conflict: Some(kind),
+            });
+            continue;
+        }
+
         if x == '?' && y == '?' {
             snap.by_path
                 .insert(full_path.clone(), GitFileStatus::Untracked);
@@ -1330,6 +1783,7 @@ pub fn parse_porcelain_status(text: &str, root: &Path, snap: &mut GitSnapshot) {
                 orig_path: None,
                 status: GitFileStatus::Untracked,
                 staged: false,
+                conflict: None,
             });
             continue;
         }
@@ -1350,6 +1804,7 @@ pub fn parse_porcelain_status(text: &str, root: &Path, snap: &mut GitSnapshot) {
                 orig_path: orig_path.clone(),
                 status,
                 staged: true,
+                conflict: None,
             });
         }
 
@@ -1367,6 +1822,7 @@ pub fn parse_porcelain_status(text: &str, root: &Path, snap: &mut GitSnapshot) {
                 orig_path,
                 status,
                 staged: false,
+                conflict: None,
             });
         }
     }
@@ -1741,5 +2197,104 @@ mod tests {
         unstage_patch(&root, &second).expect("取消暂存第二个块");
         assert!(staged_patch(&root, "file.txt").is_empty());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn porcelain_parser_flags_every_conflict_pair() {
+        let sample = "## main...origin/main\nUU a.rs\nAA b.rs\nDD c.rs\nAU d.rs\nUD e.rs\nUA f.rs\nDU g.rs\n";
+        let mut snap = GitSnapshot::default();
+        parse_porcelain_status(sample, Path::new("/repo"), &mut snap);
+        assert_eq!(snap.branch, "main");
+        assert_eq!(snap.upstream, "origin/main");
+        assert_eq!(snap.conflicts.len(), 7);
+        let kinds: Vec<Option<ConflictKind>> = snap.changes.iter().map(|c| c.conflict).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                Some(ConflictKind::BothModified),
+                Some(ConflictKind::BothAdded),
+                Some(ConflictKind::BothDeleted),
+                Some(ConflictKind::AddedByUs),
+                Some(ConflictKind::DeletedByThem),
+                Some(ConflictKind::AddedByThem),
+                Some(ConflictKind::DeletedByUs),
+            ]
+        );
+        assert!(
+            snap.changes
+                .iter()
+                .all(|change| change.status == GitFileStatus::Conflicted)
+        );
+        assert_eq!(snap.conflicts[0], Path::new("/repo").join("a.rs"));
+        assert_eq!(ConflictKind::BothModified.label(), "双方修改");
+        assert_eq!(ConflictSide::Ours.label(), "我的");
+        assert_eq!(ConflictSide::Theirs.label(), "对方的");
+    }
+
+    #[test]
+    fn porcelain_parser_reads_upstream_and_detached_head() {
+        let mut snap = GitSnapshot::default();
+        parse_porcelain_status(
+            "## feat...origin/feat [ahead 3, behind 0]\n",
+            Path::new("/repo"),
+            &mut snap,
+        );
+        assert_eq!(snap.branch, "feat");
+        assert_eq!(snap.upstream, "origin/feat");
+        assert_eq!((snap.ahead, snap.behind), (3, 0));
+        assert!(snap.has_upstream());
+
+        let mut local = GitSnapshot::default();
+        parse_porcelain_status("## main\n", Path::new("/repo"), &mut local);
+        assert_eq!(local.branch, "main");
+        assert!(!local.has_upstream());
+
+        let mut detached = GitSnapshot::default();
+        parse_porcelain_status("## HEAD (no branch)\n", Path::new("/repo"), &mut detached);
+        assert_eq!(detached.branch, "HEAD");
+        assert!(!detached.has_upstream());
+    }
+
+    #[test]
+    fn commit_history_pages_by_twenty() {
+        let root = test_repo("history");
+        git_ok(&root, &["init", "-q"]);
+        for index in 0..22 {
+            git_ok(
+                &root,
+                &["commit", "-q", "--allow-empty", "-m", &format!("c{index}")],
+            );
+        }
+        let first = collect_commits(&root, 0, COMMIT_HISTORY_LIMIT);
+        assert_eq!(first.len(), COMMIT_HISTORY_LIMIT);
+        assert!(page_is_full(first.len()));
+        let second = collect_commits(&root, first.len(), COMMIT_HISTORY_LIMIT);
+        assert_eq!(second.len(), 2);
+        assert!(!page_is_full(second.len()));
+        let mut pages = first;
+        assert!(append_commits(&mut pages, second));
+        assert_eq!(pages.len(), 22);
+        assert_eq!(pages.last().map(|c| c.subject.as_str()), Some("c0"));
+        let duplicate = pages[0].clone();
+        assert!(!append_commits(&mut pages, vec![duplicate]));
+        assert_eq!(pages.len(), 22);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn remote_error_messages_are_actionable() {
+        let no_upstream = friendly_remote_error(
+            "fatal: The current branch main has no upstream branch.\nTo push the current branch",
+        );
+        assert!(no_upstream.contains("发布分支"), "{no_upstream}");
+        let auth = friendly_remote_error(
+            "fatal: Authentication failed for 'https://example.com/repo.git/'",
+        );
+        assert!(auth.contains("凭据"), "{auth}");
+        let network =
+            friendly_remote_error("fatal: unable to access 'https://x/': Could not resolve host: x");
+        assert!(network.contains("网络"), "{network}");
+        let other = friendly_remote_error("fatal: something odd");
+        assert_eq!(other, "fatal: something odd");
     }
 }

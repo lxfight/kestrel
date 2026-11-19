@@ -1,7 +1,7 @@
 //! Persisted user settings, custom keybindings, and the last editor session.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
@@ -41,6 +41,13 @@ pub struct Settings {
     pub keybindings: HashMap<String, String>,
     pub disabled_plugins: Vec<String>,
     pub plugin_config: HashMap<String, HashMap<String, serde_json::Value>>,
+    /// Last used project-search include/exclude globs.
+    pub search_include: String,
+    pub search_exclude: String,
+    /// Recently opened files, newest first.
+    pub recent_files: Vec<String>,
+    /// New terminals start in the active editor's directory.
+    pub terminal_follow_active_dir: bool,
 }
 
 impl Default for Settings {
@@ -75,6 +82,10 @@ impl Default for Settings {
             keybindings: HashMap::new(),
             disabled_plugins: Vec::new(),
             plugin_config: HashMap::new(),
+            search_include: String::new(),
+            search_exclude: String::new(),
+            recent_files: Vec::new(),
+            terminal_follow_active_dir: false,
         }
     }
 }
@@ -176,6 +187,15 @@ impl Settings {
         self.recent_folders.retain(|f| f != folder);
         self.recent_folders.insert(0, folder.to_string());
         self.recent_folders.truncate(12);
+        self.save();
+    }
+
+    /// Record an opened file for the welcome page's recent list.
+    pub fn note_recent_file(&mut self, path: &Path) {
+        let entry = path.to_string_lossy().to_string();
+        self.recent_files.retain(|existing| existing != &entry);
+        self.recent_files.insert(0, entry);
+        self.recent_files.truncate(12);
         self.save();
     }
 

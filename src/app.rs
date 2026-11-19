@@ -159,6 +159,8 @@ pub struct SearchPanelState {
     pub case_sensitive: bool,
     pub whole_word: bool,
     pub regex: bool,
+    /// Match file names only; file contents are never read.
+    pub filename_only: bool,
     pub show_options: bool,
     pub results: Vec<SearchResult>,
     pub scanning: bool,
@@ -294,6 +296,12 @@ pub struct BottomPanel {
 
     /// Kept from the last frame so global shortcuts skip keys the terminal owns.
     pub terminal_has_focus: bool,
+    /// Two terminals side by side in the same bottom panel.
+    pub split: bool,
+    /// Right-hand terminal when `split` is on.
+    pub secondary_terminal: usize,
+    /// New terminals start in the active editor's directory instead of the project root.
+    pub follow_active_dir: bool,
 }
 
 impl BottomPanel {
@@ -308,6 +316,9 @@ impl BottomPanel {
             terminal_size: (0, 0),
             terminal_focus: false,
             terminal_has_focus: false,
+            split: false,
+            secondary_terminal: 1,
+            follow_active_dir: false,
         }
     }
 }
@@ -738,6 +749,9 @@ impl KestrelApp {
             jump_back: Vec::new(),
             jump_forward: Vec::new(),
         };
+        app.bottom.follow_active_dir = app.settings.terminal_follow_active_dir;
+        app.workspace.search_panel.include = app.settings.search_include.clone();
+        app.workspace.search_panel.exclude = app.settings.search_exclude.clone();
         app.apply_dev_env();
         if app.workspace.root.is_none() && app.tabs.is_empty() && app.dev_ui.is_none() {
             app.restore_session();
@@ -999,6 +1013,15 @@ impl KestrelApp {
                     term.begin_selection(1, 0);
                     term.update_selection(2, 18);
                 }
+            }
+            "terminal_split" => {
+                self.toggle_terminal();
+                if self.bottom.terminals.len() < 2 {
+                    self.new_terminal();
+                }
+                self.bottom.split = true;
+                self.bottom.active_terminal = 0;
+                self.bottom.secondary_terminal = 1.min(self.bottom.terminals.len() - 1);
             }
             "output" => {
                 self.bottom.visible = true;
@@ -1348,6 +1371,18 @@ impl KestrelApp {
 
     pub fn active_path(&self) -> Option<PathBuf> {
         self.active_editor().and_then(|e| e.doc.path.clone())
+    }
+
+    /// Recently opened files, newest first, for the welcome page.
+    #[allow(dead_code)] // consumed by the welcome page batch
+    pub fn recent_files(&self) -> Vec<PathBuf> {
+        self.settings
+            .recent_files
+            .iter()
+            .map(PathBuf::from)
+            .filter(|path| path.is_file())
+            .take(12)
+            .collect()
     }
 
     pub fn dirty_tabs(&self) -> Vec<String> {
@@ -1821,6 +1856,7 @@ impl KestrelApp {
                     ctx.copy_text(text);
                     self.toast("已复制到剪贴板", ToastKind::Success);
                 }
+                ViewerEvent::OpenPath(path) => self.open_file(path),
                 ViewerEvent::OpenUrl(url) => {
                     #[cfg(windows)]
                     let _ = std::process::Command::new("cmd")
@@ -1917,6 +1953,9 @@ impl KestrelApp {
     }
 
     fn open_file_internal(&mut self, path: PathBuf, as_preview: bool) {
+        if path.is_file() {
+            self.settings.note_recent_file(&path);
+        }
         if let Some(index) = self
             .tabs
             .iter()
@@ -3014,9 +3053,18 @@ impl KestrelApp {
             self.workspace.index.scan(&root);
             return;
         }
+        let filters_changed = self.settings.search_include
+            != self.workspace.search_panel.include
+            || self.settings.search_exclude != self.workspace.search_panel.exclude;
+        if filters_changed {
+            self.settings.search_include = self.workspace.search_panel.include.clone();
+            self.settings.search_exclude = self.workspace.search_panel.exclude.clone();
+            self.settings.save();
+        }
         let search_query = SearchQuery {
             pattern: query.clone(),
             regex: self.workspace.search_panel.regex,
+            filename_only: self.workspace.search_panel.filename_only,
             case_sensitive: self.workspace.search_panel.case_sensitive,
             whole_word: self.workspace.search_panel.whole_word,
             include: self.workspace.search_panel.include.clone(),
@@ -3037,9 +3085,14 @@ impl KestrelApp {
         if self.workspace.search_panel.query.trim().is_empty() {
             return;
         }
+        if self.workspace.search_panel.filename_only {
+            self.toast("仅文件名模式下不支持替换", ToastKind::Info);
+            return;
+        }
         let search_query = SearchQuery {
             pattern: self.workspace.search_panel.query.clone(),
             regex: self.workspace.search_panel.regex,
+            filename_only: false,
             case_sensitive: self.workspace.search_panel.case_sensitive,
             whole_word: self.workspace.search_panel.whole_word,
             include: self.workspace.search_panel.include.clone(),
@@ -3498,10 +3551,14 @@ impl KestrelApp {
     }
 
     pub fn new_terminal_with_shell(&mut self, shell: ShellKind) {
-        let cwd = self
-            .workspace
-            .root
-            .clone()
+        let follow_dir = if self.bottom.follow_active_dir {
+            self.active_path()
+                .and_then(|path| path.parent().map(Path::to_path_buf))
+        } else {
+            None
+        };
+        let cwd = follow_dir
+            .or_else(|| self.workspace.root.clone())
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_default();
         self.open_terminal_in(cwd, shell);
@@ -3548,6 +3605,12 @@ impl KestrelApp {
             .bottom
             .active_terminal
             .min(self.bottom.terminals.len().saturating_sub(1));
+        let secondary = if self.bottom.secondary_terminal >= self.bottom.terminals.len() {
+            0
+        } else {
+            self.bottom.secondary_terminal
+        };
+        self.bottom.secondary_terminal = secondary.min(self.bottom.terminals.len().saturating_sub(1));
     }
 
     // ------------------------------------------------------------------
@@ -4533,6 +4596,7 @@ impl eframe::App for KestrelApp {
         if !devshot::enabled() {
             self.settings.sidebar_width = self.sidebar.width;
             self.settings.terminal_height = self.bottom.height;
+            self.settings.terminal_follow_active_dir = self.bottom.follow_active_dir;
             // Settings writes are debounced; exit must land them immediately.
             self.settings.flush();
             self.save_session();

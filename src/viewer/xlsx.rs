@@ -313,6 +313,16 @@ impl SpreadsheetViewer {
                     let (grid_rect, _) =
                         ui.allocate_exact_size(Vec2::new(total_w, total_h), Sense::hover());
                     let painter = ui.painter_at(grid_rect);
+                    // 冻结表头：表头钉在可视区顶端，数据区裁剪到表头下沿，最后再画表头压在最上层。
+                    let clip = painter.clip_rect();
+                    let header_rect = Rect::from_min_size(
+                        Pos2::new(clip.left(), clip.top()),
+                        Vec2::new(clip.width(), row_h),
+                    );
+                    let data_painter = painter.with_clip_rect(Rect::from_min_max(
+                        Pos2::new(clip.left(), header_rect.bottom()),
+                        clip.max,
+                    ));
 
                     let first_row = ((viewport.top() / row_h).floor() as isize - 1).max(0) as usize;
                     let last_row =
@@ -321,34 +331,6 @@ impl SpreadsheetViewer {
                         .max(0) as usize;
                     let last_col = (((viewport.right() - row_num_w) / col_w).ceil() as usize + 1)
                         .min(total_cols);
-
-                    // Header row (fixed at top of allocated grid)
-                    let hdr_y = grid_rect.top();
-                    painter.rect_filled(
-                        Rect::from_min_size(
-                            Pos2::new(grid_rect.left(), hdr_y),
-                            Vec2::new(total_w, row_h),
-                        ),
-                        0.0,
-                        theme.panel_bg,
-                    );
-                    for c in first_col..last_col {
-                        let x = grid_rect.left() + row_num_w + c as f32 * col_w;
-                        let cr = Rect::from_min_size(Pos2::new(x, hdr_y), Vec2::new(col_w, row_h));
-                        painter.rect_stroke(
-                            cr,
-                            0.0,
-                            Stroke::new(1.0, theme.border),
-                            StrokeKind::Inside,
-                        );
-                        painter.text(
-                            cr.center(),
-                            Align2::CENTER_CENTER,
-                            col_name(c),
-                            FontId::new(11.5, style.ui_bold_family.clone()),
-                            theme.text_dim,
-                        );
-                    }
 
                     // Visible data rows
                     for r in first_row..last_row {
@@ -364,14 +346,14 @@ impl SpreadsheetViewer {
                             Pos2::new(grid_rect.left(), y),
                             Vec2::new(row_num_w, row_h),
                         );
-                        painter.rect_filled(rn_rect, 0.0, theme.panel_bg);
-                        painter.rect_stroke(
+                        data_painter.rect_filled(rn_rect, 0.0, theme.panel_bg);
+                        data_painter.rect_stroke(
                             rn_rect,
                             0.0,
                             Stroke::new(1.0, theme.border),
                             StrokeKind::Inside,
                         );
-                        painter.text(
+                        data_painter.text(
                             rn_rect.center(),
                             Align2::CENTER_CENTER,
                             (r + 1).to_string(),
@@ -398,8 +380,8 @@ impl SpreadsheetViewer {
                             } else {
                                 row_bg
                             };
-                            painter.rect_filled(cell_rect, 0.0, bg);
-                            painter.rect_stroke(
+                            data_painter.rect_filled(cell_rect, 0.0, bg);
+                            data_painter.rect_stroke(
                                 cell_rect,
                                 0.0,
                                 Stroke::new(
@@ -410,9 +392,10 @@ impl SpreadsheetViewer {
                             );
 
                             if !val.is_empty() {
-                                let clip = painter.with_clip_rect(cell_rect.shrink2(Vec2::new(6.0, 2.0)));
+                                let text_painter =
+                                    data_painter.with_clip_rect(cell_rect.shrink2(Vec2::new(6.0, 2.0)));
                                 if is_num {
-                                    clip.text(
+                                    text_painter.text(
                                         Pos2::new(cell_rect.right() - 8.0, cell_rect.center().y),
                                         Align2::RIGHT_CENTER,
                                         val,
@@ -420,7 +403,7 @@ impl SpreadsheetViewer {
                                         theme.syn_number,
                                     );
                                 } else {
-                                    clip.text(
+                                    text_painter.text(
                                         Pos2::new(cell_rect.left() + 8.0, cell_rect.center().y),
                                         Align2::LEFT_CENTER,
                                         val,
@@ -431,7 +414,7 @@ impl SpreadsheetViewer {
                             }
 
                             let resp = ui.interact(
-                                cell_rect,
+                                cell_rect.intersect(data_painter.clip_rect()),
                                 ui.scope_id().with(("cell", r, c)),
                                 Sense::click(),
                             );
@@ -439,6 +422,29 @@ impl SpreadsheetViewer {
                                 new_selection = Some((r, c));
                             }
                         }
+                    }
+
+                    // 表头最后绘制，始终压在数据行之上。
+                    painter.rect_filled(header_rect, 0.0, theme.panel_bg);
+                    for c in first_col..last_col {
+                        let x = grid_rect.left() + row_num_w + c as f32 * col_w;
+                        let cr = Rect::from_min_size(
+                            Pos2::new(x, header_rect.top()),
+                            Vec2::new(col_w, row_h),
+                        );
+                        painter.rect_stroke(
+                            cr,
+                            0.0,
+                            Stroke::new(1.0, theme.border),
+                            StrokeKind::Inside,
+                        );
+                        painter.text(
+                            cr.center(),
+                            Align2::CENTER_CENTER,
+                            col_name(c),
+                            FontId::new(11.5, style.ui_bold_family.clone()),
+                            theme.text_dim,
+                        );
                     }
                 });
         }

@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use egui::text::{LayoutJob, TextFormat};
 use egui::{
     Align2, Color32, CornerRadius, Event, FontId, ImeEvent, Key, Modifiers, Pos2, Rect, ScrollArea,
-    Sense, Stroke, TextEdit, Ui, Vec2,
+    Sense, Stroke, TextEdit, Ui, UiBuilder, Vec2,
 };
 
 use crate::app::{BottomTab, KestrelApp};
@@ -39,7 +39,7 @@ impl KestrelApp {
         let term_count = self.bottom.terminals.len();
 
         // Tabs keep out of the fixed right-hand action cluster.
-        let actions_left = header.right() - 168.0;
+        let actions_left = header.right() - 216.0;
         let mut tab_x = header.left() + crate::theme::SP3;
         let mut draw_tab = |ui: &mut Ui, tab: BottomTab, label: &str, badge: Option<usize>| {
             let active = self.bottom.tab == tab;
@@ -119,7 +119,10 @@ impl KestrelApp {
 
         // Terminal instance selector pills when on Terminal tab
         let mut switch_term = None;
-        if self.bottom.tab == BottomTab::Terminal && !self.bottom.terminals.is_empty() {
+        if self.bottom.tab == BottomTab::Terminal
+            && !self.bottom.split
+            && !self.bottom.terminals.is_empty()
+        {
             tab_x += crate::theme::SP2;
             for (idx, term) in self.bottom.terminals.iter().enumerate() {
                 let active = idx == self.bottom.active_terminal;
@@ -172,35 +175,44 @@ impl KestrelApp {
         }
 
         // Right side header actions
-        let mut new_pwsh = false;
-        let mut new_cmd = false;
+        let mut new_shell: Option<ShellKind> = None;
+        let mut toggle_split = false;
+        let mut toggle_follow = false;
         let mut kill_term = false;
         let mut clear = false;
         let mut close_panel = false;
         let mut x = header.right() - 8.0;
-        let action = |ui: &mut Ui, x: &mut f32, icon: Icon, tip: &str| -> bool {
-            *x -= 24.0;
-            let r =
-                Rect::from_center_size(Pos2::new(*x + 11.0, header.center().y), Vec2::splat(22.0));
-            let resp = ui.interact(r, ui.scope_id().with(("term_action", tip)), Sense::click());
-            if resp.hovered() {
-                ui.painter()
-                    .rect_filled(r, CornerRadius::same(5), theme.hover);
-            }
-            icons::paint(
-                ui.painter(),
-                r.shrink(4.0),
-                icon,
-                if resp.hovered() {
-                    theme.text
-                } else {
-                    theme.text_dim
-                },
-                1.3,
-            );
-            resp.on_hover_text(tip).clicked()
-        };
-        if action(ui, &mut x, Icon::Close, "隐藏底部面板 (Ctrl+J)") {
+        let action =
+            |ui: &mut Ui, x: &mut f32, icon: Icon, tip: &str, active: bool| -> egui::Response {
+                *x -= 24.0;
+                let r = Rect::from_center_size(
+                    Pos2::new(*x + 11.0, header.center().y),
+                    Vec2::splat(22.0),
+                );
+                let resp =
+                    ui.interact(r, ui.scope_id().with(("term_action", tip)), Sense::click());
+                if active {
+                    ui.painter()
+                        .rect_filled(r, CornerRadius::same(5), theme.active);
+                } else if resp.hovered() {
+                    ui.painter()
+                        .rect_filled(r, CornerRadius::same(5), theme.hover);
+                }
+                icons::paint(
+                    ui.painter(),
+                    r.shrink(4.0),
+                    icon,
+                    if active || resp.hovered() {
+                        theme.text
+                    } else {
+                        theme.text_dim
+                    },
+                    1.3,
+                );
+                resp.clone().on_hover_text(tip);
+                resp
+            };
+        if action(ui, &mut x, Icon::Close, "隐藏底部面板 (Ctrl+J)", false).clicked() {
             close_panel = true;
         }
         x -= 6.0;
@@ -213,58 +225,36 @@ impl KestrelApp {
         );
         x -= 4.0;
         if self.bottom.tab == BottomTab::Terminal {
-            if action(ui, &mut x, Icon::Trash, "关闭当前终端会话") {
+            if action(ui, &mut x, Icon::Trash, "关闭当前终端会话", false).clicked() {
                 kill_term = true;
             }
-            if action(ui, &mut x, Icon::ClearAll, "清屏 (Clear)") {
+            if action(ui, &mut x, Icon::ClearAll, "清屏 (Clear)", false).clicked() {
                 clear = true;
             }
-            // Compact "CMD" pill button to distinguish from the PowerShell '+' icon
-            x -= 36.0;
-            let cmd_rect = Rect::from_center_size(
-                Pos2::new(x + 17.0, header.center().y),
-                Vec2::new(32.0, 20.0),
-            );
-            let cmd_resp = ui.interact(cmd_rect, ui.scope_id().with("term_cmd_btn"), Sense::click());
-            ui.painter().rect_filled(
-                cmd_rect,
-                CornerRadius::same(4),
-                if cmd_resp.hovered() {
-                    theme.hover
-                } else {
-                    theme.input_bg
-                },
-            );
-            ui.painter().rect_stroke(
-                cmd_rect,
-                CornerRadius::same(4),
-                Stroke::new(1.0, theme.border),
-                egui::StrokeKind::Inside,
-            );
-            ui.painter().text(
-                cmd_rect.center(),
-                Align2::CENTER_CENTER,
-                "CMD",
-                style.tiny(),
-                if cmd_resp.hovered() {
-                    theme.text
-                } else {
-                    theme.text_dim
-                },
-            );
-            if cmd_resp.on_hover_text("新建 CMD 终端").clicked() {
-                new_cmd = true;
+            if action(ui, &mut x, Icon::SplitHorizontal, "左右分屏", self.bottom.split).clicked() {
+                toggle_split = true;
             }
             if action(
                 ui,
                 &mut x,
-                Icon::Plus,
-                "新建 PowerShell 终端 (Ctrl+Shift+`)",
-            ) {
-                new_pwsh = true;
+                Icon::FolderOpen,
+                "新终端跟随活动文件目录",
+                self.bottom.follow_active_dir,
+            )
+            .clicked()
+            {
+                toggle_follow = true;
             }
+            let plus = action(ui, &mut x, Icon::Plus, "新建终端", false);
+            egui::Popup::menu(&plus).width(150.0).show(|ui| {
+                for profile in crate::terminal::available_profiles() {
+                    if ui.button(profile.label).clicked() {
+                        new_shell = Some(profile.kind);
+                    }
+                }
+            });
         } else if self.bottom.tab == BottomTab::Output
-            && action(ui, &mut x, Icon::ClearAll, "清空输出日志")
+            && action(ui, &mut x, Icon::ClearAll, "清空输出日志", false).clicked()
         {
             self.git.logs.clear();
             self.plugins.clear_logs();
@@ -282,11 +272,27 @@ impl KestrelApp {
             self.bottom.visible = false;
             return;
         }
-        if new_pwsh {
-            self.new_terminal_with_shell(ShellKind::PowerShell);
+        if let Some(shell) = new_shell {
+            self.new_terminal_with_shell(shell);
         }
-        if new_cmd {
-            self.new_terminal_with_shell(ShellKind::Cmd);
+        if toggle_follow {
+            self.bottom.follow_active_dir = !self.bottom.follow_active_dir;
+        }
+        if toggle_split {
+            self.bottom.split = !self.bottom.split;
+            if self.bottom.split {
+                if self.bottom.terminals.len() < 2 {
+                    self.new_terminal();
+                }
+                let len = self.bottom.terminals.len();
+                let left = self.bottom.active_terminal.min(len.saturating_sub(1));
+                self.bottom.active_terminal = left;
+                self.bottom.secondary_terminal = if len >= 2 {
+                    (left + 1) % len
+                } else {
+                    left
+                };
+            }
         }
         if kill_term {
             self.close_active_terminal();
@@ -442,27 +448,102 @@ impl KestrelApp {
             return;
         }
 
-        let active_idx = self
-            .bottom
-            .active_terminal
-            .min(self.bottom.terminals.len() - 1);
-        self.bottom.active_terminal = active_idx;
-
+        let len = self.bottom.terminals.len();
+        let left = self.bottom.active_terminal.min(len - 1);
+        self.bottom.active_terminal = left;
         if clear {
-            self.bottom.terminals[active_idx].clear_screen();
+            self.bottom.terminals[left].clear_screen();
         }
 
-        if self.bottom.terminals[active_idx].search.open {
-            self.terminal_search_bar_ui(ui, style, active_idx);
+        let area = ui.available_rect_before_wrap();
+        ui.painter().rect_filled(area, 0.0, theme.input_bg);
+        ui.allocate_rect(area, Sense::hover());
+
+        if self.bottom.split && len >= 2 {
+            let right = {
+                let right = self.bottom.secondary_terminal.min(len - 1);
+                if right == left {
+                    (left + 1) % len
+                } else {
+                    right
+                }
+            };
+            self.bottom.secondary_terminal = right;
+            let gap = 6.0;
+            let pane_w = ((area.width() - gap) * 0.5).floor().max(8.0);
+            let left_rect = Rect::from_min_size(area.min, Vec2::new(pane_w, area.height()));
+            let right_rect =
+                Rect::from_min_max(Pos2::new(area.left() + pane_w + gap, area.top()), area.max);
+            let divider_x = area.left() + pane_w + gap * 0.5;
+            ui.painter().line_segment(
+                [
+                    Pos2::new(divider_x, area.top()),
+                    Pos2::new(divider_x, area.bottom()),
+                ],
+                Stroke::new(1.0, theme.border),
+            );
+            let left_res = ui
+                .scope_builder(UiBuilder::new().max_rect(left_rect), |ui| {
+                    self.terminal_pane_ui(ui, style, left, true)
+                })
+                .inner;
+            let right_res = ui
+                .scope_builder(UiBuilder::new().max_rect(right_rect), |ui| {
+                    self.terminal_pane_ui(ui, style, right, false)
+                })
+                .inner;
+            self.bottom.terminal_has_focus = left_res.focused || right_res.focused;
+            if right_res.clicked || right_res.dropped {
+                self.bottom.active_terminal = right;
+                self.bottom.secondary_terminal = left;
+                self.bottom.terminal_focus = true;
+            }
+        } else {
+            let res = ui
+                .scope_builder(UiBuilder::new().max_rect(area), |ui| {
+                    self.terminal_pane_ui(ui, style, left, true)
+                })
+                .inner;
+            self.bottom.terminal_has_focus = res.focused;
+            if res.dropped {
+                self.bottom.terminal_focus = true;
+            }
+        }
+    }
+
+    /// Paint and drive one terminal grid. The result tells the split layout
+    /// which pane the pointer targeted so a click can promote it.
+    fn terminal_pane_ui(
+        &mut self,
+        ui: &mut Ui,
+        style: &UiStyle,
+        idx: usize,
+        primary: bool,
+    ) -> TerminalPaneResult {
+        let theme = style.theme;
+        let mut result = TerminalPaneResult::default();
+
+        if self.bottom.terminals[idx].search.open {
+            self.terminal_search_bar_ui(ui, style, idx);
         }
 
-        let (body, resp) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
+        let body = ui.available_rect_before_wrap();
+        if body.width() < 16.0 || body.height() < 16.0 {
+            return result;
+        }
+        let split = self.bottom.split;
+        let resp = ui.interact(
+            body,
+            egui::Id::unique(("kestrel_terminal_grid", idx)),
+            Sense::click_and_drag(),
+        );
         ui.painter().rect_filled(body, 0.0, theme.input_bg);
 
         if resp.clicked() {
             resp.request_focus();
+            result.clicked = true;
         }
-        if self.bottom.terminal_focus {
+        if primary && self.bottom.terminal_focus {
             resp.request_focus();
             // 终端面板先于 CentralPanel 绘制，编辑器本帧仍会按 focus_requested 抢焦点，这里提前清掉。
             if let Some(tab) = self.tabs.get_mut(self.active) {
@@ -471,7 +552,7 @@ impl KestrelApp {
             self.bottom.terminal_focus = false;
         }
         let focused = resp.has_focus();
-        self.bottom.terminal_has_focus = focused;
+        result.focused = focused;
 
         // Ctrl + wheel adjusts terminal font size; normal wheel scrolls history
         if resp.hovered() {
@@ -485,7 +566,7 @@ impl KestrelApp {
                     ui.input(|i| (i.modifiers, i.smooth_scroll_delta.y));
                 if !(modifiers.ctrl || modifiers.command)
                     && smooth_dy.abs() > 0.5
-                    && let Some(term) = self.bottom.terminals.get_mut(active_idx)
+                    && let Some(term) = self.bottom.terminals.get_mut(idx)
                 {
                     let lines = (smooth_dy / 16.0).round() as isize;
                     let next_offset =
@@ -505,7 +586,7 @@ impl KestrelApp {
         let cols = ((body.width() - 14.0) / cell_w).floor().max(2.0) as u16;
         let rows = ((body.height() - 6.0) / cell_h).floor().max(2.0) as u16;
 
-        let terminal = &mut self.bottom.terminals[active_idx];
+        let terminal = &mut self.bottom.terminals[idx];
         if !focused {
             terminal.ime_preedit.clear();
         }
@@ -513,7 +594,7 @@ impl KestrelApp {
         if (rows, cols) != (cur_rows.get(), cur_cols.get()) && cols > 0 && rows > 0 {
             terminal.resize(cols, rows);
         }
-        if cols > 0 && rows > 0 {
+        if primary && cols > 0 && rows > 0 {
             self.bottom.terminal_size = (cols, rows);
         }
         terminal.poll();
@@ -524,9 +605,48 @@ impl KestrelApp {
             (rows_nz.get().min(rows), cols_nz.get().min(cols))
         };
 
+        // Ctrl+click on a URL opens it in the default browser.
+        if let Some(pos) = resp.hover_pos()
+            && ui.input(|i| i.modifiers.ctrl || i.modifiers.command)
+        {
+            let (row, col) = cell_at(pos, origin, cell_w, cell_h, screen_rows, screen_cols);
+            if let Some(url) = crate::terminal::url_at_cell(&terminal.row_text(row), col) {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                resp.clone()
+                    .on_hover_text(format!("Ctrl+点击在浏览器打开 {url}"));
+                if resp.clicked() {
+                    crate::terminal::open_url(&url);
+                }
+            }
+        }
+
+        // Files dropped on this pane become shell-quoted arguments for its shell.
+        if resp.hovered() {
+            let dropped: Vec<PathBuf> = ui.input(|i| {
+                i.raw
+                    .dropped_files
+                    .iter()
+                    .map(|file| file.path().to_path_buf())
+                    .collect()
+            });
+            if !dropped.is_empty() {
+                let mut text = String::new();
+                for path in &dropped {
+                    text.push_str(&crate::terminal::quote_path(path));
+                    text.push(' ');
+                }
+                terminal.write(text.as_bytes());
+                ui.input_mut(|i| i.raw.dropped_files.clear());
+                resp.request_focus();
+                result.dropped = true;
+            }
+        }
+
         // Mouse selection maps the press point (not the post-threshold drag point)
-        // to a cell so the first cell stays inside the range.
-        if !terminal.search.open && focused {
+        // to a cell so the first cell stays inside the range. A split pane still
+        // accepts a drag while it is not the focused grid.
+        let can_select = focused || (split && resp.hovered());
+        if !terminal.search.open && can_select {
             if resp.drag_started()
                 && let Some(pos) = ui
                     .input(|i| i.pointer.press_origin())
@@ -816,6 +936,7 @@ impl KestrelApp {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(120));
         }
+        result
     }
     /// Ctrl+F row above the grid: query field, live match counter, and
     /// Enter / Shift+Enter navigation. Esc closes and returns focus to the grid.
@@ -916,6 +1037,13 @@ impl KestrelApp {
             self.bottom.terminal_focus = true;
         }
     }
+}
+
+#[derive(Default)]
+struct TerminalPaneResult {
+    focused: bool,
+    clicked: bool,
+    dropped: bool,
 }
 
 fn paint_terminal_run(

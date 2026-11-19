@@ -113,6 +113,9 @@ impl KestrelApp {
                 .show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
                     ui.spacing_mut().item_spacing.y = 0.0;
+                    if !load_errors.is_empty() {
+                        load_error_section(ui, style, &load_errors, &mut action);
+                    }
                     if infos.is_empty() {
                         ui.add_space(14.0);
                         ui.horizontal(|ui| {
@@ -147,19 +150,6 @@ impl KestrelApp {
                             );
                         });
                     } else if filtered.is_empty() {
-                        for error in &load_errors {
-                            ui.horizontal(|ui| {
-                                ui.add_space(14.0);
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(error)
-                                            .font(style.tiny())
-                                            .color(theme.error),
-                                    )
-                                    .truncate(),
-                                );
-                            });
-                        }
                         ui.add_space(14.0);
                         ui.horizontal(|ui| {
                             ui.add_space(14.0);
@@ -244,6 +234,65 @@ impl KestrelApp {
             }
         }
     }
+}
+
+/// 「加载失败」区段：即使有正常插件也展示，每个损坏插件一行。
+fn load_error_section(
+    ui: &mut Ui,
+    style: &UiStyle,
+    errors: &[String],
+    action: &mut Option<PanelAction>,
+) {
+    let theme = style.theme;
+    let (header, _) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 22.0), Sense::hover());
+    ui.painter()
+        .rect_filled(header, 0.0, theme.panel_bg.gamma_multiply(0.7));
+    ui.painter().text(
+        Pos2::new(header.left() + 14.0, header.center().y),
+        Align2::LEFT_CENTER,
+        format!("加载失败 · {}", errors.len()),
+        style.tiny(),
+        theme.error,
+    );
+    for error in errors {
+        let (rect, resp) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), 22.0), Sense::click());
+        if resp.hovered() {
+            ui.painter().rect_filled(
+                rect.shrink2(Vec2::new(6.0, 0.0)),
+                CornerRadius::same(4),
+                theme.hover.gamma_multiply(0.55),
+            );
+        }
+        let text_clip = Rect::from_min_max(
+            Pos2::new(rect.left() + 14.0, rect.top()),
+            Pos2::new(rect.right() - 10.0, rect.bottom()),
+        );
+        ui.painter().with_clip_rect(text_clip).text(
+            Pos2::new(rect.left() + 14.0, rect.center().y),
+            Align2::LEFT_CENTER,
+            load_error_label(error),
+            style.tiny(),
+            theme.error,
+        );
+        if resp.on_hover_text(error.as_str()).clicked() {
+            *action = Some(PanelAction::OpenDir);
+        }
+    }
+    ui.add_space(4.0);
+}
+
+/// `manifest::discover` 的错误形如 `<清单路径>: <原因>`，列表行只取插件目录名。
+fn load_error_label(error: &str) -> String {
+    let path = error.split_once(": ").map_or(error, |(path, _)| path);
+    std::path::Path::new(path)
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .map_or_else(
+            || error.lines().next().unwrap_or_default().to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        )
 }
 
 fn plugin_row(
