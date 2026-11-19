@@ -1,0 +1,795 @@
+//! The command registry: every user-facing action, its label, icon, and default shortcut.
+
+use egui::{Key, Modifiers};
+
+use crate::icons::Icon;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum Command {
+    // File
+    NewFile,
+    NewFolder,
+    OpenFile,
+    OpenFolder,
+    Save,
+    SaveAs,
+    SaveAll,
+    CloseTab,
+    CloseAllTabs,
+    ReloadFile,
+    // Edit & Multi-cursor
+    Undo,
+    Redo,
+    Cut,
+    Copy,
+    Paste,
+    SelectAll,
+    SelectNextOccurrence,
+    SelectAllOccurrences,
+    AddCursorUp,
+    AddCursorDown,
+    Find,
+    Replace,
+    FindNext,
+    FindPrev,
+    GotoLine,
+    GotoSymbol,
+    GotoDefinition,
+    FormatDocument,
+    TriggerSuggest,
+    ToggleComment,
+    DuplicateLine,
+    DeleteLine,
+    MoveLineUp,
+    MoveLineDown,
+    Indent,
+    Outdent,
+    ToggleFold,
+    FoldAll,
+    UnfoldAll,
+    // Navigation / view / workbench
+    CommandPalette,
+    QuickOpen,
+    ToggleSidebar,
+    ToggleTerminal,
+    NewTerminal,
+    ShowProblems,
+    ShowOutput,
+    SplitEditor,
+    ToggleMarkdownPreview,
+    MarkdownPreviewSide,
+    ToggleWordWrap,
+    ToggleMinimap,
+    ToggleStickyScroll,
+    ToggleWhitespace,
+    ToggleIndentGuides,
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
+    ThemeDark,
+    ThemeLight,
+    OpenSettings,
+    SetLanguage,
+    ShowExplorer,
+    ShowSearch,
+    ShowGit,
+    ShowOutline,
+    NextTab,
+    PrevTab,
+    // Workspace
+    CopyPath,
+    RevealInExplorer,
+    RefreshExplorer,
+    // Help
+    About,
+    Shortcuts,
+    // Extensions
+    Plugins,
+}
+
+/// A key chord with exact modifiers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Shortcut {
+    pub mods: Modifiers,
+    pub key: Key,
+}
+
+impl Shortcut {
+    pub const fn new(mods: Modifiers, key: Key) -> Self {
+        Self { mods, key }
+    }
+
+    pub fn display(&self) -> String {
+        let mut s = String::new();
+        if self.mods.ctrl {
+            if cfg!(target_os = "macos") {
+                s.push_str("Cmd+");
+            } else {
+                s.push_str("Ctrl+");
+            }
+        }
+        if self.mods.shift {
+            s.push_str("Shift+");
+        }
+        if self.mods.alt {
+            s.push_str("Alt+");
+        }
+        s.push_str(key_name(self.key));
+        s
+    }
+
+    /// Parse a keybinding such as `ctrl+alt+h`, `f12`, or `ctrl+shift+space`.
+    pub fn parse(text: &str) -> Option<Self> {
+        let mut mods = Modifiers::NONE;
+        let mut key = None;
+        let mut parts: Vec<&str> = text.split('+').collect();
+        let mut plus_key = false;
+        if parts.len() > 1 && parts.last().is_some_and(|part| part.trim().is_empty()) {
+            parts.pop();
+            if parts.last().is_some_and(|part| part.trim().is_empty()) {
+                parts.pop();
+                plus_key = true;
+            }
+        }
+        if plus_key {
+            key = Some(Key::Plus);
+        }
+        for part in parts {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            match part.to_ascii_lowercase().as_str() {
+                "ctrl" | "control" | "cmd" | "command" | "super" | "win" | "meta" => mods.ctrl = true,
+                "shift" => mods.shift = true,
+                "alt" | "option" | "opt" => mods.alt = true,
+                _ => {
+                    if key.is_some() {
+                        return None;
+                    }
+                    key = parse_key(part);
+                }
+            }
+        }
+        if plus_key && key != Some(Key::Plus) {
+            return None;
+        }
+        key.map(|key| Self { mods, key })
+    }
+
+    /// Parse several keybindings separated by commas; invalid entries are skipped.
+    pub fn parse_list(text: &str) -> Vec<Self> {
+        text.split(',').filter_map(Self::parse).collect()
+    }
+}
+
+const CTRL: Modifiers = Modifiers {
+    alt: false,
+    ctrl: true,
+    shift: false,
+    mac_cmd: false,
+    command: false,
+};
+
+const fn ctrl_shift() -> Modifiers {
+    Modifiers {
+        alt: false,
+        ctrl: true,
+        shift: true,
+        mac_cmd: false,
+        command: false,
+    }
+}
+
+const fn ctrl_alt() -> Modifiers {
+    Modifiers {
+        alt: true,
+        ctrl: true,
+        shift: false,
+        mac_cmd: false,
+        command: false,
+    }
+}
+
+const fn shift_alt() -> Modifiers {
+    Modifiers {
+        alt: true,
+        ctrl: false,
+        shift: true,
+        mac_cmd: false,
+        command: false,
+    }
+}
+
+const fn alt() -> Modifiers {
+    Modifiers {
+        alt: true,
+        ctrl: false,
+        shift: false,
+        mac_cmd: false,
+        command: false,
+    }
+}
+
+const fn no_mods() -> Modifiers {
+    Modifiers {
+        alt: false,
+        ctrl: false,
+        shift: false,
+        mac_cmd: false,
+        command: false,
+    }
+}
+
+
+fn parse_key(part: &str) -> Option<Key> {
+    let lower = part.to_ascii_lowercase();
+    let alias = match lower.as_str() {
+        "up" | "↑" => Some(Key::ArrowUp),
+        "down" | "↓" => Some(Key::ArrowDown),
+        "left" | "←" => Some(Key::ArrowLeft),
+        "right" | "→" => Some(Key::ArrowRight),
+        "esc" | "escape" => Some(Key::Escape),
+        "tab" => Some(Key::Tab),
+        "backspace" => Some(Key::Backspace),
+        "enter" | "return" => Some(Key::Enter),
+        "delete" | "del" => Some(Key::Delete),
+        "insert" => Some(Key::Insert),
+        "home" => Some(Key::Home),
+        "end" => Some(Key::End),
+        "pageup" => Some(Key::PageUp),
+        "pagedown" => Some(Key::PageDown),
+        "space" => Some(Key::Space),
+        _ => None,
+    };
+    alias.or_else(|| Key::from_name(part)).or_else(|| {
+        let mut chars = part.chars();
+        let first = chars.next()?;
+        let capitalized = first.to_uppercase().collect::<String>() + chars.as_str();
+        Key::from_name(&capitalized)
+    })
+}
+
+fn key_name(key: Key) -> &'static str {
+    match key {
+        Key::F1 => "F1",
+        Key::F2 => "F2",
+        Key::F3 => "F3",
+        Key::F5 => "F5",
+        Key::F11 => "F11",
+        Key::F12 => "F12",
+        Key::Escape => "Esc",
+        Key::Enter => "Enter",
+        Key::Tab => "Tab",
+        Key::Backspace => "Backspace",
+        Key::Delete => "Delete",
+        Key::ArrowUp => "↑",
+        Key::ArrowDown => "↓",
+        Key::ArrowLeft => "←",
+        Key::ArrowRight => "→",
+        Key::Home => "Home",
+        Key::End => "End",
+        Key::PageUp => "PageUp",
+        Key::PageDown => "PageDown",
+        Key::Plus => "Plus",
+        Key::Minus => "-",
+        Key::Comma => ",",
+        Key::Period => ".",
+        Key::Slash => "/",
+        Key::Backslash => "\\",
+        Key::Semicolon => ";",
+        Key::Quote => "'",
+        Key::OpenBracket => "[",
+        Key::CloseBracket => "]",
+        Key::Backtick => "`",
+        Key::Equals => "=",
+        Key::Space => "Space",
+        Key::Num0 => "0",
+        Key::A => "A",
+        Key::B => "B",
+        Key::C => "C",
+        Key::D => "D",
+        Key::E => "E",
+        Key::F => "F",
+        Key::G => "G",
+        Key::H => "H",
+        Key::I => "I",
+        Key::J => "J",
+        Key::K => "K",
+        Key::L => "L",
+        Key::M => "M",
+        Key::N => "N",
+        Key::O => "O",
+        Key::P => "P",
+        Key::Q => "Q",
+        Key::R => "R",
+        Key::S => "S",
+        Key::T => "T",
+        Key::U => "U",
+        Key::V => "V",
+        Key::W => "W",
+        Key::X => "X",
+        Key::Y => "Y",
+        Key::Z => "Z",
+        _ => "",
+    }
+}
+
+impl Command {
+
+    /// Stable identifier used by keybindings, plugins, and settings files.
+    pub fn id(self) -> &'static str {
+        match self {
+            Command::NewFile => "file.new",
+            Command::NewFolder => "file.newFolder",
+            Command::OpenFile => "file.openFile",
+            Command::OpenFolder => "file.openFolder",
+            Command::Save => "file.save",
+            Command::SaveAs => "file.saveAs",
+            Command::SaveAll => "file.saveAll",
+            Command::CloseTab => "file.closeTab",
+            Command::CloseAllTabs => "file.closeAllTabs",
+            Command::ReloadFile => "file.reload",
+            Command::Undo => "edit.undo",
+            Command::Redo => "edit.redo",
+            Command::Cut => "edit.cut",
+            Command::Copy => "edit.copy",
+            Command::Paste => "edit.paste",
+            Command::SelectAll => "edit.selectAll",
+            Command::SelectNextOccurrence => "edit.selectNextOccurrence",
+            Command::SelectAllOccurrences => "edit.selectAllOccurrences",
+            Command::AddCursorUp => "edit.addCursorUp",
+            Command::AddCursorDown => "edit.addCursorDown",
+            Command::Find => "edit.find",
+            Command::Replace => "edit.replace",
+            Command::FindNext => "edit.findNext",
+            Command::FindPrev => "edit.findPrev",
+            Command::GotoLine => "edit.gotoLine",
+            Command::GotoSymbol => "edit.gotoSymbol",
+            Command::GotoDefinition => "edit.gotoDefinition",
+            Command::FormatDocument => "edit.formatDocument",
+            Command::TriggerSuggest => "edit.triggerSuggest",
+            Command::ToggleComment => "edit.toggleComment",
+            Command::DuplicateLine => "edit.duplicateLine",
+            Command::DeleteLine => "edit.deleteLine",
+            Command::MoveLineUp => "edit.moveLineUp",
+            Command::MoveLineDown => "edit.moveLineDown",
+            Command::Indent => "edit.indent",
+            Command::Outdent => "edit.outdent",
+            Command::ToggleFold => "edit.toggleFold",
+            Command::FoldAll => "edit.foldAll",
+            Command::UnfoldAll => "edit.unfoldAll",
+            Command::CommandPalette => "view.commandPalette",
+            Command::QuickOpen => "view.quickOpen",
+            Command::ToggleSidebar => "view.toggleSidebar",
+            Command::ToggleTerminal => "view.toggleTerminal",
+            Command::NewTerminal => "view.newTerminal",
+            Command::ShowProblems => "view.problems",
+            Command::ShowOutput => "view.output",
+            Command::SplitEditor => "view.splitEditor",
+            Command::ToggleMarkdownPreview => "view.toggleMarkdownPreview",
+            Command::MarkdownPreviewSide => "view.markdownPreviewSide",
+            Command::ToggleWordWrap => "view.toggleWordWrap",
+            Command::ToggleMinimap => "view.toggleMinimap",
+            Command::ToggleStickyScroll => "view.toggleStickyScroll",
+            Command::ToggleWhitespace => "view.toggleWhitespace",
+            Command::ToggleIndentGuides => "view.toggleIndentGuides",
+            Command::ZoomIn => "view.zoomIn",
+            Command::ZoomOut => "view.zoomOut",
+            Command::ZoomReset => "view.zoomReset",
+            Command::ThemeDark => "view.themeDark",
+            Command::ThemeLight => "view.themeLight",
+            Command::OpenSettings => "view.settings",
+            Command::SetLanguage => "view.setLanguage",
+            Command::ShowExplorer => "view.explorer",
+            Command::ShowSearch => "view.search",
+            Command::ShowGit => "view.git",
+            Command::ShowOutline => "view.outline",
+            Command::NextTab => "view.nextTab",
+            Command::PrevTab => "view.prevTab",
+            Command::CopyPath => "workspace.copyPath",
+            Command::RevealInExplorer => "workspace.revealInExplorer",
+            Command::RefreshExplorer => "workspace.refreshExplorer",
+            Command::About => "help.about",
+            Command::Shortcuts => "help.shortcuts",
+            Command::Plugins => "plugins.manage",
+        }
+    }
+
+    /// Look up a built-in command by its stable identifier.
+    pub fn from_id(id: &str) -> Option<Command> {
+        Command::ALL.iter().copied().find(|command| command.id() == id)
+    }
+
+    pub const ALL: &'static [Command] = &[
+        Command::NewFile,
+        Command::NewFolder,
+        Command::OpenFile,
+        Command::OpenFolder,
+        Command::Save,
+        Command::SaveAs,
+        Command::SaveAll,
+        Command::CloseTab,
+        Command::CloseAllTabs,
+        Command::ReloadFile,
+        Command::Undo,
+        Command::Redo,
+        Command::Cut,
+        Command::Copy,
+        Command::Paste,
+        Command::SelectAll,
+        Command::SelectNextOccurrence,
+        Command::SelectAllOccurrences,
+        Command::AddCursorUp,
+        Command::AddCursorDown,
+        Command::Find,
+        Command::Replace,
+        Command::FindNext,
+        Command::FindPrev,
+        Command::GotoLine,
+        Command::GotoSymbol,
+        Command::GotoDefinition,
+        Command::FormatDocument,
+        Command::TriggerSuggest,
+        Command::ToggleComment,
+        Command::DuplicateLine,
+        Command::DeleteLine,
+        Command::MoveLineUp,
+        Command::MoveLineDown,
+        Command::Indent,
+        Command::Outdent,
+        Command::ToggleFold,
+        Command::FoldAll,
+        Command::UnfoldAll,
+        Command::CommandPalette,
+        Command::QuickOpen,
+        Command::ToggleSidebar,
+        Command::ToggleTerminal,
+        Command::NewTerminal,
+        Command::ShowProblems,
+        Command::ShowOutput,
+        Command::SplitEditor,
+        Command::ToggleMarkdownPreview,
+        Command::MarkdownPreviewSide,
+        Command::ToggleWordWrap,
+        Command::ToggleMinimap,
+        Command::ToggleStickyScroll,
+        Command::ToggleWhitespace,
+        Command::ToggleIndentGuides,
+        Command::ZoomIn,
+        Command::ZoomOut,
+        Command::ZoomReset,
+        Command::ThemeDark,
+        Command::ThemeLight,
+        Command::OpenSettings,
+        Command::SetLanguage,
+        Command::ShowExplorer,
+        Command::ShowSearch,
+        Command::ShowGit,
+        Command::ShowOutline,
+        Command::NextTab,
+        Command::PrevTab,
+        Command::CopyPath,
+        Command::RevealInExplorer,
+        Command::RefreshExplorer,
+        Command::About,
+        Command::Shortcuts,
+        Command::Plugins,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Command::NewFile => "新建文件",
+            Command::NewFolder => "新建文件夹",
+            Command::OpenFile => "打开文件…",
+            Command::OpenFolder => "打开文件夹…",
+            Command::Save => "保存",
+            Command::SaveAs => "另存为…",
+            Command::SaveAll => "全部保存",
+            Command::CloseTab => "关闭编辑器",
+            Command::CloseAllTabs => "关闭所有编辑器",
+            Command::ReloadFile => "从磁盘重新加载",
+            Command::Undo => "撤销",
+            Command::Redo => "重做",
+            Command::Cut => "剪切",
+            Command::Copy => "复制",
+            Command::Paste => "粘贴",
+            Command::SelectAll => "全选",
+            Command::SelectNextOccurrence => "添加下一个匹配项到选区",
+            Command::SelectAllOccurrences => "选择所有匹配项 (多光标)",
+            Command::AddCursorUp => "在上方添加光标",
+            Command::AddCursorDown => "在下方添加光标",
+            Command::Find => "查找",
+            Command::Replace => "替换",
+            Command::FindNext => "查找下一个",
+            Command::FindPrev => "查找上一个",
+            Command::GotoLine => "转到行…",
+            Command::GotoSymbol => "转到文件中的符号…",
+            Command::GotoDefinition => "转到定义",
+            Command::FormatDocument => "格式化文档",
+            Command::TriggerSuggest => "触发代码补全建议",
+            Command::ToggleComment => "切换行注释",
+            Command::DuplicateLine => "复制行",
+            Command::DeleteLine => "删除行",
+            Command::MoveLineUp => "上移行",
+            Command::MoveLineDown => "下移行",
+            Command::Indent => "增加缩进",
+            Command::Outdent => "减少缩进",
+            Command::ToggleFold => "切换代码折叠",
+            Command::FoldAll => "全部折叠代码块",
+            Command::UnfoldAll => "全部展开代码块",
+            Command::CommandPalette => "显示所有命令",
+            Command::QuickOpen => "快速打开文件",
+            Command::ToggleSidebar => "切换侧边栏",
+            Command::ToggleTerminal => "切换终端面板",
+            Command::NewTerminal => "新建终端实例",
+            Command::ShowProblems => "显示问题面板 (Problems)",
+            Command::ShowOutput => "显示输出面板 (Output)",
+            Command::SplitEditor => "向右拆分编辑器 (分屏)",
+            Command::ToggleMarkdownPreview => "切换 Markdown 预览",
+            Command::MarkdownPreviewSide => "Markdown 侧边分屏预览",
+            Command::ToggleWordWrap => "切换自动换行 (Word Wrap)",
+            Command::ToggleMinimap => "切换小地图 (Minimap)",
+            Command::ToggleStickyScroll => "切换粘性滚动 (Sticky Scroll)",
+            Command::ToggleWhitespace => "切换空白字符显示",
+            Command::ToggleIndentGuides => "切换缩进参考线",
+            Command::ZoomIn => "放大界面",
+            Command::ZoomOut => "缩小界面",
+            Command::ZoomReset => "重置界面缩放",
+            Command::ThemeDark => "使用深色主题",
+            Command::ThemeLight => "使用浅色主题",
+            Command::OpenSettings => "打开设置",
+            Command::SetLanguage => "更改语言模式…",
+            Command::ShowExplorer => "显示资源管理器",
+            Command::ShowSearch => "显示全局搜索",
+            Command::ShowGit => "显示源代码管理 (Git)",
+            Command::ShowOutline => "显示代码大纲 (Outline)",
+            Command::NextTab => "下一个编辑器",
+            Command::PrevTab => "上一个编辑器",
+            Command::CopyPath => "复制文件路径",
+            Command::RevealInExplorer => "在文件资源管理器中显示",
+            Command::RefreshExplorer => "刷新资源管理器",
+            Command::About => "关于 Kestrel",
+            Command::Shortcuts => "键盘快捷键",
+            Command::Plugins => "管理插件",
+        }
+    }
+
+    pub fn icon(self) -> Icon {
+        match self {
+            Command::NewFile => Icon::NewFile,
+            Command::NewFolder => Icon::NewFolder,
+            Command::OpenFile | Command::QuickOpen => Icon::File,
+            Command::OpenFolder => Icon::FolderOpen,
+            Command::Save | Command::SaveAs => Icon::Save,
+            Command::SaveAll => Icon::SaveAll,
+            Command::CloseTab | Command::CloseAllTabs => Icon::Close,
+            Command::ReloadFile | Command::RefreshExplorer => Icon::Refresh,
+            Command::Undo => Icon::Undo,
+            Command::Redo => Icon::Redo,
+            Command::Copy | Command::CopyPath => Icon::Copy,
+            Command::Find | Command::FindNext | Command::FindPrev | Command::ShowSearch => {
+                Icon::Search
+            }
+            Command::Replace => Icon::Replace,
+            Command::GotoLine | Command::GotoDefinition => Icon::Goforward,
+            Command::GotoSymbol | Command::ShowOutline => Icon::Outline,
+            Command::FormatDocument => Icon::FileCode,
+            Command::TriggerSuggest => Icon::Lightbulb,
+            Command::ToggleFold | Command::FoldAll => Icon::CollapseAll,
+            Command::UnfoldAll => Icon::ExpandAll,
+            Command::ToggleSidebar | Command::ShowExplorer => Icon::Explorer,
+            Command::ToggleTerminal | Command::NewTerminal => Icon::Terminal,
+            Command::ShowProblems => Icon::Problems,
+            Command::ShowOutput => Icon::Output,
+            Command::SplitEditor | Command::MarkdownPreviewSide => Icon::SplitHorizontal,
+            Command::ToggleMarkdownPreview => Icon::Preview,
+            Command::ToggleWordWrap => Icon::WordWrap,
+            Command::ShowGit => Icon::SourceControl,
+            Command::OpenSettings => Icon::Settings,
+            Command::ThemeLight => Icon::Sun,
+            Command::ThemeDark => Icon::Moon,
+            Command::Shortcuts => Icon::Keyboard,
+            Command::About => Icon::Info,
+            Command::Plugins => Icon::Extensions,
+            _ => Icon::FileCode,
+        }
+    }
+
+    pub fn category(self) -> &'static str {
+        match self {
+            Command::NewFile
+            | Command::NewFolder
+            | Command::OpenFile
+            | Command::OpenFolder
+            | Command::Save
+            | Command::SaveAs
+            | Command::SaveAll
+            | Command::CloseTab
+            | Command::CloseAllTabs
+            | Command::ReloadFile => "文件",
+            Command::Undo
+            | Command::Redo
+            | Command::Cut
+            | Command::Copy
+            | Command::Paste
+            | Command::SelectAll
+            | Command::SelectNextOccurrence
+            | Command::SelectAllOccurrences
+            | Command::AddCursorUp
+            | Command::AddCursorDown
+            | Command::Find
+            | Command::Replace
+            | Command::FindNext
+            | Command::FindPrev
+            | Command::GotoLine
+            | Command::GotoSymbol
+            | Command::GotoDefinition
+            | Command::FormatDocument
+            | Command::TriggerSuggest
+            | Command::ToggleComment
+            | Command::DuplicateLine
+            | Command::DeleteLine
+            | Command::MoveLineUp
+            | Command::MoveLineDown
+            | Command::Indent
+            | Command::Outdent
+            | Command::ToggleFold
+            | Command::FoldAll
+            | Command::UnfoldAll => "编辑",
+            Command::CopyPath | Command::RevealInExplorer | Command::RefreshExplorer => "工作区",
+            Command::About | Command::Shortcuts => "帮助",
+            Command::Plugins => "插件",
+            _ => "视图",
+        }
+    }
+
+    pub fn shortcut(self) -> Option<Shortcut> {
+        use Key::*;
+        Some(match self {
+            Command::NewFile => Shortcut::new(CTRL, N),
+            Command::OpenFile => Shortcut::new(CTRL, O),
+            Command::OpenFolder => Shortcut::new(ctrl_shift(), O),
+            Command::Save => Shortcut::new(CTRL, S),
+            Command::SaveAs => Shortcut::new(ctrl_shift(), S),
+            Command::SaveAll => Shortcut::new(ctrl_shift(), A),
+            Command::CloseTab => Shortcut::new(CTRL, W),
+            Command::CloseAllTabs => Shortcut::new(ctrl_shift(), W),
+            Command::Undo => Shortcut::new(CTRL, Z),
+            Command::Redo => Shortcut::new(CTRL, Y),
+            Command::Cut => Shortcut::new(CTRL, X),
+            Command::Copy => Shortcut::new(CTRL, C),
+            Command::Paste => Shortcut::new(CTRL, V),
+            Command::SelectAll => Shortcut::new(CTRL, A),
+            Command::SelectNextOccurrence => Shortcut::new(CTRL, D),
+            Command::SelectAllOccurrences => Shortcut::new(ctrl_shift(), L),
+            Command::AddCursorUp => Shortcut::new(ctrl_alt(), ArrowUp),
+            Command::AddCursorDown => Shortcut::new(ctrl_alt(), ArrowDown),
+            Command::Find => Shortcut::new(CTRL, F),
+            Command::Replace => Shortcut::new(CTRL, H),
+            Command::FindNext => Shortcut::new(no_mods(), F3),
+            Command::FindPrev => Shortcut::new(ctrl_shift(), F3),
+            Command::GotoLine => Shortcut::new(CTRL, G),
+            Command::GotoSymbol => Shortcut::new(ctrl_shift(), Period),
+            Command::GotoDefinition => Shortcut::new(no_mods(), F12),
+            Command::FormatDocument => Shortcut::new(shift_alt(), F),
+            Command::TriggerSuggest => Shortcut::new(CTRL, Space),
+            Command::ToggleComment => Shortcut::new(CTRL, Slash),
+            Command::DuplicateLine => Shortcut::new(ctrl_shift(), D),
+            Command::DeleteLine => Shortcut::new(ctrl_shift(), K),
+            Command::MoveLineUp => Shortcut::new(alt(), ArrowUp),
+            Command::MoveLineDown => Shortcut::new(alt(), ArrowDown),
+            Command::ToggleFold => Shortcut::new(ctrl_shift(), OpenBracket),
+            Command::CommandPalette => Shortcut::new(ctrl_shift(), P),
+            Command::QuickOpen => Shortcut::new(CTRL, P),
+            Command::ToggleSidebar => Shortcut::new(CTRL, B),
+            Command::ToggleTerminal => Shortcut::new(CTRL, J),
+            Command::NewTerminal => Shortcut::new(ctrl_shift(), Backtick),
+            Command::ShowProblems => Shortcut::new(ctrl_shift(), M),
+            Command::ShowOutput => Shortcut::new(ctrl_shift(), U),
+            Command::SplitEditor => Shortcut::new(CTRL, Backslash),
+            Command::ToggleMarkdownPreview => Shortcut::new(ctrl_shift(), V),
+            Command::MarkdownPreviewSide => Shortcut::new(alt(), V),
+            Command::ToggleWordWrap => Shortcut::new(alt(), Z),
+            Command::ToggleMinimap => Shortcut::new(alt(), M),
+            Command::ToggleIndentGuides => Shortcut::new(ctrl_shift(), G),
+            Command::ZoomIn => Shortcut::new(CTRL, Plus),
+            Command::ZoomOut => Shortcut::new(CTRL, Minus),
+            Command::ZoomReset => Shortcut::new(CTRL, Num0),
+            Command::ShowExplorer => Shortcut::new(ctrl_shift(), E),
+            Command::ShowSearch => Shortcut::new(ctrl_shift(), F),
+            Command::NextTab => Shortcut::new(CTRL, Tab),
+            Command::PrevTab => Shortcut::new(ctrl_shift(), Tab),
+            Command::OpenSettings => Shortcut::new(CTRL, Comma),
+            Command::Shortcuts => Shortcut::new(CTRL, K),
+            Command::Plugins => Shortcut::new(ctrl_shift(), X),
+            _ => return None,
+        })
+    }
+
+    /// Shortcut text shown in menus and the palette, formatted for display.
+    pub fn shortcut_text(self) -> Option<String> {
+        self.shortcut().map(|s| s.display())
+    }
+
+    /// Commands whose keys are handled by the editor canvas directly.
+    pub fn is_editor_command(self) -> bool {
+        matches!(
+            self,
+            Command::Undo
+                | Command::Redo
+                | Command::Cut
+                | Command::Copy
+                | Command::Paste
+                | Command::SelectAll
+                | Command::SelectNextOccurrence
+                | Command::SelectAllOccurrences
+                | Command::AddCursorUp
+                | Command::AddCursorDown
+                | Command::Find
+                | Command::Replace
+                | Command::FindNext
+                | Command::FindPrev
+                | Command::TriggerSuggest
+                | Command::ToggleComment
+                | Command::DuplicateLine
+                | Command::DeleteLine
+                | Command::MoveLineUp
+                | Command::MoveLineDown
+                | Command::Indent
+                | Command::Outdent
+                | Command::ToggleFold
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shortcut_parse_roundtrips_every_builtin() {
+        for command in Command::ALL {
+            let Some(shortcut) = command.shortcut() else {
+                continue;
+            };
+            assert_eq!(
+                Shortcut::parse(&shortcut.display()),
+                Some(shortcut),
+                "{} {:?}",
+                command.id(),
+                shortcut
+            );
+        }
+        assert_eq!(
+            Shortcut::parse("ctrl+alt+u"),
+            Some(Shortcut::new(
+                Modifiers {
+                    alt: true,
+                    ctrl: true,
+                    shift: false,
+                    mac_cmd: false,
+                    command: false,
+                },
+                Key::U
+            ))
+        );
+        assert!(Shortcut::parse("ctrl+nope").is_none());
+        assert_eq!(Shortcut::parse_list("ctrl+a, ctrl+b").len(), 2);
+    }
+
+    #[test]
+    fn command_ids_are_unique_and_roundtrip() {
+        let mut ids: Vec<&str> = Command::ALL.iter().map(|command| command.id()).collect();
+        for command in Command::ALL {
+            assert!(!command.id().is_empty());
+            assert_eq!(Command::from_id(command.id()), Some(*command));
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), Command::ALL.len());
+        assert_eq!(Command::from_id("file.save"), Some(Command::Save));
+        assert_eq!(Command::from_id("plugins.manage"), Some(Command::Plugins));
+        assert_eq!(Command::from_id("no.such"), None);
+    }
+}

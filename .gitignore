@@ -1,0 +1,11 @@
+/target
+*.ppm
+*.log
+shot*.png
+Kestrel.exe
+
+# 开发文档与截图不进版本库
+/docs
+/IMPLEMENTATION_PLAN.md
+/OPTIMIZATION_PLAN.md
+/recovery
