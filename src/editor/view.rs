@@ -9,7 +9,7 @@ use egui::{
     Vec2,
 };
 
-use super::{Editor, EditorEvent, EditorStyle};
+use super::{Editor, EditorEvent, EditorStyle, MinimapRow};
 use crate::git::LineDiffKind;
 use crate::highlight::{Span, TokenKind};
 use crate::icons::{self, Icon};
@@ -20,18 +20,80 @@ const SCROLLBAR_W: f32 = 11.0;
 const MINIMAP_W: f32 = 88.0;
 
 impl Editor {
-    /// Fractional line number at the top of the viewport.
+    /// Fractional document line at the top of the viewport.
     pub fn top_visible_line(&self, line_h: f32) -> f32 {
-        ((self.scroll_y - PAD_TOP) / line_h.max(1.0)).max(0.0)
+        let row_frac = (self.scroll_y - PAD_TOP).max(0.0) / line_h.max(1.0);
+        let row_count = self.line_map.row_count();
+        if row_count == 0 || self.line_map.rows.is_none() {
+            return row_frac;
+        }
+        self.line_map
+            .line_of_row((row_frac.floor() as usize).min(row_count - 1)) as f32
     }
 
-    /// Scroll so that `line` sits at the top of the viewport.
+    /// Scroll so that the given document line sits at the top of the viewport.
     pub fn scroll_to_line(&mut self, line: f32, line_h: f32) {
-        self.scroll_y = (line.max(0.0) * line_h + PAD_TOP).max(0.0);
+        self.sync_layout();
+        let line = line.max(0.0) as usize;
+        let row = match self.line_map.row_of(line) {
+            Some(row) => row,
+            None => self
+                .fold_index
+                .enclosing_start(line)
+                .and_then(|start| self.line_map.row_of(start))
+                .unwrap_or(0),
+        };
+        self.scroll_y = (row as f32 * line_h.max(1.0) + PAD_TOP).max(0.0);
+    }
+
+    /// First row whose top edge is at or above the viewport.
+    fn first_visible_row(&self, line_h: f32) -> usize {
+        ((self.scroll_y - PAD_TOP).max(0.0) / line_h.max(1.0)).floor() as usize
+    }
+
+    /// Row under a screen y coordinate, clamped to the last row.
+    fn row_at_y(&self, y: f32, view_top: f32, line_h: f32, row_count: usize) -> usize {
+        (((y - view_top + self.scroll_y - PAD_TOP) / line_h).floor() as isize)
+            .clamp(0, row_count as isize - 1) as usize
+    }
+
+    /// Start line of the sticky header floating above the viewport, if any.
+    fn sticky_header_line(&self, style: &EditorStyle, line_h: f32) -> Option<usize> {
+        if !style.show_sticky_scroll {
+            return None;
+        }
+        let row_count = self.line_map.row_count();
+        let first_row = self.first_visible_row(line_h);
+        if first_row == 0 || row_count == 0 {
+            return None;
+        }
+        let first_line = self.line_map.line_of_row(first_row.min(row_count - 1));
+        self.symbols
+            .iter()
+            .rfind(|symbol| symbol.start_line < first_line && symbol.end_line > first_line)
+            .map(|symbol| symbol.start_line)
+    }
+
+    /// Height the sticky header steals from the text viewport.
+    fn sticky_height(&self, style: &EditorStyle, line_h: f32) -> f32 {
+        if self.sticky_header_line(style, line_h).is_some() {
+            line_h
+        } else {
+            0.0
+        }
+    }
+
+    fn max_scroll(total_h: f32, view_h: f32, style: &EditorStyle, line_h: f32) -> f32 {
+        (total_h + PAD_TOP * 2.0 - view_h).max(0.0)
+            + if style.scroll_past_end {
+                line_h * 2.0
+            } else {
+                0.0
+            }
     }
 
     pub fn ui(&mut self, ui: &mut Ui, style: &EditorStyle) -> Option<EditorEvent> {
-        self.tab_size = style.tab_size;
+        self.tab_size = style.tab_size.max(1);
         self.insert_spaces = style.insert_spaces;
         self.autocomplete_enabled = style.autocomplete;
         let mut event = None;
@@ -57,8 +119,6 @@ impl Editor {
 
         let line_h = style.line_h.max(1.0);
         let line_count = self.doc.line_count().max(1);
-        let total_h = line_count as f32 * line_h;
-
         let digit_w = self.char_width(ui, style);
         let digits = line_count.to_string().len().max(3) as f32;
         let gutter_w = if style.show_line_numbers {
@@ -70,23 +130,25 @@ impl Editor {
         let text_left = rect.left() + gutter_w;
         let text_right = rect.right() - minimap_w - SCROLLBAR_W;
         let text_width = (text_right - text_left).max(80.0);
-        let view_h = rect.height();
-        let rows = ((view_h / line_h).ceil() as usize + 1).max(2);
 
         self.refresh_syntax(Instant::now());
+        self.sync_layout();
         self.sync_cache(ui, style, text_width);
+        self.snap_caret_out_of_folds();
 
         if style.word_wrap {
             self.scroll_x = 0.0;
         }
 
         // ---- scrolling ----
-        let max_scroll = (total_h + PAD_TOP * 2.0 - view_h).max(0.0)
-            + if style.scroll_past_end {
-                line_h * 2.0
-            } else {
-                0.0
-            };
+        // The sticky header takes a line off the top of the text viewport; it only
+        // appears once the content above the first row has an enclosing scope.
+        self.sticky_h = self.sticky_height(style, line_h);
+        let mut view_h = (rect.height() - self.sticky_h).max(line_h);
+        let mut max_scroll =
+            Self::max_scroll(self.total_content_height(line_h), view_h, style, line_h);
+        let rows = ((view_h / line_h).ceil() as usize + 1).max(2);
+
         let (scroll_delta, modifiers) = ui.input(|i| (i.smooth_scroll_delta, i.modifiers));
         if response.hovered() {
             let zoom_step = crate::ui::ctrl_wheel_steps(ui.ctx());
@@ -105,65 +167,80 @@ impl Editor {
         }
         self.scroll_y = self.scroll_y.clamp(0.0, max_scroll);
 
+        self.sticky_h = self.sticky_height(style, line_h);
+        view_h = (rect.height() - self.sticky_h).max(line_h);
+        max_scroll = Self::max_scroll(self.total_content_height(line_h), view_h, style, line_h);
+        self.scroll_y = self.scroll_y.clamp(0.0, max_scroll);
+        let view_top = rect.top() + self.sticky_h;
+        let row_count = self.line_map.row_count().max(1);
+
         // ---- pointer: fold gutter click, focus, click, selection drag, double/triple click ----
         let pointer_pressed = ui.input(|i| i.pointer.primary_pressed());
         let shift_held = ui.input(|i| i.modifiers.shift);
         let alt_held = ui.input(|i| i.modifiers.alt);
         let ctrl_held = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
 
-        if pointer_pressed && response.contains_pointer()
-            && let Some(pos) = response.interact_pointer_pos() {
-                // Check if user clicked the fold chevron column in the gutter.
-                let clicked_line = (((pos.y - rect.top() + self.scroll_y - PAD_TOP) / line_h)
-                    .floor() as isize)
-                    .clamp(0, line_count as isize - 1) as usize;
-                if pos.x >= text_left - 18.0
-                    && pos.x <= text_left
-                    && self.fold_range_for_line(clicked_line).is_some()
-                {
-                    self.toggle_fold_at(clicked_line);
-                } else if pos.x >= text_left {
-                    let ch = self.pos_to_char(ui, style, rect, pos, text_left);
-                    if alt_held && !shift_held && !ctrl_held {
-                        self.toggle_cursor_at(ch);
-                    } else if ctrl_held && !shift_held {
-                        self.caret = ch;
-                        self.anchor = ch;
-                        let ident = self.identifier_at(ch);
-                        if !ident.is_empty() {
-                            event = Some(EditorEvent::GotoDefinition(ident));
-                        }
-                    } else {
-                        if !shift_held {
-                            self.extra_cursors.clear();
-                            self.anchor = ch;
-                        }
-                        self.caret = ch;
-                        self.dragging_selection = true;
+        if pointer_pressed
+            && response.contains_pointer()
+            && let Some(pos) = response.interact_pointer_pos()
+        {
+            let in_text = pos.y >= view_top;
+            let row = self.row_at_y(pos.y, view_top, line_h, row_count);
+            let clicked_line = self.line_of_row(row);
+            // Check if user clicked the fold chevron column in the gutter.
+            if in_text
+                && pos.x >= text_left - 18.0
+                && pos.x <= text_left
+                && self.fold_range_for_line(clicked_line).is_some()
+            {
+                self.toggle_fold_at(clicked_line);
+            } else if in_text && pos.x >= text_left {
+                let ch = self.pos_to_char(ui, style, rect, pos, text_left, text_width);
+                if alt_held && !shift_held && !ctrl_held {
+                    self.toggle_cursor_at(ch);
+                } else if ctrl_held && !shift_held {
+                    self.caret = ch;
+                    self.anchor = ch;
+                    let ident = self.identifier_at(ch);
+                    if !ident.is_empty() {
+                        event = Some(EditorEvent::GotoDefinition(ident));
                     }
-                    self.desired_col = None;
-                    self.blink_base = ui.input(|i| i.time);
-                    self.completion.open = false;
+                } else {
+                    if !shift_held {
+                        self.extra_cursors.clear();
+                        self.anchor = ch;
+                    }
+                    self.caret = ch;
+                    self.dragging_selection = true;
                 }
+                self.desired_col = None;
+                self.blink_base = ui.input(|i| i.time);
+                self.completion.open = false;
             }
-        if self.dragging_selection && response.is_pointer_button_down_on()
-            && let Some(pos) = response.interact_pointer_pos() {
-                self.caret = self.pos_to_char(ui, style, rect, pos, text_left);
-                self.ensure_visible = true;
-            }
+        }
+        if self.dragging_selection
+            && response.is_pointer_button_down_on()
+            && let Some(pos) = response.interact_pointer_pos()
+            && pos.y >= view_top
+        {
+            self.caret = self.pos_to_char(ui, style, rect, pos, text_left, text_width);
+            self.ensure_visible = true;
+        }
         if !ui.input(|i| i.pointer.primary_down()) {
             self.dragging_selection = false;
         }
         if response.double_clicked()
-            && let Some(pos) = response.interact_pointer_pos() {
-                let ch = self.pos_to_char(ui, style, rect, pos, text_left);
-                self.select_word_at(ch);
-            }
+            && let Some(pos) = response.interact_pointer_pos()
+        {
+            let ch = self.pos_to_char(ui, style, rect, pos, text_left, text_width);
+            self.select_word_at(ch);
+        }
         if response.triple_clicked()
-            && let Some(pos) = response.interact_pointer_pos() {
-                let ch = self.pos_to_char(ui, style, rect, pos, text_left);
-                self.select_line_at(ch);
-            }
+            && let Some(pos) = response.interact_pointer_pos()
+        {
+            let ch = self.pos_to_char(ui, style, rect, pos, text_left, text_width);
+            self.select_line_at(ch);
+        }
 
         // ---- keyboard ----
         if focused {
@@ -176,9 +253,23 @@ impl Editor {
             self.handle_input(ui, style, rows);
         }
 
+        // Folding or an edit changed the row count; settle the viewport metrics.
+        self.sticky_h = self.sticky_height(style, line_h);
+        view_h = (rect.height() - self.sticky_h).max(line_h);
+        let total_h = self.total_content_height(line_h);
+        max_scroll = Self::max_scroll(total_h, view_h, style, line_h);
+        self.scroll_y = self.scroll_y.clamp(0.0, max_scroll);
+        let view_top = rect.top() + self.sticky_h;
+
+        // Any edit makes the find matches stale; recompute once per frame.
+        if self.find.open && self.find.last_version != self.doc.version {
+            self.recompute_find();
+        }
+
         // ---- caret visibility ----
         let caret_line = self.doc.char_to_line(self.caret);
-        let care_y = caret_line as f32 * line_h - self.scroll_y + PAD_TOP;
+        let caret_row = self.row_of_line(caret_line).unwrap_or(0);
+        let care_y = caret_row as f32 * line_h - self.scroll_y + PAD_TOP;
         if self.ensure_visible {
             if care_y < 0.0 {
                 self.scroll_y += care_y - 2.0;
@@ -212,11 +303,12 @@ impl Editor {
             let sb = ui.interact(scrollbar_rect, sb_id, Sense::click_and_drag());
             let thumb_h = ((view_h / total_h) * view_h).clamp(30.0, view_h);
             if (sb.dragged() || sb.clicked())
-                && let Some(pos) = sb.interact_pointer_pos() {
-                    let travel = (view_h - thumb_h).max(1.0);
-                    let t = ((pos.y - rect.top() - thumb_h * 0.5) / travel).clamp(0.0, 1.0);
-                    self.scroll_y = t * max_scroll;
-                }
+                && let Some(pos) = sb.interact_pointer_pos()
+            {
+                let travel = (view_h - thumb_h).max(1.0);
+                let t = ((pos.y - rect.top() - thumb_h * 0.5) / travel).clamp(0.0, 1.0);
+                self.scroll_y = t * max_scroll;
+            }
             let thumb_y = rect.top() + (self.scroll_y / max_scroll.max(1.0)) * (view_h - thumb_h);
             let thumb = Rect::from_min_size(
                 Pos2::new(scrollbar_rect.right() - 8.0, thumb_y),
@@ -241,8 +333,9 @@ impl Editor {
             && let Some(pos) = ui.input(|i| i.pointer.hover_pos())
             && pos.x >= text_left
             && pos.x <= text_right
+            && pos.y >= view_top
         {
-            let ch = self.pos_to_char(ui, style, rect, pos, text_left);
+            let ch = self.pos_to_char(ui, style, rect, pos, text_left, text_width);
             let line = self.doc.char_to_line(ch);
             let word = self.identifier_at(ch);
             if let Some(doc_tip) =
@@ -288,20 +381,57 @@ impl Editor {
         style.show_whitespace.hash(&mut h);
         style.word_wrap.hash(&mut h);
         style.theme.kind.as_u8().hash(&mut h);
+        std::mem::discriminant(&style.mono_family).hash(&mut h);
         h.finish()
     }
 
-    fn sync_cache(&mut self, _ui: &Ui, style: &EditorStyle, text_width: f32) {
-        // Clear per-frame galley map so egui's internal GalleyCache (which tracks
-        // font-atlas texture resizes) is always authoritative across frames.
-        self.galleys.clear();
+    /// Hash where a few fixed glyphs landed in the font atlas. A repacked or rebuilt
+    /// atlas makes every cached galley point at stale texels, and this probe is the
+    /// cheapest reliable signal for it.
+    fn atlas_probe(ui: &Ui, style: &EditorStyle) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let font = style.mono();
+        ui.ctx().fonts_mut(|fonts| {
+            let galley = fonts.layout_no_wrap("Mg0_".to_owned(), font, Color32::WHITE);
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            for row in &galley.rows {
+                for glyph in &row.glyphs {
+                    glyph.uv_rect.min.hash(&mut hasher);
+                    glyph.uv_rect.max.hash(&mut hasher);
+                }
+            }
+            hasher.finish()
+        })
+    }
+
+    /// Drop cached galleys only when the document, the style, the wrap width or the
+    /// font atlas changed; idle scrolling and caret blinking reuse them.
+    fn sync_cache(&mut self, ui: &Ui, style: &EditorStyle, text_width: f32) {
+        let atlas_key = Self::atlas_probe(ui, style);
+        let atlas_fill = ui.ctx().fonts(|fonts| fonts.font_atlas_fill_ratio());
+        let wrap_width = if style.word_wrap {
+            text_width.to_bits()
+        } else {
+            0
+        };
         let key = (
             self.doc.version,
+            self.spans_version,
             Self::style_hash(style),
-            text_width,
+            wrap_width,
             self.doc.line_count(),
+            atlas_key,
         );
-        self.cache_key = key;
+        // A shrinking fill ratio also catches an atlas clear where the probe layout
+        // happened to land on identical texels.
+        let atlas_rebuilt = (self.atlas_key != 0 && atlas_key != self.atlas_key)
+            || atlas_fill + 0.02 < self.atlas_fill;
+        if key != self.cache_key || atlas_rebuilt {
+            self.galleys.clear();
+            self.cache_key = key;
+        }
+        self.atlas_key = atlas_key;
+        self.atlas_fill = atlas_fill;
     }
 
     /// Lay out one line (with tabs expanded) and cache the galley.
@@ -449,14 +579,18 @@ impl Editor {
         rect: Rect,
         pos: Pos2,
         text_left: f32,
+        text_width: f32,
     ) -> usize {
         let line_h = style.line_h.max(1.0);
-        let line_count = self.doc.line_count().max(1);
-        let line = (((pos.y - rect.top() + self.scroll_y - PAD_TOP) / line_h).floor() as isize)
-            .clamp(0, line_count as isize - 1) as usize;
+        let row_count = self.line_map.row_count().max(1);
+        let view_top = rect.top() + self.sticky_h.max(0.0);
+        let row = self.row_at_y(pos.y, view_top, line_h, row_count);
+        let line = self.line_map.line_of_row(row);
         let x = pos.x - text_left + self.scroll_x;
-        let galley = self.line_galley(ui, style, line, 0.0);
-        let cached = self.galleys.get(&line).unwrap();
+        let galley = self.line_galley(ui, style, line, text_width);
+        let Some(cached) = self.galleys.get(&line) else {
+            return self.doc.line_to_char(line);
+        };
         let vis_col = if x <= 0.0 {
             0
         } else {
@@ -485,21 +619,32 @@ impl Editor {
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, theme.bg);
 
-        let first = (self.scroll_y / line_h).floor().max(0.0) as usize;
-        let visible = ((rect.height() / line_h).ceil() as usize + 2).min(self.doc.line_count());
-        let last = (first + visible).min(self.doc.line_count());
-        let origin = Pos2::new(text_left, rect.top() + PAD_TOP - self.scroll_y);
+        let sticky_h = self.sticky_h.max(0.0);
+        let view_top = rect.top() + sticky_h;
+        let view_h = (rect.height() - sticky_h).max(line_h);
+        let row_count = self.line_map.row_count().max(1);
+        let first_row = self.first_visible_row(line_h).min(row_count - 1);
+        let visible_rows = (view_h / line_h).ceil() as usize + 2;
+        let last_row = (first_row + visible_rows).min(row_count);
+        let first_line = self.line_map.line_of_row(first_row);
+        let last_line = self.line_map.line_of_row(last_row.saturating_sub(1));
+        let origin_y = view_top + PAD_TOP - self.scroll_y;
+        let origin = Pos2::new(text_left, origin_y);
         let clip = Rect::from_min_max(
-            Pos2::new(text_left, rect.top()),
+            Pos2::new(text_left, view_top),
             Pos2::new(text_right, rect.bottom()),
         );
         let tp = painter.with_clip_rect(clip);
+        let row_y = |row: usize| origin_y + row as f32 * line_h;
 
         // Current line highlight
         let caret_line = self.doc.char_to_line(self.caret);
         let caret_col = self.doc.char_to_line_col(self.caret).1;
-        if caret_line >= first && caret_line < last && !self.is_line_hidden(caret_line) {
-            let y = origin.y + caret_line as f32 * line_h;
+        if let Some(caret_row) = self.line_map.row_of(caret_line)
+            && caret_row >= first_row
+            && caret_row < last_row
+        {
+            let y = row_y(caret_row);
             painter.rect_filled(
                 Rect::from_min_max(Pos2::new(text_left, y), Pos2::new(text_right, y + line_h)),
                 0.0,
@@ -507,31 +652,31 @@ impl Editor {
             );
             if style.show_line_numbers {
                 painter.rect_filled(
-                    Rect::from_min_max(Pos2::new(rect.left(), y), Pos2::new(text_left, y + line_h)),
+                    Rect::from_min_max(
+                        Pos2::new(rect.left(), y),
+                        Pos2::new(text_left, y + line_h),
+                    ),
                     0.0,
                     theme.current_line,
                 );
             }
         }
 
-        // Ensure galleys exist for visible lines.
-        for line in first..last {
-            if !self.is_line_hidden(line) {
-                let _ = self.line_galley(ui, style, line, text_width);
-            }
+        // Ensure galleys exist for visible rows.
+        for row in first_row..last_row {
+            let line = self.line_map.line_of_row(row);
+            let _ = self.line_galley(ui, style, line, text_width);
         }
 
         // Indent guides
         if style.show_indent_guides {
             let guide_color = theme.indent_guide;
             let active = theme.indent_guide_active;
-            for line in first..last {
-                if self.is_line_hidden(line) {
+            let tab = style.tab_size.max(1);
+            for row in first_row..last_row {
+                let line = self.line_map.line_of_row(row);
+                let Some(cached) = self.galleys.get(&line) else {
                     continue;
-                }
-                let cached = match self.galleys.get(&line) {
-                    Some(c) => c,
-                    None => continue,
                 };
                 let content = self.doc.line_content(line);
                 let mut cols = 0usize;
@@ -539,13 +684,13 @@ impl Editor {
                     if ch == ' ' {
                         cols += 1;
                     } else if ch == '\t' {
-                        cols = (cols / style.tab_size.max(1) + 1) * style.tab_size.max(1);
+                        cols = (cols / tab + 1) * tab;
                     } else {
                         break;
                     }
                 }
-                let y = origin.y + line as f32 * line_h;
-                let mut col = style.tab_size.max(1);
+                let y = row_y(row);
+                let mut col = tab;
                 while col <= cols {
                     let x = origin.x + self.x_of_col_in(cached, col);
                     let color = if line == caret_line && col <= caret_col {
@@ -557,26 +702,36 @@ impl Editor {
                         [Pos2::new(x, y), Pos2::new(x, y + line_h)],
                         Stroke::new(1.0, color),
                     );
-                    col += style.tab_size.max(1);
+                    col += tab;
                 }
             }
         }
 
-        // Find matches
+        // Find matches (only those intersecting the viewport)
         if self.find.open && !self.find.matches.is_empty() {
-            for (idx, (start, end)) in self.find.matches.iter().enumerate() {
-                let sl = self.doc.char_to_line(*start);
-                let el = self.doc.char_to_line(*end);
-                if el < first || sl >= last {
-                    continue;
+            let visible_start = self.doc.line_to_char(first_line);
+            let visible_end =
+                self.doc.line_to_char(last_line) + self.doc.line_char_len(last_line);
+            let first_match = self
+                .find
+                .matches
+                .partition_point(|(start, _)| *start < visible_start);
+            for (idx, &(start, end)) in self.find.matches.iter().enumerate().skip(first_match) {
+                if start > visible_end {
+                    break;
                 }
                 let color = if self.find.active == Some(idx) {
                     theme.find_active
                 } else {
                     theme.find_match
                 };
-                for line in sl.max(first)..=el.min(last.saturating_sub(1)) {
-                    if self.is_line_hidden(line) {
+                let start_line = self.doc.char_to_line(start);
+                let end_line = self.doc.char_to_line(end);
+                for line in start_line..=end_line {
+                    let Some(row) = self.line_map.row_of(line) else {
+                        continue;
+                    };
+                    if row < first_row || row >= last_row {
                         continue;
                     }
                     let Some(cached) = self.galleys.get(&line) else {
@@ -585,7 +740,7 @@ impl Editor {
                     let line_start = self.doc.line_to_char(line);
                     let line_len = self.doc.line_char_len(line);
                     let a = start.saturating_sub(line_start).min(line_len);
-                    let b = if *end > line_start + line_len {
+                    let b = if end > line_start + line_len {
                         line_len
                     } else {
                         end.saturating_sub(line_start)
@@ -596,7 +751,7 @@ impl Editor {
                     } else {
                         origin.x + self.x_of_col_in(cached, b) - self.scroll_x
                     };
-                    let y = origin.y + line as f32 * line_h;
+                    let y = row_y(row);
                     painter.rect_filled(
                         Rect::from_min_max(Pos2::new(x1 - 1.0, y), Pos2::new(x2 + 1.0, y + line_h)),
                         2.0,
@@ -606,7 +761,7 @@ impl Editor {
             }
         }
 
-        // Selections (Primary + Extra Multi-Cursors)
+        // Selections (Primary + Extra Multi-Cursors), one pass over visible rows.
         let sel_color = if self.has_focus {
             theme.selection
         } else {
@@ -621,59 +776,57 @@ impl Editor {
                 all_selections.push((c.min(a), c.max(a)));
             }
         }
-        for (sel_start, sel_end) in all_selections {
-            let sl = self.doc.char_to_line(sel_start);
-            let el = self.doc.char_to_line(sel_end);
-            for line in sl.max(first)..=el.min(last.saturating_sub(1)) {
-                if self.is_line_hidden(line) {
-                    continue;
-                }
+        if !all_selections.is_empty() {
+            for row in first_row..last_row {
+                let line = self.line_map.line_of_row(row);
+                let line_start = self.doc.line_to_char(line);
+                let line_len = self.doc.line_char_len(line);
                 let Some(cached) = self.galleys.get(&line) else {
                     continue;
                 };
-                let line_start = self.doc.line_to_char(line);
-                let line_len = self.doc.line_char_len(line);
-                let a = sel_start.saturating_sub(line_start).min(line_len);
-                let b = if sel_end > line_start + line_len {
-                    line_len + 1
-                } else {
-                    sel_end.saturating_sub(line_start)
-                };
-                let x1 = origin.x + self.x_of_col_in(cached, a) - self.scroll_x;
-                let x2 = if b > line_len {
-                    text_right - 4.0
-                } else {
-                    origin.x + self.x_of_col_in(cached, b) - self.scroll_x
-                };
-                let y = origin.y + line as f32 * line_h;
-                if x2 > x1 || b > line_len {
-                    painter.rect_filled(
-                        Rect::from_min_max(
-                            Pos2::new(x1, y),
-                            Pos2::new(x2.max(x1 + 2.0), y + line_h),
-                        ),
-                        2.0,
-                        sel_color,
-                    );
+                for &(sel_start, sel_end) in &all_selections {
+                    if sel_end < line_start || sel_start > line_start + line_len {
+                        continue;
+                    }
+                    let a = sel_start.saturating_sub(line_start).min(line_len);
+                    let b = if sel_end > line_start + line_len {
+                        line_len + 1
+                    } else {
+                        sel_end.saturating_sub(line_start)
+                    };
+                    let x1 = origin.x + self.x_of_col_in(cached, a) - self.scroll_x;
+                    let x2 = if b > line_len {
+                        text_right - 4.0
+                    } else {
+                        origin.x + self.x_of_col_in(cached, b) - self.scroll_x
+                    };
+                    let y = row_y(row);
+                    if x2 > x1 || b > line_len {
+                        painter.rect_filled(
+                            Rect::from_min_max(
+                                Pos2::new(x1, y),
+                                Pos2::new(x2.max(x1 + 2.0), y + line_h),
+                            ),
+                            2.0,
+                            sel_color,
+                        );
+                    }
                 }
             }
         }
 
-        // Text + Folded Ellipsis Badges + Inline Diagnostics
+        // Text + Folded Ellipsis Badges
         let default_color = theme.syn_text;
-        for line in first..last {
-            if self.is_line_hidden(line) {
+        for row in first_row..last_row {
+            let line = self.line_map.line_of_row(row);
+            let Some(cached) = self.galleys.get(&line) else {
                 continue;
-            }
-            let cached = match self.galleys.get(&line) {
-                Some(c) => c,
-                None => continue,
             };
-            let y = origin.y + line as f32 * line_h;
+            let y = row_y(row);
             let pos = Pos2::new(origin.x - self.scroll_x, y);
             tp.galley(pos, cached.galley.clone(), default_color);
 
-            // Folded badge `⋯` if this line starts a folded block
+            // Folded badge if this line starts a folded block
             if self.folded_lines.contains(&line) {
                 let badge_x = origin.x + cached.text_width - self.scroll_x + 8.0;
                 let badge_rect = Rect::from_min_size(
@@ -699,14 +852,20 @@ impl Editor {
 
         // Diagnostic wavy underlines
         for diag in &self.diagnostics {
-            if diag.line < first || diag.line >= last || self.is_line_hidden(diag.line) {
+            if diag.line < first_line || diag.line > last_line {
+                continue;
+            }
+            let Some(row) = self.line_map.row_of(diag.line) else {
+                continue;
+            };
+            if row < first_row || row >= last_row {
                 continue;
             }
             if let Some(cached) = self.galleys.get(&diag.line) {
                 let x1 = origin.x + self.x_of_col_in(cached, diag.col) - self.scroll_x;
                 let x2 = (origin.x + self.x_of_col_in(cached, diag.end_col) - self.scroll_x)
                     .max(x1 + self.char_w * 2.0);
-                let y = origin.y + (diag.line as f32 + 1.0) * line_h - 2.0;
+                let y = row_y(row) + line_h - 2.0;
                 let color = match diag.severity {
                     DiagSeverity::Error => theme.error,
                     DiagSeverity::Warning => theme.warning,
@@ -719,16 +878,13 @@ impl Editor {
         // Whitespace markers
         if style.show_whitespace {
             let dot = theme.text_faint.gamma_multiply(0.6);
-            for line in first..last {
-                if self.is_line_hidden(line) {
+            for row in first_row..last_row {
+                let line = self.line_map.line_of_row(row);
+                let Some(cached) = self.galleys.get(&line) else {
                     continue;
-                }
-                let cached = match self.galleys.get(&line) {
-                    Some(c) => c,
-                    None => continue,
                 };
                 let content = self.doc.line_content(line);
-                let y = origin.y + line as f32 * line_h + line_h * 0.5;
+                let y = row_y(row) + line_h * 0.5;
                 let mut col = 0usize;
                 for ch in content.chars() {
                     if ch == ' ' {
@@ -771,11 +927,9 @@ impl Editor {
                 .input(|i| i.pointer.hover_pos())
                 .is_some_and(|p| p.x >= rect.left() && p.x <= text_left + 20.0);
 
-            for line in first..last {
-                if self.is_line_hidden(line) {
-                    continue;
-                }
-                let y = origin.y + line as f32 * line_h;
+            for row in first_row..last_row {
+                let line = self.line_map.line_of_row(row);
+                let y = row_y(row);
                 let color = if line == caret_line {
                     theme.text
                 } else {
@@ -862,13 +1016,16 @@ impl Editor {
         {
             for ch_pos in [open, close] {
                 let line = self.doc.char_to_line(ch_pos);
-                if line < first || line >= last || self.is_line_hidden(line) {
+                let Some(row) = self.line_map.row_of(line) else {
+                    continue;
+                };
+                if row < first_row || row >= last_row {
                     continue;
                 }
                 let col = self.doc.char_to_line_col(ch_pos).1;
                 if let Some(cached) = self.galleys.get(&line) {
                     let x = origin.x + self.x_of_col_in(cached, col) - self.scroll_x;
-                    let y = origin.y + line as f32 * line_h;
+                    let y = row_y(row);
                     painter.rect_stroke(
                         Rect::from_min_max(
                             Pos2::new(x - 1.0, y + 1.0),
@@ -894,13 +1051,16 @@ impl Editor {
                 }
                 for c_pos in carets {
                     let c_line = self.doc.char_to_line(c_pos);
-                    if c_line < first || c_line >= last || self.is_line_hidden(c_line) {
+                    let Some(c_row) = self.line_map.row_of(c_line) else {
+                        continue;
+                    };
+                    if c_row < first_row || c_row >= last_row {
                         continue;
                     }
                     let c_col = self.doc.char_to_line_col(c_pos).1;
                     if let Some(cached) = self.galleys.get(&c_line) {
                         let x = origin.x + self.x_of_col_in(cached, c_col) - self.scroll_x;
-                        let y = origin.y + c_line as f32 * line_h;
+                        let y = row_y(c_row);
                         painter.rect_filled(
                             Rect::from_min_size(
                                 Pos2::new(x, y + 1.0),
@@ -919,23 +1079,21 @@ impl Editor {
         // composing. Without the output below, egui-winit disables the IME for
         // the whole window and typing falls back to plain ASCII.
         let (caret_line, caret_col) = self.doc.char_to_line_col(self.caret);
-        let caret_visible = caret_line >= first
-            && caret_line < last
-            && !self.is_line_hidden(caret_line);
-        let caret_pos = if caret_visible {
-            self.galleys.get(&caret_line).map(|cached| {
-                Pos2::new(
-                    origin.x + self.x_of_col_in(cached, caret_col) - self.scroll_x,
-                    origin.y + caret_line as f32 * line_h,
-                )
-            })
-        } else {
-            None
-        };
+        let caret_row = self
+            .line_map
+            .row_of(caret_line)
+            .filter(|row| *row >= first_row && *row < last_row);
+        let caret_pos = caret_row.map(|row| {
+            let x = match self.galleys.get(&caret_line) {
+                Some(cached) => self.x_of_col_in(cached, caret_col),
+                None => 0.0,
+            };
+            Pos2::new(origin.x + x - self.scroll_x, row_y(row))
+        });
         if self.has_focus && !self.doc.readonly {
             // Keep IME enabled for the whole editor even while the caret is
             // scrolled out of view: toggling IMEAllowed resets the OS IME mode.
-            let caret = caret_pos.unwrap_or(Pos2::new(text_left, rect.top() + line_h));
+            let caret = caret_pos.unwrap_or(Pos2::new(text_left, view_top + line_h));
             let to_global = ui
                 .ctx()
                 .layer_transform_to_global(ui.layer_id())
@@ -967,7 +1125,7 @@ impl Editor {
                 let galley = ui.ctx().fonts_mut(|fonts| fonts.layout_job(job));
                 painter
                     .with_clip_rect(Rect::from_min_max(
-                        Pos2::new(text_left, rect.top()),
+                        Pos2::new(text_left, view_top),
                         Pos2::new(text_right, rect.bottom()),
                     ))
                     .galley(caret, galley, theme.text);
@@ -975,47 +1133,48 @@ impl Editor {
         }
 
         // Sticky Scroll header (top of editor canvas)
-        if style.show_sticky_scroll && first > 0
-            && let Some(enclosing) = self
-                .symbols
-                .iter().rfind(|s| s.start_line < first && s.end_line > first)
-                .cloned()
-            {
-                let sticky_rect = Rect::from_min_size(
-                    Pos2::new(rect.left(), rect.top()),
-                    Vec2::new(text_right - rect.left(), line_h + 2.0),
-                );
-                painter.rect_filled(sticky_rect, 0.0, theme.panel_bg);
-                painter.line_segment(
-                    [
-                        Pos2::new(sticky_rect.left(), sticky_rect.bottom()),
-                        Pos2::new(sticky_rect.right(), sticky_rect.bottom()),
-                    ],
-                    Stroke::new(1.0, theme.border_strong),
-                );
-                let header_line = self.doc.line_content(enclosing.start_line);
-                if style.show_line_numbers {
-                    painter.text(
-                        Pos2::new(text_left - 18.0, sticky_rect.center().y),
-                        Align2::RIGHT_CENTER,
-                        (enclosing.start_line + 1).to_string(),
-                        FontId::new(style.font_size - 1.0, style.mono_family.clone()),
-                        theme.text_faint,
-                    );
-                }
-                painter.with_clip_rect(sticky_rect).text(
-                    Pos2::new(text_left, sticky_rect.center().y),
-                    Align2::LEFT_CENTER,
-                    header_line.trim_end(),
-                    style.mono(),
-                    theme.text_dim,
+        if let Some(header_line) = self.sticky_header_line(style, line_h) {
+            let sticky_rect = Rect::from_min_size(
+                Pos2::new(rect.left(), rect.top()),
+                Vec2::new(text_right - rect.left(), sticky_h),
+            );
+            painter.rect_filled(sticky_rect, 0.0, theme.panel_bg);
+            painter.line_segment(
+                [
+                    Pos2::new(sticky_rect.left(), sticky_rect.bottom()),
+                    Pos2::new(sticky_rect.right(), sticky_rect.bottom()),
+                ],
+                Stroke::new(1.0, theme.border_strong),
+            );
+            let header_line_text = self.doc.line_content(header_line);
+            if style.show_line_numbers {
+                painter.text(
+                    Pos2::new(text_left - 18.0, sticky_rect.center().y),
+                    Align2::RIGHT_CENTER,
+                    (header_line + 1).to_string(),
+                    FontId::new(style.font_size - 1.0, style.mono_family.clone()),
+                    theme.text_faint,
                 );
             }
+            painter.with_clip_rect(sticky_rect).text(
+                Pos2::new(text_left, sticky_rect.center().y),
+                Align2::LEFT_CENTER,
+                header_line_text.trim_end(),
+                style.mono(),
+                theme.text_dim,
+            );
+        }
 
         // Minimap
         if style.show_minimap {
             self.paint_minimap(ui, style, rect, text_right, line_h);
         }
+
+        // Keep the galley cache bounded to the neighbourhood of the viewport.
+        let keep_from = first_line.saturating_sub(64);
+        let keep_to = last_line + 64;
+        self.galleys
+            .retain(|line, _| *line >= keep_from && *line <= keep_to);
     }
 
     fn paint_minimap(
@@ -1034,19 +1193,64 @@ impl Editor {
         );
         painter.rect_filled(mm, 0.0, theme.bg);
         painter.line_segment(
-            [Pos2::new(mm.left(), mm.top()), Pos2::new(mm.left(), mm.bottom())],
+            [
+                Pos2::new(mm.left(), mm.top()),
+                Pos2::new(mm.left(), mm.bottom()),
+            ],
             Stroke::new(1.0, theme.border),
         );
 
-        let line_count = self.doc.line_count().max(1);
-        let rows = ((mm.height() / 2.2) as usize).clamp(1, 380).min(line_count);
-        let step = (line_count as f32 / rows as f32).max(1.0);
+        let row_count = self.line_map.row_count().max(1);
+        let rows = ((mm.height() / 2.2) as usize).clamp(1, 380).min(row_count);
+        let step = (row_count as f32 / rows as f32).max(1.0);
         let row_h = (mm.height() / rows as f32).clamp(1.6, 3.2);
         let content_h = (rows as f32 * row_h).min(mm.height()).max(1.0);
-        let tab = style.tab_size.max(1);
+
+        // Rescan the rope only when the document or the minimap geometry changed.
+        let key = (
+            self.doc.version,
+            self.spans_version,
+            theme.kind.as_u8(),
+            rows,
+            mm.height().to_bits(),
+            self.fold_rev,
+        );
+        if self.minimap_cache.key != key || self.minimap_cache.rows.len() != rows {
+            let tab = style.tab_size.max(1);
+            let mut cached_rows = Vec::with_capacity(rows);
+            for i in 0..rows {
+                let src_row = (((i as f32) * step) as usize).min(row_count - 1);
+                let line = self.line_map.line_of_row(src_row);
+                let content = self.doc.line_content(line);
+                let mut indent = 0usize;
+                for ch in content.chars() {
+                    match ch {
+                        ' ' => indent += 1,
+                        '\t' => indent = (indent / tab + 1) * tab,
+                        _ => break,
+                    }
+                }
+                let len = content.trim_end().chars().count();
+                let diff = self.line_diffs.get(line).and_then(|kind| match kind {
+                    LineDiffKind::Added => Some(theme.git_added),
+                    LineDiffKind::Modified => Some(theme.accent),
+                    LineDiffKind::DeletedBelow => Some(theme.git_deleted),
+                    LineDiffKind::Unchanged => None,
+                });
+                cached_rows.push(MinimapRow {
+                    indent: indent.min(u16::MAX as usize) as u16,
+                    len: len.min(u16::MAX as usize) as u16,
+                    color: self.minimap_line_color(line, &style.theme),
+                    diff,
+                });
+            }
+            self.minimap_cache.rows = cached_rows;
+            self.minimap_cache.key = key;
+        }
 
         let caret_line = self.doc.char_to_line(self.caret);
-        let caret_y = mm.top() + (caret_line as f32 / line_count as f32) * content_h;
+        let caret_row = self.line_map.row_of(caret_line).unwrap_or(0);
+        let caret_y = mm.top() + (caret_row as f32 / row_count as f32) * content_h;
         painter.rect_filled(
             Rect::from_min_size(
                 Pos2::new(mm.left() + 1.0, caret_y),
@@ -1056,64 +1260,38 @@ impl Editor {
             theme.accent.gamma_multiply(0.22),
         );
 
-        for i in 0..rows {
-            let line = ((i as f32) * step) as usize;
-            if line >= line_count {
-                break;
-            }
+        for (i, cached_row) in self.minimap_cache.rows.iter().enumerate() {
+            let row = *cached_row;
             let y = mm.top() + i as f32 * row_h;
-
-            // Git diff marker on minimap left edge
-            if let Some(diff) = self.line_diffs.get(line) {
-                let diff_col = match diff {
-                    LineDiffKind::Added => Some(theme.git_added),
-                    LineDiffKind::Modified => Some(theme.accent),
-                    LineDiffKind::DeletedBelow => Some(theme.git_deleted),
-                    LineDiffKind::Unchanged => None,
-                };
-                if let Some(c) = diff_col {
-                    painter.rect_filled(
-                        Rect::from_min_size(Pos2::new(mm.left() + 1.0, y), Vec2::new(2.0, row_h)),
-                        0.0,
-                        c,
-                    );
-                }
+            if let Some(color) = row.diff {
+                painter.rect_filled(
+                    Rect::from_min_size(Pos2::new(mm.left() + 1.0, y), Vec2::new(2.0, row_h)),
+                    0.0,
+                    color,
+                );
             }
-
-            let content = self.doc.line_content(line);
-            let trimmed = content.trim_end();
-            if trimmed.is_empty() {
+            if row.len == 0 {
                 continue;
             }
-            let mut indent_cols = 0usize;
-            for ch in content.chars() {
-                match ch {
-                    ' ' => indent_cols += 1,
-                    '\t' => indent_cols = (indent_cols / tab + 1) * tab,
-                    _ => break,
-                }
-            }
-            let color = self.minimap_line_color(line, &style.theme);
-            let x = mm.left() + 5.0 + (indent_cols as f32 * 0.45).min(mm.width() * 0.42);
-            let width = ((trimmed.chars().count() as f32 * 0.45)
-                .min(mm.width() - (x - mm.left()) - 4.0))
-            .max(1.5);
+            let x = mm.left() + 5.0 + (row.indent as f32 * 0.45).min(mm.width() * 0.42);
+            let width = ((row.len as f32 * 0.45).min(mm.width() - (x - mm.left()) - 4.0)).max(1.5);
             painter.rect_filled(
                 Rect::from_min_size(
                     Pos2::new(x, y + row_h * 0.15),
                     Vec2::new(width, (row_h * 0.65).max(1.0)),
                 ),
                 0.5,
-                color,
+                row.color,
             );
         }
 
         // Find matches indicator on minimap
         if self.find.open {
             for &(start, _) in self.find.matches.iter().take(200) {
-                let m_line = self.doc.char_to_line(start);
-                let ratio = m_line as f32 / line_count as f32;
-                let my = mm.top() + ratio * content_h;
+                let Some(row) = self.line_map.row_of(self.doc.char_to_line(start)) else {
+                    continue;
+                };
+                let my = mm.top() + (row as f32 / row_count as f32) * content_h;
                 painter.rect_filled(
                     Rect::from_min_size(Pos2::new(mm.right() - 6.0, my), Vec2::new(5.0, 2.5)),
                     1.0,
@@ -1123,11 +1301,14 @@ impl Editor {
         }
 
         // Viewport slider indicator
-        let view_h = rect.height();
+        let view_h = (rect.height() - self.sticky_h.max(0.0)).max(line_h);
         let (slider_offset, vh) =
-            minimap_slider_span(content_h, line_count, line_h, view_h, self.scroll_y);
+            minimap_slider_span(content_h, row_count, line_h, view_h, self.scroll_y);
         let vy = mm.top() + slider_offset;
-        let vp_rect = Rect::from_min_size(Pos2::new(mm.left() + 1.0, vy), Vec2::new(mm.width() - 2.0, vh));
+        let vp_rect = Rect::from_min_size(
+            Pos2::new(mm.left() + 1.0, vy),
+            Vec2::new(mm.width() - 2.0, vh),
+        );
         painter.rect_filled(vp_rect, 2.0, Color32::from_white_alpha(15));
         painter.rect_stroke(
             vp_rect,
@@ -1141,13 +1322,8 @@ impl Editor {
         if (resp.clicked() || resp.dragged())
             && let Some(pos) = resp.interact_pointer_pos()
         {
-            let total = line_count as f32 * line_h;
-            let max_scroll = (total + PAD_TOP * 2.0 - view_h).max(0.0)
-                + if style.scroll_past_end {
-                    line_h * 2.0
-                } else {
-                    0.0
-                };
+            let total = row_count as f32 * line_h;
+            let max_scroll = Self::max_scroll(total, view_h, style, line_h);
             if max_scroll > 0.0 && content_h > vh {
                 let t = ((pos.y - mm.top() - vh * 0.5) / (content_h - vh)).clamp(0.0, 1.0);
                 self.scroll_y = t * max_scroll;
@@ -1253,7 +1429,12 @@ impl Editor {
             Some(cached) => text_left + self.x_of_col_in(cached, caret_col) - self.scroll_x,
             None => text_left,
         };
-        let y = editor_rect.top() + PAD_TOP + (caret_line as f32 + 1.0) * line_h - self.scroll_y;
+        let caret_row = self.line_map.row_of(caret_line).unwrap_or(0);
+        let y = editor_rect.top()
+            + self.sticky_h
+            + PAD_TOP
+            + (caret_row as f32 + 1.0) * line_h
+            - self.scroll_y;
         let popup_pos = Pos2::new(
             x.clamp(editor_rect.left() + 8.0, editor_rect.right() - 320.0),
             y.clamp(editor_rect.top() + 20.0, editor_rect.bottom() - 220.0),
@@ -1392,6 +1573,8 @@ impl Editor {
                             if enter {
                                 let back = ui.input(|i| i.modifiers.shift);
                                 self.find_next(!back);
+                                // Hand the keyboard back to the canvas so F3 keeps working.
+                                self.focus_requested = true;
                             }
 
                             if find_icon_button(
@@ -1535,20 +1718,20 @@ fn find_icon_button(
 
 fn minimap_slider_span(
     content_h: f32,
-    line_count: usize,
+    row_count: usize,
     line_h: f32,
     view_h: f32,
     scroll_y: f32,
 ) -> (f32, f32) {
     let content_h = content_h.max(1.0);
-    let line_count = line_count.max(1);
+    let row_count = row_count.max(1);
     let line_h = line_h.max(1.0);
-    let total_doc_h = (line_count as f32 * line_h).max(1.0);
+    let total_doc_h = (row_count as f32 * line_h).max(1.0);
     let visible_ratio = (view_h.max(1.0) / (total_doc_h + PAD_TOP * 2.0)).clamp(0.0, 1.0);
     let min_h = 12.0_f32.min(content_h);
     let vh = (visible_ratio * content_h).clamp(min_h, content_h);
     let first_line_f = ((scroll_y - PAD_TOP) / line_h).max(0.0);
-    let top_ratio = (first_line_f / line_count as f32).clamp(0.0, 1.0);
+    let top_ratio = (first_line_f / row_count as f32).clamp(0.0, 1.0);
     let vy = (top_ratio * content_h).clamp(0.0, (content_h - vh).max(0.0));
     (vy, vh)
 }
