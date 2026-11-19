@@ -608,6 +608,9 @@ pub struct KestrelApp {
     pub toasts: Vec<Toast>,
     pub drag_payload: Option<DragPayload>,
     pub editor_area_rect: Option<egui::Rect>,
+    /// Recently opened files, newest first; persisted in the session and shown
+    /// on the welcome page.
+    pub recent_files: Vec<PathBuf>,
 
     pub close_confirmed: bool,
     pub window_focused: bool,
@@ -703,6 +706,7 @@ impl KestrelApp {
             toasts: Vec::new(),
             drag_payload: None,
             editor_area_rect: None,
+            recent_files: Vec::new(),
             close_confirmed: false,
             window_focused: true,
             last_title: String::new(),
@@ -848,6 +852,12 @@ impl KestrelApp {
             self.sync_active();
         }
         self.restore_panel_state(&session);
+        self.recent_files = session
+            .recent_files
+            .iter()
+            .map(PathBuf::from)
+            .filter(|path| path.is_file())
+            .collect();
         if let Some(editor) = self.tabs.get_mut(self.active) {
             editor.focus_requested = true;
         }
@@ -1155,6 +1165,12 @@ impl KestrelApp {
             terminals,
             active_terminal: self.bottom.active_terminal,
             search_query: self.workspace.search_panel.query.clone(),
+            recent_files: self
+                .recent_files
+                .iter()
+                .take(12)
+                .map(|path| path.to_string_lossy().to_string())
+                .collect(),
         };
         session.save();
     }
@@ -1951,6 +1967,7 @@ impl KestrelApp {
             };
             self.spawn_viewer_load(final_id, path.clone(), kind);
             self.reveal_in_tree(&path);
+            self.record_recent_file(&path);
             return;
         }
 
@@ -2018,6 +2035,7 @@ impl KestrelApp {
                     self.attach_editor_to_active_group(id);
                 }
                 self.reveal_in_tree(&path);
+                self.record_recent_file(&path);
             }
             Err(err) => {
                 self.toast(
@@ -3683,6 +3701,8 @@ impl KestrelApp {
                 self.settings.show_indent_guides = !self.settings.show_indent_guides;
                 self.settings.save();
             }
+            Command::ToggleEol => self.toggle_active_eol(),
+            Command::ToggleIndent => self.toggle_indent(),
             Command::ZoomIn => {
                 self.set_ui_zoom(self.settings.ui_zoom + 0.1, ctx);
             }

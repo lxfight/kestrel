@@ -263,6 +263,8 @@ pub struct Session {
     pub active_terminal: usize,
     /// Last project-search query, restored into the search sidebar.
     pub search_query: String,
+    /// Files opened recently, newest first; feeds the welcome page.
+    pub recent_files: Vec<String>,
 }
 
 impl Default for Session {
@@ -283,6 +285,7 @@ impl Default for Session {
             terminals: Vec::new(),
             active_terminal: 0,
             search_query: String::new(),
+            recent_files: Vec::new(),
         }
     }
 }
