@@ -119,7 +119,18 @@ pub struct Editor {
 
     // Layout cache (invalidated on version/style change).
     galleys: std::collections::HashMap<usize, CachedLine>,
-    cache_key: (u64, u64, f32, usize),
+    /// (doc version, spans version, style hash, wrap width bits, line count, atlas probe).
+    cache_key: (u64, u64, u64, u32, usize, u64),
+    /// Font-atlas probe hash and fill ratio; an atlas rebuild invalidates every galley.
+    atlas_key: u64,
+    atlas_fill: f32,
+    /// Visible-row mapping (folded lines removed) plus the sorted fold index.
+    line_map: LineMap,
+    fold_index: FoldIndex,
+    fold_rev: u64,
+    /// Height of the sticky-scroll header currently covering the top of the canvas.
+    sticky_h: f32,
+    minimap_cache: MinimapCache,
     char_w: f32,
     char_w_size: f32,
     blink_base: f64,
@@ -144,6 +155,136 @@ struct CachedLine {
     /// `vis_to_doc[visual_col] = doc_col`; present only when the line has tabs.
     vis_to_doc: Option<Vec<u32>>,
     text_width: f32,
+}
+
+/// Maps document lines to visual rows, with folded-away lines removed.
+///
+/// `rows: None` is the identity mapping, so files without folds allocate nothing.
+/// Rebuilt only when the document version or the fold revision changes.
+#[derive(Default)]
+struct LineMap {
+    version: u64,
+    fold_rev: u64,
+    line_count: usize,
+    rows: Option<Vec<u32>>,
+}
+
+impl LineMap {
+    fn rebuild(
+        &mut self,
+        line_count: usize,
+        fold_rev: u64,
+        version: u64,
+        hidden: impl Fn(usize) -> bool,
+    ) {
+        let mut rows = Vec::with_capacity(line_count);
+        for line in 0..line_count {
+            if !hidden(line) {
+                rows.push(line as u32);
+            }
+        }
+        self.rows = (rows.len() != line_count).then_some(rows);
+        self.line_count = line_count;
+        self.fold_rev = fold_rev;
+        self.version = version;
+    }
+
+    fn row_count(&self) -> usize {
+        match &self.rows {
+            Some(rows) => rows.len(),
+            None => self.line_count,
+        }
+    }
+
+    fn row_of(&self, line: usize) -> Option<usize> {
+        match &self.rows {
+            Some(rows) => rows.binary_search(&(line as u32)).ok(),
+            None => (line < self.line_count).then_some(line),
+        }
+    }
+
+    fn line_of_row(&self, row: usize) -> usize {
+        match &self.rows {
+            Some(rows) => rows[row.min(rows.len().saturating_sub(1))] as usize,
+            None => row.min(self.line_count.saturating_sub(1)),
+        }
+    }
+}
+
+/// Foldable ranges sorted by start line, plus a prefix maximum of their ends, so
+/// hidden-line lookups are one binary search instead of a scan over every fold.
+#[derive(Default)]
+struct FoldIndex {
+    rev: u64,
+    /// Every foldable range, sorted by start line.
+    all: Vec<(usize, usize)>,
+    /// Only the folded ranges, sorted by start line.
+    ranges: Vec<(usize, usize)>,
+    /// `max_end[i] = ranges[..=i].end.max()`.
+    max_end: Vec<usize>,
+}
+
+impl FoldIndex {
+    fn rebuild(&mut self, folds: &[(usize, usize)], folded: &HashSet<usize>, rev: u64) {
+        self.all.clear();
+        self.ranges.clear();
+        for &(start, end) in folds {
+            self.all.push((start, end));
+            if folded.contains(&start) && start < end {
+                self.ranges.push((start, end));
+            }
+        }
+        self.all.sort_unstable_by_key(|(start, _)| *start);
+        self.ranges.sort_unstable_by_key(|(start, _)| *start);
+        self.max_end = self
+            .ranges
+            .iter()
+            .map(|(_, end)| *end)
+            .scan(0, |max, end| {
+                *max = (*max).max(end);
+                Some(*max)
+            })
+            .collect();
+        self.rev = rev;
+    }
+
+    /// Lines strictly inside a folded block are hidden; its start line stays visible.
+    fn is_hidden(&self, line: usize) -> bool {
+        let idx = self.ranges.partition_point(|(start, _)| *start < line);
+        idx > 0 && line <= self.max_end[idx - 1]
+    }
+
+    /// Start line of the folded block hiding `line`, if any.
+    fn enclosing_start(&self, line: usize) -> Option<usize> {
+        let idx = self.max_end.partition_point(|end| *end < line);
+        let (start, _) = *self.ranges.get(idx)?;
+        (start < line).then_some(start)
+    }
+
+    fn range_starting_at(&self, line: usize) -> Option<(usize, usize)> {
+        let idx = self
+            .all
+            .binary_search_by_key(&line, |(start, _)| *start)
+            .ok()?;
+        self.all.get(idx).copied()
+    }
+}
+
+/// One sampled line of the minimap, cached per (version, rows) so scrolling does
+/// not rescan the rope.
+#[derive(Clone, Copy)]
+struct MinimapRow {
+    indent: u16,
+    len: u16,
+    color: egui::Color32,
+    diff: Option<egui::Color32>,
+}
+
+#[derive(Default)]
+struct MinimapCache {
+    /// (doc version, spans version, theme kind, sampled rows, pixel height, fold revision).
+    key: (u64, u64, u8, usize, u32, u64),
+    rows: Vec<MinimapRow>,
 }
 
 impl Editor {
@@ -185,7 +326,14 @@ impl Editor {
             insert_spaces: true,
             autocomplete_enabled: true,
             galleys: std::collections::HashMap::new(),
-            cache_key: (0, 0, 0.0, 0),
+            cache_key: (0, 0, 0, 0, 0, 0),
+            atlas_key: 0,
+            atlas_fill: 0.0,
+            line_map: LineMap::default(),
+            fold_index: FoldIndex::default(),
+            fold_rev: 0,
+            sticky_h: 0.0,
+            minimap_cache: MinimapCache::default(),
             char_w: 8.0,
             char_w_size: 0.0,
             blink_base: 0.0,
@@ -231,6 +379,8 @@ impl Editor {
             self.spans.clear();
             self.symbols.clear();
             self.folds.clear();
+            self.folded_lines.clear();
+            self.fold_rev += 1;
             self.diagnostics.clear();
             self.spans_version = 0;
             self.invalidate_layout();
@@ -272,6 +422,17 @@ impl Editor {
     pub fn toggle_cursor_at(&mut self, pos: usize) {
         let pos = pos.min(self.doc.len_chars());
         if pos == self.caret {
+            return;
+        }
+        // Alt+click inside an existing selection must not drop a cursor into it.
+        let inside_primary = self
+            .selection()
+            .is_some_and(|(start, end)| start < pos && pos < end);
+        let inside_extra = self
+            .extra_cursors
+            .iter()
+            .any(|(c, a)| c.min(a) < &pos && &pos < c.max(a));
+        if inside_primary || inside_extra {
             return;
         }
         if let Some(idx) = self.extra_cursors.iter().position(|(c, _)| *c == pos) {
@@ -501,28 +662,111 @@ impl Editor {
     // Code Folding
     // ---------------------------------------------------------------------
 
+    /// Bring the visible-row map and the sorted fold index up to date with the
+    /// document version and fold state. Cheap to call every frame.
+    fn sync_layout(&mut self) {
+        let folds_stale = self.fold_index.rev != self.fold_rev
+            || self.fold_index.all.len() != self.folds.len();
+        if folds_stale {
+            let rev = self.fold_rev;
+            let Editor {
+                fold_index,
+                folds,
+                folded_lines,
+                ..
+            } = self;
+            fold_index.rebuild(folds, folded_lines, rev);
+        }
+        if folds_stale
+            || self.line_map.version != self.doc.version
+            || self.line_map.fold_rev != self.fold_rev
+            || self.line_map.line_count == 0
+        {
+            let version = self.doc.version;
+            let rev = self.fold_rev;
+            let line_count = self.doc.line_count().max(1);
+            let Editor {
+                line_map,
+                fold_index,
+                ..
+            } = self;
+            line_map.rebuild(line_count, rev, version, |line| fold_index.is_hidden(line));
+        }
+    }
+
+    /// Number of rows actually rendered (document lines minus folded-away lines).
+    pub fn visible_row_count(&mut self) -> usize {
+        self.sync_layout();
+        self.line_map.row_count()
+    }
+
+    /// Height of the scrollable text area; folded lines occupy no space.
+    pub fn total_content_height(&mut self, line_h: f32) -> f32 {
+        self.visible_row_count() as f32 * line_h.max(1.0)
+    }
+
+    /// Visual row of a document line, `None` while it is folded away.
+    pub fn row_of_line(&mut self, line: usize) -> Option<usize> {
+        self.sync_layout();
+        self.line_map.row_of(line)
+    }
+
+    /// Document line rendered at `row` (clamped to the last row).
+    pub fn line_of_row(&mut self, row: usize) -> usize {
+        self.sync_layout();
+        self.line_map.line_of_row(row)
+    }
+
+    /// Move a caret that ended up inside a folded block back to the block's start line.
+    fn snap_caret_out_of_folds(&mut self) {
+        let mut caret_line = self.doc.char_to_line(self.caret);
+        let mut anchor_line = self.doc.char_to_line(self.anchor);
+        let mut snapped = false;
+        if let Some(start) = self.fold_index.enclosing_start(caret_line) {
+            caret_line = start;
+            snapped = true;
+        }
+        if let Some(start) = self.fold_index.enclosing_start(anchor_line) {
+            anchor_line = start;
+            snapped = true;
+        }
+        if snapped {
+            self.caret = self.doc.line_to_char(caret_line) + self.doc.line_char_len(caret_line);
+            self.anchor = self.doc.line_to_char(anchor_line) + self.doc.line_char_len(anchor_line);
+            self.desired_col = None;
+            self.ensure_visible = true;
+        }
+    }
+
     pub fn fold_range_for_line(&self, line: usize) -> Option<(usize, usize)> {
-        self.folds.iter().find(|(s, _)| *s == line).copied()
+        self.fold_index.range_starting_at(line)
     }
 
     pub fn toggle_fold_at(&mut self, line: usize) -> bool {
-        if self.fold_range_for_line(line).is_some() {
-            if !self.folded_lines.remove(&line) {
-                self.folded_lines.insert(line);
-            }
-            return true;
+        self.sync_layout();
+        if self.fold_range_for_line(line).is_none() {
+            return false;
         }
-        false
+        if !self.folded_lines.remove(&line) {
+            self.folded_lines.insert(line);
+        }
+        self.fold_rev += 1;
+        self.sync_layout();
+        self.snap_caret_out_of_folds();
+        self.ensure_visible = true;
+        true
     }
 
     pub fn toggle_fold_caret(&mut self) {
+        self.sync_layout();
         let caret_line = self.doc.char_to_line(self.caret);
         if self.toggle_fold_at(caret_line) {
             return;
         }
         // Find innermost enclosing foldable range.
         if let Some((start, _)) = self
-            .folds
+            .fold_index
+            .all
             .iter()
             .filter(|(s, e)| *s <= caret_line && caret_line <= *e)
             .max_by_key(|(s, _)| *s)
@@ -533,25 +777,23 @@ impl Editor {
     }
 
     pub fn fold_all(&mut self) {
+        self.sync_layout();
         for (start, _) in &self.folds {
             self.folded_lines.insert(*start);
         }
+        self.fold_rev += 1;
+        self.sync_layout();
+        self.snap_caret_out_of_folds();
     }
 
     pub fn unfold_all(&mut self) {
         self.folded_lines.clear();
+        self.fold_rev += 1;
+        self.sync_layout();
     }
 
     pub fn is_line_hidden(&self, line: usize) -> bool {
-        for &folded_start in &self.folded_lines {
-            if let Some((s, e)) = self.fold_range_for_line(folded_start)
-                && line > s
-                && line <= e
-            {
-                return true;
-            }
-        }
-        false
+        self.fold_index.is_hidden(line)
     }
 
     // ---------------------------------------------------------------------
@@ -624,7 +866,7 @@ impl Editor {
         let end = self.caret;
         self.completion.open = false;
         let before = (self.caret, self.anchor);
-        let after_pos = start + insert.chars().count();
+        let after_pos = (start + insert.chars().count()).min(self.doc.len_chars());
         let sed = self.doc.edit(
             start,
             end,
@@ -688,6 +930,7 @@ impl Editor {
     }
 
     pub fn move_vertical(&mut self, delta_lines: isize, extend: bool) {
+        self.sync_layout();
         let (line, col) = self.doc.char_to_line_col(self.caret);
         let target_col = self.desired_col.unwrap_or(col);
         let mut target_line = (line as isize + delta_lines).max(0) as usize;
@@ -764,23 +1007,36 @@ impl Editor {
             .doc
             .edit(start, end, text, kind, before, (caret_after, caret_after));
         self.syntax.apply_edit(syntax_edit);
-        self.caret = caret_after;
-        self.anchor = caret_after;
+        self.caret = caret_after.min(self.doc.len_chars());
+        self.anchor = self.caret;
         self.after_edit();
         true
     }
 
     fn replace_multi_cursors(&mut self, text: &str) -> bool {
-        let mut all_cursors = Vec::with_capacity(self.extra_cursors.len() + 1);
-        all_cursors.push((self.caret, self.anchor, true));
-        for &(c, a) in &self.extra_cursors {
-            all_cursors.push((c, a, false));
-        }
-        all_cursors.sort_by_key(|(c, a, _)| (*c).min(*a));
+        let texts = vec![text.to_string(); self.extra_cursors.len() + 1];
+        self.replace_multi_cursors_each(&texts)
+    }
 
-        let edits: Vec<(usize, usize, String)> = all_cursors
+    /// Replace every cursor's selection with its own text (cursors ordered by position).
+    fn replace_multi_cursors_each(&mut self, texts: &[String]) -> bool {
+        let mut cursors = Vec::with_capacity(self.extra_cursors.len() + 1);
+        cursors.push((self.caret, self.anchor, true));
+        for &(c, a) in &self.extra_cursors {
+            cursors.push((c, a, false));
+        }
+        cursors.sort_by_key(|(c, a, _)| (*c).min(*a));
+
+        let edits: Vec<(usize, usize, String)> = cursors
             .iter()
-            .map(|(c, a, _)| ((*c).min(*a), (*c).max(*a), text.to_string()))
+            .enumerate()
+            .map(|(i, (c, a, _))| {
+                (
+                    (*c).min(*a),
+                    (*c).max(*a),
+                    texts.get(i).cloned().unwrap_or_default(),
+                )
+            })
             .collect();
         let before = (self.caret, self.anchor);
         let seds = self.doc.edit_many(&edits, before, before);
@@ -788,14 +1044,14 @@ impl Editor {
             self.syntax.apply_edit(sed);
         }
 
-        let insert_chars = text.chars().count() as isize;
         let mut delta: isize = 0;
         let mut new_extras = Vec::with_capacity(self.extra_cursors.len());
-        for (c, a, is_primary) in all_cursors {
+        for (i, (c, a, is_primary)) in cursors.into_iter().enumerate() {
             let start = c.min(a) as isize + delta;
             let removed = c.max(a).saturating_sub(c.min(a)) as isize;
-            let new_pos = (start + insert_chars).max(0) as usize;
-            delta += insert_chars - removed;
+            let inserted = texts.get(i).map_or(0, |text| text.chars().count()) as isize;
+            let new_pos = (start + inserted).max(0) as usize;
+            delta += inserted - removed;
             if is_primary {
                 self.caret = new_pos;
                 self.anchor = new_pos;
@@ -806,6 +1062,27 @@ impl Editor {
         self.extra_cursors = new_extras;
         self.after_edit();
         true
+    }
+
+    /// Paste, distributing lines across cursors when their counts match.
+    pub fn paste_text(&mut self, text: &str) {
+        if self.doc.readonly {
+            return;
+        }
+        let cursor_count = self.extra_cursors.len() + 1;
+        if cursor_count > 1 {
+            let lines: Vec<&str> = text
+                .split('\n')
+                .map(|line| line.strip_suffix('\r').unwrap_or(line))
+                .collect();
+            if lines.len() == cursor_count {
+                let texts: Vec<String> = lines.into_iter().map(str::to_string).collect();
+                self.replace_multi_cursors_each(&texts);
+                self.completion.open = false;
+                return;
+            }
+        }
+        self.insert_text(text);
     }
 
     fn after_edit(&mut self) {
@@ -969,7 +1246,7 @@ impl Editor {
             if self.doc.line_indent(line).contains('\t') {
                 "\t".to_string()
             } else {
-                " ".repeat(4)
+                " ".repeat(self.tab_size.max(1))
             }
         } else {
             String::new()
@@ -1078,7 +1355,7 @@ impl Editor {
             && col > 0
             && self.doc.line_indent(line).chars().count() == col
         {
-            let tab = 4usize;
+            let tab = self.tab_size.max(1);
             let remove = ((col - 1) / tab) * tab;
             let target = line_start + remove;
             let n = self.caret - target;
@@ -1536,6 +1813,7 @@ impl Editor {
         self.find.open = false;
         self.find.focus_query = false;
         self.find.focus_replacement = false;
+        self.focus_requested = true;
     }
 
     pub fn refresh_find_matches(&mut self) {
@@ -1580,14 +1858,17 @@ impl Editor {
         self.find.error = None;
         let text = self.doc.text();
         let mut matches = Vec::new();
+        let mut byte = 0usize;
+        let mut ch = 0usize;
         for m in regex.find_iter(&text) {
             if matches.len() >= 50_000 {
                 break;
             }
-            matches.push((
-                self.doc.byte_to_char(m.start()),
-                self.doc.byte_to_char(m.end()),
-            ));
+            ch += text[byte..m.start()].chars().count();
+            let start = ch;
+            ch += text[m.start()..m.end()].chars().count();
+            byte = m.end();
+            matches.push((start, ch));
         }
         self.find.matches = matches;
         if self.find.matches.is_empty() {
@@ -1685,6 +1966,7 @@ impl Editor {
                 self.spans = analysis.spans;
                 self.symbols = analysis.symbols;
                 self.folds = analysis.folds;
+                self.fold_rev += 1;
                 self.diagnostics = analysis.diagnostics;
                 self.spans_version = analysis.version;
                 self.invalidate_layout();
@@ -1710,6 +1992,8 @@ impl Editor {
                 self.spans.clear();
                 self.symbols.clear();
                 self.folds.clear();
+                self.folded_lines.clear();
+                self.fold_rev += 1;
                 self.diagnostics.clear();
             }
             self.spans_version = self.doc.version;
@@ -1943,5 +2227,89 @@ cc
         assert_eq!(ed.doc.char_to_line_col(ed.caret), (1, 2));
         ed.move_vertical(1, false);
         assert_eq!(ed.doc.char_to_line_col(ed.caret), (2, 2));
+    }
+
+    #[test]
+    fn folding_compresses_rows_and_total_height() {
+        let mut ed = editor("fn a() {\n    1\n    2\n    3\n}\nfn b() {}");
+        ed.folds = vec![(0, 4)];
+        assert_eq!(ed.visible_row_count(), 6);
+        assert!(ed.toggle_fold_at(0));
+        assert_eq!(ed.visible_row_count(), 2);
+        assert_eq!(ed.total_content_height(20.0), 40.0);
+        assert_eq!(ed.row_of_line(0), Some(0));
+        assert_eq!(ed.row_of_line(1), None);
+        assert_eq!(ed.row_of_line(5), Some(1));
+        assert_eq!(ed.line_of_row(1), 5);
+    }
+
+    #[test]
+    fn folding_moves_caret_to_the_fold_start_line() {
+        let mut ed = editor("a\nb\nc\nd");
+        ed.folds = vec![(1, 3)];
+        ed.caret = ed.doc.line_col_to_char(2, 0);
+        ed.anchor = ed.caret;
+        assert!(ed.toggle_fold_at(1));
+        assert_eq!(ed.doc.char_to_line(ed.caret), 1);
+        assert_eq!(ed.is_line_hidden(2), true);
+    }
+
+    #[test]
+    fn hidden_lookup_handles_nested_folds() {
+        let mut ed = editor("0\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11");
+        ed.folds = vec![(0, 10), (2, 4)];
+        ed.toggle_fold_at(0);
+        ed.toggle_fold_at(2);
+        let hidden: Vec<bool> = (0..12).map(|line| ed.is_line_hidden(line)).collect();
+        // Line 2 is the inner fold start but the outer block hides it; line 7 is past
+        // the inner block and must still be hidden by the outer one.
+        assert_eq!(
+            hidden,
+            [
+                false, true, true, true, true, true, true, true, true, true, true, false
+            ]
+        );
+    }
+
+    #[test]
+    fn fold_layout_tracks_document_version() {
+        let mut ed = editor("a\nb\nc\nd");
+        ed.folds = vec![(0, 3)];
+        ed.toggle_fold_at(0);
+        assert_eq!(ed.visible_row_count(), 1);
+        assert_eq!(ed.total_content_height(10.0), 10.0);
+        // A new edit bumps doc.version and must rebuild the cached row map.
+        ed.doc
+            .edit(0, 0, "x\n", EditKind::Other, (0, 0), (0, 0));
+        assert_eq!(ed.visible_row_count(), 2);
+        assert_eq!(ed.line_of_row(1), 4);
+    }
+
+    #[test]
+    fn newline_and_backspace_follow_tab_size() {
+        let mut ed = editor("fn main() {");
+        ed.tab_size = 2;
+        ed.caret = ed.doc.len_chars();
+        ed.anchor = ed.caret;
+        ed.newline();
+        assert_eq!(ed.doc.text(), "fn main() {\n  ");
+
+        let mut ed = editor("x\n    ");
+        ed.tab_size = 2;
+        ed.caret = ed.doc.len_chars();
+        ed.anchor = ed.caret;
+        ed.backspace();
+        assert_eq!(ed.doc.text(), "x\n  ");
+    }
+
+    #[test]
+    fn multi_cursor_paste_distributes_lines() {
+        let mut ed = editor("a\nb");
+        ed.caret = ed.doc.line_col_to_char(1, 1);
+        ed.anchor = ed.caret;
+        ed.extra_cursors
+            .push((ed.doc.line_col_to_char(0, 1), ed.doc.line_col_to_char(0, 1)));
+        ed.paste_text("X\nY");
+        assert_eq!(ed.doc.text(), "aX\nbY");
     }
 }

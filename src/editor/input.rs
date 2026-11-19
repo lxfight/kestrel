@@ -19,7 +19,7 @@ impl Editor {
                 Event::Paste(text) => {
                     self.ime_preedit.clear();
                     self.ime_active_range = None;
-                    self.insert_text(&text);
+                    self.paste_text(&text);
                 }
                 Event::Copy => {
                     self.copy_selection(&ctx);
@@ -77,19 +77,31 @@ impl Editor {
         }
     }
 
+    /// Copy every selection, joined by newlines, so multi-cursor paste round-trips.
     pub fn copy_selection(&mut self, ctx: &egui::Context) {
-        if self.has_selection() {
-            let text = self.selected_text();
-            if !text.is_empty() {
-                ctx.copy_text(text);
+        let mut selections: Vec<(usize, usize)> = Vec::new();
+        if let Some(primary) = self.selection() {
+            selections.push(primary);
+        }
+        for &(c, a) in &self.extra_cursors {
+            if c != a {
+                selections.push((c.min(a), c.max(a)));
             }
-        } else {
+        }
+        if selections.is_empty() {
             let line = self.doc.char_to_line(self.caret);
             let text = self.doc.line_content(line);
             if !text.is_empty() {
                 ctx.copy_text(format!("{text}\n"));
             }
+            return;
         }
+        selections.sort_unstable();
+        let parts: Vec<String> = selections
+            .iter()
+            .map(|(start, end)| self.doc.text_range(*start, *end))
+            .collect();
+        ctx.copy_text(parts.join("\n"));
     }
 
     pub fn delete_selection(&mut self) {
