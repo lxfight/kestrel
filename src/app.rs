@@ -556,13 +556,14 @@ impl KestrelApp {
     }
 
     fn apply_dev_ui(&mut self) {
-        let Some(ui) = self.dev_ui.clone() else {
-            return;
-        };
         // 先打开文件再注入 UI 状态：split / md_split / settings 等状态依赖已有编辑器。
+        // KESTREL_DEV_OPEN 不依赖 KESTREL_UI，单独截图状态也要生效。
         if let Ok(path) = std::env::var("KESTREL_DEV_OPEN") {
             self.open_file(PathBuf::from(path));
         }
+        let Some(ui) = self.dev_ui.clone() else {
+            return;
+        };
 
         match ui.as_str() {
             "palette" => self.open_palette(PaletteMode::Commands),
