@@ -8,7 +8,7 @@ use egui::FontFamily;
 use crate::commands::{Command, Shortcut};
 use crate::devshot;
 use crate::doc::{Document, SaveOutcome};
-use crate::editor::{Editor, EditorStyle};
+use crate::editor::{Editor, EditorStyle, FormatOutcome};
 use crate::fuzzy;
 use crate::git::{GitFileStatus, GitService};
 use crate::highlight::Language;
@@ -2913,9 +2913,24 @@ impl KestrelApp {
                 }
             }
             Command::FormatDocument => {
-                if let Some(tab) = self.tabs.get_mut(self.active) {
-                    tab.format_document();
-                    self.toast("已格式化文档", ToastKind::Info);
+                let outcome = self.tabs.get_mut(self.active).map(Editor::format_document);
+                match outcome {
+                    Some(FormatOutcome::ReadOnly) => {
+                        self.toast("文档已锁定，无法格式化", ToastKind::Warning);
+                    }
+                    Some(FormatOutcome::Formatted { external: true }) => {
+                        self.toast("已格式化文档", ToastKind::Success);
+                    }
+                    Some(FormatOutcome::Unchanged { external: true }) => {
+                        self.toast("文档已是格式化状态", ToastKind::Info);
+                    }
+                    Some(FormatOutcome::Formatted { external: false }) => {
+                        self.toast("当前语言没有格式化器，已清理行尾空白", ToastKind::Info);
+                    }
+                    Some(FormatOutcome::Unchanged { external: false }) => {
+                        self.toast("当前语言没有格式化器，无需整理", ToastKind::Info);
+                    }
+                    None => {}
                 }
             }
             Command::TriggerSuggest => {
@@ -3176,25 +3191,25 @@ impl KestrelApp {
         }
         // Handle UI zoom shortcuts (Ctrl + = / + / - / 0), including Shift+= for '+'
         let zoom_cmd = ctx.input_mut(|i| {
-            let ctrl = (i.modifiers.ctrl || i.modifiers.command) && !i.modifiers.alt;
-            if !ctrl {
+            let command = (i.modifiers.ctrl || i.modifiers.command) && !i.modifiers.alt;
+            if !command {
                 return None;
             }
-            if i.consume_key(egui::Modifiers::CTRL, egui::Key::Equals)
-                || i.consume_key(egui::Modifiers::CTRL, egui::Key::Plus)
+            if i.consume_key(egui::Modifiers::COMMAND, egui::Key::Equals)
+                || i.consume_key(egui::Modifiers::COMMAND, egui::Key::Plus)
                 || (i.modifiers.shift
                     && (i.consume_key(
-                        egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+                        egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
                         egui::Key::Plus,
                     ) || i.consume_key(
-                        egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+                        egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
                         egui::Key::Equals,
                     )))
             {
                 Some(Command::ZoomIn)
-            } else if i.consume_key(egui::Modifiers::CTRL, egui::Key::Minus) {
+            } else if i.consume_key(egui::Modifiers::COMMAND, egui::Key::Minus) {
                 Some(Command::ZoomOut)
-            } else if i.consume_key(egui::Modifiers::CTRL, egui::Key::Num0) {
+            } else if i.consume_key(egui::Modifiers::COMMAND, egui::Key::Num0) {
                 Some(Command::ZoomReset)
             } else {
                 None
@@ -3204,9 +3219,15 @@ impl KestrelApp {
             self.dispatch(cmd, ctx);
             return;
         }
+        // Editor commands usually run inside the canvas. They are matched here too
+        // while that canvas owns the keyboard, so keybindings.json overrides apply
+        // to them; text fields and the terminal keep their own Ctrl+C/X/Z handling
+        // because their keyboards are not the editor's.
+        let editor_focused = self
+            .active_editor()
+            .is_some_and(|tab| tab.has_focus && tab.ime_preedit.is_empty());
         let mut candidates: Vec<(Command, crate::commands::Shortcut)> = Command::ALL
             .iter()
-            .filter(|command| !command.is_editor_command())
             .filter_map(|command| {
                 self.custom_shortcuts
                     .get(command)
@@ -3241,6 +3262,9 @@ impl KestrelApp {
         });
         let mut handled = false;
         for (command, shortcut) in candidates {
+            if command.is_editor_command() && !editor_focused {
+                continue;
+            }
             if !pressed
                 .iter()
                 .any(|(key, mods)| *key == shortcut.key && mods.matches_exact(shortcut.mods))

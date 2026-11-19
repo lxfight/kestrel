@@ -101,7 +101,7 @@ impl Shortcut {
 
     pub fn display(&self) -> String {
         let mut s = String::new();
-        if self.mods.ctrl {
+        if self.mods.ctrl || self.mods.command {
             if cfg!(target_os = "macos") {
                 s.push_str("Cmd+");
             } else {
@@ -140,7 +140,11 @@ impl Shortcut {
                 continue;
             }
             match part.to_ascii_lowercase().as_str() {
-                "ctrl" | "control" | "cmd" | "command" | "super" | "win" | "meta" => mods.ctrl = true,
+                // All primary-modifier aliases map to egui's platform `command` bit:
+                // Ctrl on Windows/Linux, ⌘ on macOS.
+                "ctrl" | "control" | "cmd" | "command" | "super" | "win" | "meta" => {
+                    mods.command = true;
+                }
                 "shift" => mods.shift = true,
                 "alt" | "option" | "opt" => mods.alt = true,
                 _ => {
@@ -163,32 +167,15 @@ impl Shortcut {
     }
 }
 
-const CTRL: Modifiers = Modifiers {
-    alt: false,
-    ctrl: true,
-    shift: false,
-    mac_cmd: false,
-    command: false,
-};
+/// Primary platform modifier: Ctrl on Windows/Linux, ⌘ on macOS.
+const CTRL: Modifiers = Modifiers::COMMAND;
 
 const fn ctrl_shift() -> Modifiers {
-    Modifiers {
-        alt: false,
-        ctrl: true,
-        shift: true,
-        mac_cmd: false,
-        command: false,
-    }
+    Modifiers::COMMAND.plus(Modifiers::SHIFT)
 }
 
 const fn ctrl_alt() -> Modifiers {
-    Modifiers {
-        alt: true,
-        ctrl: true,
-        shift: false,
-        mac_cmd: false,
-        command: false,
-    }
+    Modifiers::COMMAND.plus(Modifiers::ALT)
 }
 
 const fn shift_alt() -> Modifiers {
@@ -763,19 +750,23 @@ mod tests {
         }
         assert_eq!(
             Shortcut::parse("ctrl+alt+u"),
-            Some(Shortcut::new(
-                Modifiers {
-                    alt: true,
-                    ctrl: true,
-                    shift: false,
-                    mac_cmd: false,
-                    command: false,
-                },
-                Key::U
-            ))
+            Some(Shortcut::new(ctrl_alt(), Key::U))
         );
         assert!(Shortcut::parse("ctrl+nope").is_none());
         assert_eq!(Shortcut::parse_list("ctrl+a, ctrl+b").len(), 2);
+    }
+
+    #[test]
+    fn primary_modifier_matches_platform_command_key() {
+        // macOS reports ⌘ through `command`/`mac_cmd`; Windows/Linux report Ctrl
+        // through both `ctrl` and `command`. Both must match our primary modifier.
+        let mac_cmd = Modifiers {
+            mac_cmd: true,
+            command: true,
+            ..Modifiers::NONE
+        };
+        assert!(mac_cmd.matches_exact(CTRL));
+        assert!(Modifiers::COMMAND.matches_exact(CTRL));
     }
 
     #[test]

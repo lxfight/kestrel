@@ -20,6 +20,10 @@ use syntax::SyntaxService;
 /// Documents larger than this are rendered without syntax highlighting.
 pub const MAX_HIGHLIGHT_BYTES: usize = 1_500_000;
 
+/// Document bytes before the caret handed to the completion matcher. Completion
+/// must never copy the whole document on every keystroke.
+const COMPLETION_CONTEXT_BYTES: usize = 64 * 1024;
+
 /// Snapshot of the user settings the editor needs while painting/handling keys.
 #[derive(Clone)]
 pub struct EditorStyle {
@@ -147,6 +151,8 @@ pub struct Editor {
     pub ime_preedit: String,
     /// Active (underlined) character range inside `ime_preedit`.
     pub ime_active_range: Option<(usize, usize)>,
+    /// Set when the next IME output must abort the OS composition (click / Esc).
+    ime_interrupt: bool,
     pub multimodal: Option<crate::viewer::MultimodalViewer>,
 }
 
@@ -287,6 +293,16 @@ struct MinimapCache {
     rows: Vec<MinimapRow>,
 }
 
+/// Outcome of an explicit format request, so callers can report what actually happened.
+pub enum FormatOutcome {
+    /// Document is read-only; nothing was formatted.
+    ReadOnly,
+    /// Text changed.
+    Formatted { external: bool },
+    /// Text was already normalized.
+    Unchanged { external: bool },
+}
+
 impl Editor {
     pub fn new(doc: Document, id: u64, untitled_index: usize) -> Self {
         let language = doc
@@ -346,6 +362,7 @@ impl Editor {
             diff: None,
             ime_preedit: String::new(),
             ime_active_range: None,
+            ime_interrupt: false,
             multimodal: None,
         };
         editor.refresh_find_matches();
@@ -800,11 +817,8 @@ impl Editor {
     // Autocomplete & Formatting
     // ---------------------------------------------------------------------
 
-    pub fn update_completion(&mut self) {
-        if !self.autocomplete_enabled || !self.extra_cursors.is_empty() {
-            self.completion.open = false;
-            return;
-        }
+    /// Start of the identifier being typed at the caret.
+    fn ident_start(&self) -> usize {
         let is_ident = |c: char| c.is_alphanumeric() || c == '_';
         let mut start = self.caret;
         while start > 0 {
@@ -813,15 +827,54 @@ impl Editor {
                 _ => break,
             }
         }
+        start
+    }
+
+    /// True when `ident_start` sits right after `.` or `::` — a member access.
+    fn member_access_before(&self, ident_start: usize) -> bool {
+        ident_start > 0 && matches!(self.doc.char_at(ident_start - 1), Some('.' | ':'))
+    }
+
+    /// Text handed to the completion matcher: up to 64 KB before the caret plus
+    /// the rest of the caret line. Never copies the whole document.
+    fn completion_context(&self) -> String {
+        let line = self.doc.char_to_line(self.caret);
+        let line_start = self.doc.line_to_char(line);
+        let line_end = line_start + self.doc.line_char_len(line);
+        let start_byte = self
+            .doc
+            .char_to_byte(self.caret)
+            .saturating_sub(COMPLETION_CONTEXT_BYTES);
+        let start = self.doc.byte_to_char(start_byte).min(line_start);
+        self.doc.text_range(start, line_end)
+    }
+
+    pub fn update_completion(&mut self) {
+        if !self.autocomplete_enabled
+            || !self.extra_cursors.is_empty()
+            || !self.ime_preedit.is_empty()
+        {
+            self.completion.open = false;
+            return;
+        }
+        let start = self.ident_start();
         let prefix = self.doc.text_range(start, self.caret);
-        if prefix.chars().count() < 2
+        let member = self.member_access_before(start);
+        if member && prefix.is_empty() {
+            self.open_member_completion();
+            return;
+        }
+        // Member access filters from the first typed character; plain identifier
+        // completion waits for two to keep the popup quiet.
+        let min_prefix = if member { 1 } else { 2 };
+        if prefix.chars().count() < min_prefix
             || prefix.chars().next().is_some_and(|c| c.is_ascii_digit())
         {
             self.completion.open = false;
             return;
         }
-        let text = self.doc.text();
-        let items = crate::lsp::complete(&prefix, self.language, &self.symbols, &text);
+        let context = self.completion_context();
+        let items = crate::lsp::complete(&prefix, self.language, &self.symbols, &context);
         if items.is_empty() {
             self.completion.open = false;
         } else {
@@ -832,19 +885,44 @@ impl Editor {
         }
     }
 
-    pub fn trigger_completion(&mut self) {
-        let is_ident = |c: char| c.is_alphanumeric() || c == '_';
-        let mut start = self.caret;
-        while start > 0 {
-            match self.doc.char_at(start - 1) {
-                Some(c) if is_ident(c) => start -= 1,
-                _ => break,
-            }
+    /// Open the member list right after `.` or `::`: current file symbols plus
+    /// language keywords, before the user narrows it down by typing.
+    fn open_member_completion(&mut self) {
+        if !self.autocomplete_enabled
+            || !self.extra_cursors.is_empty()
+            || !self.ime_preedit.is_empty()
+        {
+            self.completion.open = false;
+            return;
         }
+        let items = crate::lsp::member_candidates(self.language, &self.symbols);
+        if items.is_empty() {
+            self.completion.open = false;
+            return;
+        }
+        self.completion.prefix_start = self.caret;
+        self.completion.items = items;
+        self.completion.selected = 0;
+        self.completion.open = true;
+    }
+
+    pub fn trigger_completion(&mut self) {
+        if !self.autocomplete_enabled
+            || !self.extra_cursors.is_empty()
+            || !self.ime_preedit.is_empty()
+        {
+            self.completion.open = false;
+            return;
+        }
+        let start = self.ident_start();
         let prefix = self.doc.text_range(start, self.caret);
-        let query = if prefix.is_empty() { "a" } else { &prefix };
-        let text = self.doc.text();
-        let items = crate::lsp::complete(query, self.language, &self.symbols, &text);
+        if prefix.is_empty() && self.member_access_before(start) {
+            self.open_member_completion();
+            return;
+        }
+        let query = if prefix.is_empty() { "a" } else { prefix.as_str() };
+        let context = self.completion_context();
+        let items = crate::lsp::complete(query, self.language, &self.symbols, &context);
         if !items.is_empty() {
             self.completion.prefix_start = start;
             self.completion.items = items;
@@ -882,26 +960,31 @@ impl Editor {
         true
     }
 
-    pub fn format_document(&mut self) {
+    pub fn format_document(&mut self) -> FormatOutcome {
         if self.doc.readonly {
-            return;
+            return FormatOutcome::ReadOnly;
         }
         let current = self.doc.text();
-        let formatted =
+        let result =
             crate::lsp::format_document(self.language, &current, self.tab_size, self.insert_spaces);
-        if formatted == current {
-            return;
+        if result.text == current {
+            return FormatOutcome::Unchanged {
+                external: result.external,
+            };
         }
         let (line, col) = self.doc.char_to_line_col(self.caret);
         let before = (self.caret, self.anchor);
         let len = self.doc.len_chars();
         let sed = self
             .doc
-            .edit(0, len, &formatted, EditKind::Other, before, before);
+            .edit(0, len, &result.text, EditKind::Other, before, before);
         self.syntax.apply_edit(sed);
         self.caret = self.doc.line_col_to_char(line, col);
         self.anchor = self.caret;
         self.after_edit();
+        FormatOutcome::Formatted {
+            external: result.external,
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -1203,7 +1286,12 @@ impl Editor {
         }
 
         self.replace_selection(text, EditKind::Typing, None);
-        if ch.is_alphanumeric() || ch == '_' {
+        // `.` / `::` open the member list; other punctuation dismisses it.
+        let member_access = ch == '.'
+            || (ch == ':' && self.caret >= 2 && self.doc.char_at(self.caret - 2) == Some(':'));
+        if member_access {
+            self.open_member_completion();
+        } else if ch.is_ascii_alphanumeric() || ch == '_' {
             self.update_completion();
         } else {
             self.completion.open = false;
@@ -2251,7 +2339,7 @@ cc
         ed.anchor = ed.caret;
         assert!(ed.toggle_fold_at(1));
         assert_eq!(ed.doc.char_to_line(ed.caret), 1);
-        assert_eq!(ed.is_line_hidden(2), true);
+        assert!(ed.is_line_hidden(2));
     }
 
     #[test]
@@ -2311,5 +2399,110 @@ cc
             .push((ed.doc.line_col_to_char(0, 1), ed.doc.line_col_to_char(0, 1)));
         ed.paste_text("X\nY");
         assert_eq!(ed.doc.text(), "aX\nbY");
+    }
+
+    fn function_symbol(name: &str) -> OutlineSymbol {
+        OutlineSymbol {
+            name: name.to_string(),
+            detail: "fn".to_string(),
+            kind: crate::lsp::SymbolKind::Function,
+            start_line: 0,
+            end_line: 0,
+            byte_offset: 0,
+            depth: 0,
+        }
+    }
+
+    #[test]
+    fn continuous_typing_is_a_single_undo_step() {
+        let mut ed = editor("");
+        for ch in "abc".chars() {
+            ed.insert_text(&ch.to_string());
+        }
+        ed.undo();
+        assert_eq!(ed.doc.text(), "");
+        assert_eq!(ed.caret, 0);
+        ed.redo();
+        assert_eq!(ed.doc.text(), "abc");
+    }
+
+    #[test]
+    fn dot_and_double_colon_open_member_completion() {
+        let mut ed = editor("");
+        ed.symbols = vec![function_symbol("render_view"), function_symbol("reload")];
+        ed.insert_text(".");
+        assert!(ed.completion.open);
+        assert!(
+            ed.completion
+                .items
+                .iter()
+                .any(|item| item.label == "render_view")
+        );
+        ed.insert_text("r");
+        ed.insert_text("e");
+        assert!(ed.completion.open);
+        let selected = ed
+            .completion
+            .items
+            .iter()
+            .position(|item| item.label == "render_view")
+            .expect("render_view candidate");
+        ed.completion.selected = selected;
+        assert!(ed.accept_completion());
+        assert_eq!(ed.doc.text(), ".render_view");
+
+        let mut ed = editor("");
+        ed.symbols = vec![function_symbol("render_view")];
+        ed.insert_text(":");
+        assert!(!ed.completion.open);
+        ed.insert_text(":");
+        assert!(ed.completion.open);
+        assert_eq!(ed.completion.prefix_start, 2);
+    }
+
+    #[test]
+    fn member_completion_rows_match_the_popup_cap() {
+        let mut ed = editor("");
+        ed.symbols = (0..20)
+            .map(|index| function_symbol(&format!("symbol_{index}")))
+            .collect();
+        ed.insert_text(".");
+        assert_eq!(ed.completion.items.len(), crate::lsp::COMPLETION_MAX_ITEMS);
+    }
+
+    #[test]
+    fn completion_context_stays_bounded() {
+        let body = "let identifier = 1;\n".repeat(80_000);
+        let mut ed = editor(&body);
+        ed.caret = ed.doc.len_chars();
+        ed.anchor = ed.caret;
+        let context = ed.completion_context();
+        assert!(
+            context.len() <= COMPLETION_CONTEXT_BYTES + 1024,
+            "context grew to {} bytes",
+            context.len()
+        );
+        assert!(body.ends_with(&context));
+    }
+
+    #[test]
+    fn format_reports_builtin_cleanup_without_formatter() {
+        let mut ed = editor("let x = 1;  \nlet y = 2;\t\n");
+        match ed.format_document() {
+            FormatOutcome::Formatted { external } => assert!(!external),
+            _ => panic!("expected a change"),
+        }
+        assert_eq!(ed.doc.text(), "let x = 1;\nlet y = 2;\n");
+        match ed.format_document() {
+            FormatOutcome::Unchanged { external } => assert!(!external),
+            _ => panic!("expected no change"),
+        }
+    }
+
+    #[test]
+    fn format_reports_read_only() {
+        let mut ed = editor("x\n");
+        ed.doc.readonly = true;
+        assert!(matches!(ed.format_document(), FormatOutcome::ReadOnly));
     }
 }

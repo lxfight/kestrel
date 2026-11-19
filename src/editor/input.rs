@@ -12,9 +12,15 @@ impl Editor {
         for event in events {
             match event {
                 Event::Text(text) => {
+                    // Completion must not react to text delivered while a composition
+                    // is active; the IME owns the keystrokes until it commits.
+                    let composing = !self.ime_preedit.is_empty();
                     self.ime_preedit.clear();
                     self.ime_active_range = None;
                     self.insert_text(&text);
+                    if composing {
+                        self.completion.open = false;
+                    }
                 }
                 Event::Paste(text) => {
                     self.ime_preedit.clear();
@@ -67,10 +73,18 @@ impl Editor {
                     modifiers,
                     ..
                 } => {
-                    // While an IME composition is active, keys belong to the IME.
-                    if self.ime_preedit.is_empty() {
-                        self.handle_key(&ctx, key, modifiers, rows);
+                    // While an IME composition is active keys belong to the IME,
+                    // except Escape: it aborts the composition and still reaches the
+                    // editor so it can dismiss completion / find.
+                    if !self.ime_preedit.is_empty() {
+                        if key != Key::Escape {
+                            continue;
+                        }
+                        self.ime_preedit.clear();
+                        self.ime_active_range = None;
+                        self.ime_interrupt = true;
                     }
+                    self.handle_key(&ctx, key, modifiers, rows);
                 }
                 _ => {}
             }
@@ -288,7 +302,6 @@ impl Editor {
             Key::K if ctrl && shift => self.delete_line(),
             Key::Slash if ctrl => self.toggle_comment(),
             Key::OpenBracket if ctrl && shift => self.toggle_fold_caret(),
-            Key::F if shift && alt && !ctrl => self.format_document(),
             Key::F if ctrl && !shift => {
                 self.open_find(false);
             }
