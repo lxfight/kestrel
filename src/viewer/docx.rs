@@ -633,9 +633,10 @@ fn render_runs(
     }
 }
 
-fn parse_docx_bytes(
-    bytes: &[u8],
-) -> Result<(DocxMeta, Vec<DocxBlock>, HashMap<String, Vec<u8>>, String), String> {
+/// 解析产物：元信息、块序列、图片资源表、纯文本。
+type DocxParsed = (DocxMeta, Vec<DocxBlock>, HashMap<String, Vec<u8>>, String);
+
+fn parse_docx_bytes(bytes: &[u8]) -> Result<DocxParsed, String> {
     let archive = ZipArchive::from_bytes(bytes.to_vec())?;
     let doc_xml = archive.read_entry_string("word/document.xml")?;
 

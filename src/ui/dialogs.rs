@@ -131,7 +131,7 @@ impl KestrelApp {
                                         );
                                     }
                                     icons::paint(
-                                        &ui.painter(),
+                                        ui.painter(),
                                         egui::Rect::from_center_size(
                                             Pos2::new(rect.left() + 14.0, rect.center().y),
                                             Vec2::splat(14.0),
@@ -479,7 +479,7 @@ impl KestrelApp {
         let (hdr, _) =
             ui.allocate_exact_size(Vec2::new(ui.available_width(), 32.0), Sense::hover());
         icons::paint(
-            &ui.painter(),
+            ui.painter(),
             Rect::from_center_size(Pos2::new(hdr.left() + 10.0, hdr.center().y), Vec2::splat(18.0)),
             Icon::Settings,
             theme.accent,
@@ -509,7 +509,7 @@ impl KestrelApp {
                 .rect_filled(close_rect, CornerRadius::same(6), theme.hover);
         }
         icons::paint(
-            &ui.painter(),
+            ui.painter(),
             close_rect.shrink(6.0),
             Icon::Close,
             if close_resp.hovered() {
@@ -600,7 +600,7 @@ impl KestrelApp {
                                         theme.text
                                     };
                                     icons::paint(
-                                        &ui.painter(),
+                                        ui.painter(),
                                         Rect::from_center_size(
                                             Pos2::new(btn_rect.center().x - 24.0, btn_rect.center().y),
                                             Vec2::splat(13.0),
@@ -1073,7 +1073,7 @@ impl KestrelApp {
                                     };
                                     let (r, _) =
                                         ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
-                                    icons::paint(&ui.painter(), r, icon, color, 1.4);
+                                    icons::paint(ui.painter(), r, icon, color, 1.4);
                                     ui.label(
                                         egui::RichText::new(&toast.text)
                                             .font(style.small())

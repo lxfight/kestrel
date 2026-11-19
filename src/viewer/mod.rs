@@ -140,6 +140,7 @@ impl MultimodalViewer {
 }
 
 /// Shared right-aligned pill button helper for multimodal viewer toolbars.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn toolbar_btn(
     ui: &mut Ui,
     style: &UiStyle,

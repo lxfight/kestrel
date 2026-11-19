@@ -154,7 +154,7 @@ impl KestrelApp {
                             Vec2::splat(16.0),
                         );
                         icons::paint(
-                            &ui.painter(),
+                            ui.painter(),
                             icon_rect,
                             match self.palette.mode {
                                 PaletteMode::Commands => Icon::Goforward,
@@ -404,7 +404,7 @@ impl KestrelApp {
         match item {
             PaletteItem::File(path) => {
                 icons::paint_path_icon(
-                    &ui.painter(),
+                    ui.painter(),
                     Rect::from_center_size(Pos2::new(x + 7.0, rect.center().y), Vec2::splat(15.0)),
                     path,
                     false,
@@ -415,7 +415,7 @@ impl KestrelApp {
             }
             PaletteItem::Command(command) => {
                 icons::paint(
-                    &ui.painter(),
+                    ui.painter(),
                     Rect::from_center_size(Pos2::new(x + 7.0, rect.center().y), Vec2::splat(14.0)),
                     command.icon(),
                     if selected {
@@ -438,7 +438,7 @@ impl KestrelApp {
             }
             PaletteItem::PluginCommand(_) => {
                 icons::paint(
-                    &ui.painter(),
+                    ui.painter(),
                     Rect::from_center_size(Pos2::new(x + 7.0, rect.center().y), Vec2::splat(14.0)),
                     Icon::Extensions,
                     if selected {
@@ -469,7 +469,7 @@ impl KestrelApp {
             }
             PaletteItem::Language(_) => {
                 icons::paint(
-                    &ui.painter(),
+                    ui.painter(),
                     Rect::from_center_size(Pos2::new(x + 7.0, rect.center().y), Vec2::splat(14.0)),
                     Icon::FileCode,
                     theme.text_dim,
@@ -479,7 +479,7 @@ impl KestrelApp {
             }
             PaletteItem::Symbol(sym) => {
                 icons::paint(
-                    &ui.painter(),
+                    ui.painter(),
                     Rect::from_center_size(Pos2::new(x + 7.0, rect.center().y), Vec2::splat(14.0)),
                     sym.kind.icon(),
                     theme.accent,
@@ -489,7 +489,7 @@ impl KestrelApp {
             }
             PaletteItem::Branch(_) => {
                 icons::paint(
-                    &ui.painter(),
+                    ui.painter(),
                     Rect::from_center_size(Pos2::new(x + 7.0, rect.center().y), Vec2::splat(14.0)),
                     Icon::GitBranch,
                     theme.accent,

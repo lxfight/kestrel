@@ -267,7 +267,7 @@ impl ImageViewer {
         if self.fit_mode {
             let max_w = (canvas_rect.width() - 40.0).max(40.0);
             let max_h = (canvas_rect.height() - 40.0).max(40.0);
-            self.zoom = (max_w / nat_w).min(max_h / nat_h).min(1.0).max(0.05);
+            self.zoom = (max_w / nat_w).min(max_h / nat_h).clamp(0.05, 1.0);
         }
 
         if canvas_resp.hovered() {

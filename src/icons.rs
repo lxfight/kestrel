@@ -314,13 +314,8 @@ pub fn folder_color(name: &str, default_color: Color32) -> Color32 {
         "assets" | "resources" | "icons" | "images" => Color32::from_rgb(0xE5, 0xC0, 0x7B),
         ".git" | ".github" | ".vscode" => Color32::from_rgb(0xF0, 0x88, 0x3E),
         "target" | "dist" | "build" | "out" | "node_modules" => Color32::from_rgb(0x76, 0x80, 0x94),
-        _ => {
-            if default_color == Color32::TRANSPARENT {
-                Color32::from_rgb(0x8E, 0x9E, 0xB8)
-            } else {
-                Color32::from_rgb(0x8E, 0x9E, 0xB8)
-            }
-        }
+        _ if default_color != Color32::TRANSPARENT => default_color,
+        _ => Color32::from_rgb(0x8E, 0x9E, 0xB8),
     }
 }
 

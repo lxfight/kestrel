@@ -306,11 +306,10 @@ fn run_process(
             };
         }
     };
-    if let Some(mut pipe) = child.stdin.take() {
-        if let Some(input) = stdin {
+    if let Some(mut pipe) = child.stdin.take()
+        && let Some(input) = stdin {
             let _ = pipe.write_all(input.as_bytes());
         }
-    }
     match child.wait_with_output() {
         Ok(output) => ExecDone {
             runtime,

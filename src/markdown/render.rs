@@ -691,7 +691,7 @@ fn render_blockquote(
                 ui.set_width(inner_w);
                 ui.horizontal(|ui| {
                     let (ir, _) = ui.allocate_exact_size(Vec2::splat(15.0), Sense::hover());
-                    icons::paint(&ui.painter(), ir, icon, accent_col, 1.4);
+                    icons::paint(ui.painter(), ir, icon, accent_col, 1.4);
                     let title = custom_title
                         .as_deref()
                         .unwrap_or_else(|| kind.default_title());
@@ -768,7 +768,7 @@ fn render_list(
                     ui.painter()
                         .rect_filled(box_r, CornerRadius::same(3), theme.accent);
                     icons::paint(
-                        &ui.painter(),
+                        ui.painter(),
                         box_r.shrink(2.0),
                         Icon::Check,
                         theme.accent_text,
@@ -1192,8 +1192,6 @@ fn append_inlines(
         },
         valign: if s.sup {
             EguiAlign::TOP
-        } else if s.sub {
-            EguiAlign::BOTTOM
         } else {
             EguiAlign::BOTTOM
         },
@@ -1426,7 +1424,7 @@ fn render_image_card(
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 let (ir, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
-                icons::paint(&ui.painter(), ir, Icon::File, theme.accent, 1.3);
+                icons::paint(ui.painter(), ir, Icon::File, theme.accent, 1.3);
                 ui.label(
                     egui::RichText::new(format!("图片: {label}"))
                         .font(rctx.style.small())

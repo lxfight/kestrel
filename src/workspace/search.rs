@@ -174,8 +174,9 @@ const PREVIEW_CHARS: usize = 160;
 /// Cancellation is re-checked every this many matches inside a file.
 const CANCEL_CHECK_INTERVAL: usize = 200;
 
+#[allow(clippy::too_many_arguments)]
 fn run_search(
-    root: &PathBuf,
+    root: &Path,
     files: &[PathBuf],
     regex: &regex::Regex,
     include: &str,
@@ -207,7 +208,7 @@ fn run_search(
             continue;
         }
         scanned += 1;
-        if scanned % 100 == 0 {
+        if scanned.is_multiple_of(100) {
             let _ = tx.send(SearchEvent::Progress {
                 scanned,
                 matched_files,
@@ -227,7 +228,7 @@ fn run_search(
                 truncated = true;
                 break;
             }
-            if total_matches % CANCEL_CHECK_INTERVAL == 0 && cancel.load(Ordering::Relaxed) {
+            if total_matches.is_multiple_of(CANCEL_CHECK_INTERVAL) && cancel.load(Ordering::Relaxed) {
                 cancelled = true;
                 break;
             }

@@ -12,7 +12,6 @@ use crate::editor::{Editor, EditorStyle};
 use crate::fuzzy;
 use crate::git::{GitFileStatus, GitService};
 use crate::highlight::Language;
-use crate::icons;
 use crate::lsp::OutlineSymbol;
 use crate::plugin::{Event, PluginHost};
 use crate::settings::{Session, Settings, TabSession};
@@ -101,6 +100,7 @@ pub struct TreeEdit {
     pub focus: bool,
 }
 
+#[derive(Default)]
 pub struct SearchPanelState {
     pub query: String,
     pub replacement: String,
@@ -122,30 +122,6 @@ pub struct SearchPanelState {
     pub collapsed: std::collections::HashSet<PathBuf>,
 }
 
-impl Default for SearchPanelState {
-    fn default() -> Self {
-        Self {
-            query: String::new(),
-            replacement: String::new(),
-            show_replace: false,
-            include: String::new(),
-            exclude: String::new(),
-            case_sensitive: false,
-            whole_word: false,
-            regex: false,
-            show_options: false,
-            results: Vec::new(),
-            scanning: false,
-            scanned: 0,
-            matched_files: 0,
-            error: None,
-            last_query: String::new(),
-            last_typed: None,
-            focus: false,
-            collapsed: std::collections::HashSet::new(),
-        }
-    }
-}
 
 pub struct WorkspaceState {
     pub root: Option<PathBuf>,
@@ -532,6 +508,10 @@ impl KestrelApp {
         let Some(ui) = self.dev_ui.clone() else {
             return;
         };
+        // 先打开文件再注入 UI 状态：split / md_split / settings 等状态依赖已有编辑器。
+        if let Ok(path) = std::env::var("KESTREL_DEV_OPEN") {
+            self.open_file(PathBuf::from(path));
+        }
 
         match ui.as_str() {
             "palette" => self.open_palette(PaletteMode::Commands),
@@ -637,9 +617,6 @@ impl KestrelApp {
             "about" => self.dialog = Some(Dialog::About),
             "shortcuts" => self.dialog = Some(Dialog::Shortcuts),
             _ => {}
-        }
-        if let Ok(path) = std::env::var("KESTREL_DEV_OPEN") {
-            self.open_file(PathBuf::from(path));
         }
         if let Ok(query) = std::env::var("KESTREL_DEV_QUERY") {
             self.palette.query = query;
@@ -2047,8 +2024,8 @@ impl KestrelApp {
                     self.active = self.active.min(self.tabs.len().saturating_sub(1));
                 }
                 if let Some(root) = &self.workspace.root {
-                    self.workspace.index.scan(&root);
-                    self.git.refresh(&root);
+                    self.workspace.index.scan(root);
+                    self.git.refresh(root);
                 }
                 self.toast("已删除", ToastKind::Info);
             }
@@ -2430,7 +2407,7 @@ impl KestrelApp {
                     scored.push((score + bonus, idx));
                 }
             }
-            scored.sort_by(|a, b| b.0.cmp(&a.0));
+            scored.sort_by_key(|item| std::cmp::Reverse(item.0));
             scored.truncate(400);
             self.palette.items = scored
                 .iter()
@@ -2476,7 +2453,7 @@ impl KestrelApp {
                     }
                 }
             }
-            scored.sort_by(|a, b| b.0.cmp(&a.0));
+            scored.sort_by_key(|item| std::cmp::Reverse(item.0));
             self.palette.filtered = scored.iter().map(|(_, idx, _)| *idx).collect();
         }
         self.palette.needs_filter = false;
@@ -2805,7 +2782,7 @@ impl KestrelApp {
                     tab.unfold_all();
                 }
             }
-            Command::CommandPalette => self.open_palette(PaletteMode::Commands),
+            Command::ShowPalette => self.open_palette(PaletteMode::Commands),
             Command::QuickOpen => self.open_palette(PaletteMode::QuickOpen),
             Command::ToggleSidebar => self.sidebar.visible = !self.sidebar.visible,
             Command::ToggleTerminal => self.toggle_terminal(),
@@ -3416,8 +3393,6 @@ impl eframe::App for KestrelApp {
         self.dialogs_ui(&ctx);
         self.toasts_ui(&ctx);
         self.handle_window_resize(&ctx);
-
-        let _ = icons::file_color("rs");
     }
 
     fn on_exit(&mut self) {
@@ -3616,7 +3591,7 @@ impl KestrelApp {
 
         let spot = payload
             .as_ref()
-            .and_then(|_| pointer_pos)
+            .and(pointer_pos)
             .and_then(|pos| self.drop_spot_at(pos));
         let target = spot.and_then(|spot| self.drop_preview_target(spot));
         self.update_drop_preview(ctx, target);

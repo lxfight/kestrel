@@ -62,7 +62,7 @@ impl KestrelApp {
                     .margin(Vec2::new(26.0, 4.0)),
             );
             icons::paint(
-                &ui.painter(),
+                ui.painter(),
                 Rect::from_center_size(
                     Pos2::new(resp.rect.left() + 14.0, resp.rect.center().y),
                     Vec2::splat(12.0),
@@ -232,7 +232,7 @@ impl KestrelApp {
                 }
             }
             PanelAction::OpenDir => {
-                crate::workspace::tree::reveal_in_explorer(&self.plugins.root().to_path_buf());
+                crate::workspace::tree::reveal_in_explorer(self.plugins.root());
             }
             PanelAction::Rescan => {
                 self.plugins.rescan(&self.settings);
@@ -283,7 +283,7 @@ fn plugin_row(
         StrokeKind::Inside,
     );
     icons::paint(
-        &ui.painter(),
+        ui.painter(),
         Rect::from_center_size(tile.center(), Vec2::splat(20.0)),
         Icon::Extensions,
         theme.accent,
@@ -416,7 +416,7 @@ fn panel_header_action(
             .rect_filled(rect, CornerRadius::same(5), theme.hover);
     }
     icons::paint(
-        &ui.painter(),
+        ui.painter(),
         rect.shrink(4.0),
         icon,
         if resp.hovered() {
@@ -442,7 +442,7 @@ fn panel_icon_button(
             .rect_filled(rect, CornerRadius::same(4), theme.hover);
     }
     icons::paint(
-        &ui.painter(),
+        ui.painter(),
         rect.shrink(6.0),
         icon,
         if resp.hovered() {

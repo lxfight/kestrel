@@ -309,10 +309,9 @@ fn parse_link_def(lines: &[Line<'_>], idx: usize) -> Option<(String, LinkDef, us
 
     let mut title = None;
     if !after_url.is_empty() {
-        if let Some(t) = extract_quoted_title(after_url) {
+        {
+            let t = extract_quoted_title(after_url)?;
             title = Some(t);
-        } else {
-            return None;
         }
     } else if idx + consumed < lines.len() {
         let next = lines[idx + consumed].text.trim();
@@ -377,13 +376,12 @@ fn parse_blocks(lines: &[Line<'_>], ctx: &mut ParseCtx, depth: usize) -> Vec<Blo
         }
 
         // 2. Collapsible `<details>` block
-        if leading <= 3 && no_indent.to_ascii_lowercase().starts_with("<details") {
-            if let Some((details_block, next_i)) = parse_details_block(lines, i, ctx, depth) {
+        if leading <= 3 && no_indent.to_ascii_lowercase().starts_with("<details")
+            && let Some((details_block, next_i)) = parse_details_block(lines, i, ctx, depth) {
                 blocks.push(details_block);
                 i = next_i;
                 continue;
             }
-        }
 
         // 3. Fenced Code Block (``` or ~~~)
         if leading <= 3
@@ -614,13 +612,12 @@ fn parse_blocks(lines: &[Line<'_>], ctx: &mut ParseCtx, depth: usize) -> Vec<Blo
         }
 
         // 11. Simple HTML Block (`<hr>`, `<p align=...>`, `<h1..h6>`, `<blockquote>`, `<pre>`, `<img>`, `<br>`)
-        if leading <= 3 && no_indent.starts_with('<') && !no_indent.starts_with("<http") {
-            if let Some((html_block, next_i)) = try_parse_html_block(lines, i, ctx) {
+        if leading <= 3 && no_indent.starts_with('<') && !no_indent.starts_with("<http")
+            && let Some((html_block, next_i)) = try_parse_html_block(lines, i, ctx) {
                 blocks.push(html_block);
                 i = next_i;
                 continue;
             }
-        }
 
         // 12. Definition List (`Term` followed by `: Definition`)
         if i + 1 < lines.len() && lines[i + 1].text.trim_start().starts_with(": ") {
@@ -681,11 +678,7 @@ fn parse_blocks(lines: &[Line<'_>], ctx: &mut ParseCtx, depth: usize) -> Vec<Blo
 fn parse_paragraph_inlines(lines: &[&str], ctx: &mut ParseCtx) -> Vec<Inline> {
     let mut out = Vec::new();
     for (idx, line) in lines.iter().enumerate() {
-        let trimmed_start = if idx == 0 {
-            line.trim_start()
-        } else {
-            line.trim_start()
-        };
+        let trimmed_start = line.trim_start();
         let hard_spaces = line.ends_with("  ");
         let hard_slash = trimmed_start.ends_with('\\') && !trimmed_start.ends_with("\\\\");
         let clean = if hard_slash {
@@ -938,12 +931,12 @@ fn parse_definition_list(
             definitions.push(parse_blocks(&def_lines, ctx, depth + 1));
         }
         items.push(DefItem { term, definitions });
-        while i < lines.len() && lines[i].text.trim().is_empty() {
-            if i + 2 < lines.len() && lines[i + 2].text.trim_start().starts_with(": ") {
-                i += 1;
-                break;
-            }
-            break;
+        if i < lines.len()
+            && lines[i].text.trim().is_empty()
+            && i + 2 < lines.len()
+            && lines[i + 2].text.trim_start().starts_with(": ")
+        {
+            i += 1;
         }
     }
 
@@ -1718,12 +1711,12 @@ fn parse_inline_math(input: &str, start: usize) -> Option<(String, usize)> {
     None
 }
 
-fn find_delim_span<'a>(
-    input: &'a str,
+fn find_delim_span(
+    input: &str,
     start: usize,
     marker: u8,
     max_run: usize,
-) -> Option<(&'a str, usize, usize)> {
+) -> Option<(&str, usize, usize)> {
     let bytes = input.as_bytes();
     for run in (1..=max_run).rev() {
         let content_start = start + run;
@@ -1768,7 +1761,7 @@ fn find_delim_span<'a>(
     None
 }
 
-fn find_double_delim<'a>(input: &'a str, start: usize, marker: u8) -> Option<(&'a str, usize)> {
+fn find_double_delim(input: &str, start: usize, marker: u8) -> Option<(&str, usize)> {
     let bytes = input.as_bytes();
     let content_start = start + 2;
     if content_start >= bytes.len() || bytes[content_start].is_ascii_whitespace() {
@@ -1780,21 +1773,20 @@ fn find_double_delim<'a>(input: &'a str, start: usize, marker: u8) -> Option<(&'
             i += 2;
             continue;
         }
-        if bytes[i] == marker && bytes[i + 1] == marker && i > content_start {
-            if !bytes[i - 1].is_ascii_whitespace() {
+        if bytes[i] == marker && bytes[i + 1] == marker && i > content_start
+            && !bytes[i - 1].is_ascii_whitespace() {
                 return Some((&input[content_start..i], i + 2));
             }
-        }
         i += 1;
     }
     None
 }
 
-fn find_single_inline_delim<'a>(
-    input: &'a str,
+fn find_single_inline_delim(
+    input: &str,
     start: usize,
     marker: u8,
-) -> Option<(&'a str, usize)> {
+) -> Option<(&str, usize)> {
     let bytes = input.as_bytes();
     let content_start = start + 1;
     if content_start >= bytes.len() || bytes[content_start].is_ascii_whitespace() {
@@ -2083,11 +2075,10 @@ fn parse_angle_or_html(
     if tag_lower == "br" || tag_lower == "br/" || tag_lower == "br /" {
         return Some((Some(Inline::HardBreak), tag_end));
     }
-    if tag_lower.starts_with("img ") || tag_lower.starts_with("img\t") {
-        if let Some(img) = parse_html_img_tag(&input[start..tag_end]) {
+    if (tag_lower.starts_with("img ") || tag_lower.starts_with("img\t"))
+        && let Some(img) = parse_html_img_tag(&input[start..tag_end]) {
             return Some((Some(img), tag_end));
         }
-    }
 
     let tag_name = tag_lower
         .split([' ', '\t', '/'])

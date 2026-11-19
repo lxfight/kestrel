@@ -103,7 +103,7 @@ impl KestrelApp {
 
         // Terminal instance selector pills when on Terminal tab
         let mut switch_term = None;
-        if self.bottom.tab == BottomTab::Terminal && self.bottom.terminals.len() > 0 {
+        if self.bottom.tab == BottomTab::Terminal && !self.bottom.terminals.is_empty() {
             tab_x += 8.0;
             for (idx, term) in self.bottom.terminals.iter().enumerate() {
                 let active = idx == self.bottom.active_terminal;
@@ -167,7 +167,7 @@ impl KestrelApp {
                     .rect_filled(r, CornerRadius::same(5), theme.hover);
             }
             icons::paint(
-                &ui.painter(),
+                ui.painter(),
                 r.shrink(4.0),
                 icon,
                 if resp.hovered() {
@@ -324,7 +324,7 @@ impl KestrelApp {
                         DiagSeverity::Info => (Icon::Info, theme.accent),
                     };
                     icons::paint(
-                        &ui.painter(),
+                        ui.painter(),
                         Rect::from_center_size(
                             Pos2::new(row.left() + 18.0, row.center().y),
                             Vec2::splat(14.0),

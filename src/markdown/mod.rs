@@ -106,6 +106,7 @@ pub struct ListItem {
 }
 
 #[derive(Clone, Debug)]
+#[allow(clippy::enum_variant_names)] // CodeBlock / MathBlock / HtmlBlock 与 Markdown AST 术语一致
 pub enum Block {
     Heading {
         level: u8,

@@ -13,12 +13,12 @@ pub fn quick_score(query: &str, text: &str) -> Option<i32> {
         return Some(0);
     }
     let mut score = 0i32;
-    let mut text_chars = text.char_indices().peekable();
+    let text_chars = text.char_indices().peekable();
     let query_chars: Vec<char> = query.chars().flat_map(|c| c.to_lowercase()).collect();
     let mut qi = 0;
     let mut last_match: Option<usize> = None;
     let mut prev_char: Option<char> = None;
-    while let Some((idx, ch)) = text_chars.next() {
+    for (idx, ch) in text_chars {
         if qi >= query_chars.len() {
             break;
         }
@@ -95,11 +95,11 @@ pub fn fuzzy_match(query: &str, text: &str) -> Option<FuzzyMatch> {
             }
             let mut best_prev = NEG;
             let mut best_k = usize::MAX;
-            for k in 0..j {
-                if best[i - 1][k] <= NEG {
+            for (k, prev) in best[i - 1].iter().take(j).enumerate() {
+                if *prev <= NEG {
                     continue;
                 }
-                let mut score = best[i - 1][k] + 10;
+                let mut score = *prev + 10;
                 if k + 1 == j {
                     score += 12;
                 }
@@ -120,9 +120,9 @@ pub fn fuzzy_match(query: &str, text: &str) -> Option<FuzzyMatch> {
 
     let mut end = usize::MAX;
     let mut score = NEG;
-    for j in 0..m {
-        if best[n - 1][j] > score {
-            score = best[n - 1][j];
+    for (j, value) in best[n - 1].iter().enumerate().take(m) {
+        if *value > score {
+            score = *value;
             end = j;
         }
     }

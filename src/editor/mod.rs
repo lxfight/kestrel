@@ -51,6 +51,7 @@ impl EditorStyle {
     }
 }
 
+#[derive(Default)]
 pub struct FindState {
     pub open: bool,
     pub show_replace: bool,
@@ -67,25 +68,6 @@ pub struct FindState {
     pub last_version: u64,
 }
 
-impl Default for FindState {
-    fn default() -> Self {
-        Self {
-            open: false,
-            show_replace: false,
-            query: String::new(),
-            replacement: String::new(),
-            case_sensitive: false,
-            whole_word: false,
-            regex: false,
-            matches: Vec::new(),
-            active: None,
-            error: None,
-            focus_query: false,
-            focus_replacement: false,
-            last_version: 0,
-        }
-    }
-}
 
 #[derive(Default)]
 pub struct CompletionState {

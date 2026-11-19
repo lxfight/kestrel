@@ -216,12 +216,11 @@ impl Plugin {
         let result = (|| -> mlua::Result<()> {
             let table = lua.create_table()?;
             table.set("name", event.name())?;
-            if let Some(subject) = ctx.subject {
-                if let Some(snapshot) = ctx.docs.get(&subject) {
+            if let Some(subject) = ctx.subject
+                && let Some(snapshot) = ctx.docs.get(&subject) {
                     let handle = api::DocHandle::new(snapshot.clone(), shared.clone());
                     table.set("doc", lua.create_userdata(handle)?)?;
                 }
-            }
             let keys: Vec<&RegistryKey> = self
                 .handlers
                 .get(&event)

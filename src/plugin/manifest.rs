@@ -118,11 +118,10 @@ fn validate(manifest: &mut Manifest, dir: &Path) -> Result<(), String> {
             manifest.api_version
         ));
     }
-    if let Some(main) = &manifest.main {
-        if !dir.join(main).is_file() {
+    if let Some(main) = &manifest.main
+        && !dir.join(main).is_file() {
             return Err(format!("入口文件不存在: {main}"));
         }
-    }
     for event in &manifest.events {
         if !event_name_known(event) {
             return Err(format!("未知事件: {event}"));

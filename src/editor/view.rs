@@ -111,8 +111,8 @@ impl Editor {
         let alt_held = ui.input(|i| i.modifiers.alt);
         let ctrl_held = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
 
-        if pointer_pressed && response.contains_pointer() {
-            if let Some(pos) = response.interact_pointer_pos() {
+        if pointer_pressed && response.contains_pointer()
+            && let Some(pos) = response.interact_pointer_pos() {
                 // Check if user clicked the fold chevron column in the gutter.
                 let clicked_line = (((pos.y - rect.top() + self.scroll_y - PAD_TOP) / line_h)
                     .floor() as isize)
@@ -146,28 +146,24 @@ impl Editor {
                     self.completion.open = false;
                 }
             }
-        }
-        if self.dragging_selection && response.is_pointer_button_down_on() {
-            if let Some(pos) = response.interact_pointer_pos() {
+        if self.dragging_selection && response.is_pointer_button_down_on()
+            && let Some(pos) = response.interact_pointer_pos() {
                 self.caret = self.pos_to_char(ui, style, rect, pos, text_left);
                 self.ensure_visible = true;
             }
-        }
         if !ui.input(|i| i.pointer.primary_down()) {
             self.dragging_selection = false;
         }
-        if response.double_clicked() {
-            if let Some(pos) = response.interact_pointer_pos() {
+        if response.double_clicked()
+            && let Some(pos) = response.interact_pointer_pos() {
                 let ch = self.pos_to_char(ui, style, rect, pos, text_left);
                 self.select_word_at(ch);
             }
-        }
-        if response.triple_clicked() {
-            if let Some(pos) = response.interact_pointer_pos() {
+        if response.triple_clicked()
+            && let Some(pos) = response.interact_pointer_pos() {
                 let ch = self.pos_to_char(ui, style, rect, pos, text_left);
                 self.select_line_at(ch);
             }
-        }
 
         // ---- keyboard ----
         if focused {
@@ -215,13 +211,12 @@ impl Editor {
             let sb_id = ui.scope_id().with(("v_scroll", self.id));
             let sb = ui.interact(scrollbar_rect, sb_id, Sense::click_and_drag());
             let thumb_h = ((view_h / total_h) * view_h).clamp(30.0, view_h);
-            if sb.dragged() || sb.clicked() {
-                if let Some(pos) = sb.interact_pointer_pos() {
+            if (sb.dragged() || sb.clicked())
+                && let Some(pos) = sb.interact_pointer_pos() {
                     let travel = (view_h - thumb_h).max(1.0);
                     let t = ((pos.y - rect.top() - thumb_h * 0.5) / travel).clamp(0.0, 1.0);
                     self.scroll_y = t * max_scroll;
                 }
-            }
             let thumb_y = rect.top() + (self.scroll_y / max_scroll.max(1.0)) * (view_h - thumb_h);
             let thumb = Rect::from_min_size(
                 Pos2::new(scrollbar_rect.right() - 8.0, thumb_y),
@@ -980,12 +975,10 @@ impl Editor {
         }
 
         // Sticky Scroll header (top of editor canvas)
-        if style.show_sticky_scroll && first > 0 {
-            if let Some(enclosing) = self
+        if style.show_sticky_scroll && first > 0
+            && let Some(enclosing) = self
                 .symbols
-                .iter()
-                .filter(|s| s.start_line < first && s.end_line > first)
-                .next_back()
+                .iter().rfind(|s| s.start_line < first && s.end_line > first)
                 .cloned()
             {
                 let sticky_rect = Rect::from_min_size(
@@ -1018,7 +1011,6 @@ impl Editor {
                     theme.text_dim,
                 );
             }
-        }
 
         // Minimap
         if style.show_minimap {
@@ -1049,7 +1041,7 @@ impl Editor {
         let line_count = self.doc.line_count().max(1);
         let rows = ((mm.height() / 2.2) as usize).clamp(1, 380).min(line_count);
         let step = (line_count as f32 / rows as f32).max(1.0);
-        let row_h = (mm.height() / rows as f32).max(1.6).min(3.2);
+        let row_h = (mm.height() / rows as f32).clamp(1.6, 3.2);
         let content_h = (rows as f32 * row_h).min(mm.height()).max(1.0);
         let tab = style.tab_size.max(1);
 
@@ -1303,7 +1295,7 @@ impl Editor {
                                 Vec2::splat(14.0),
                             );
                             icons::paint(
-                                &ui.painter(),
+                                ui.painter(),
                                 icon_rect,
                                 item.kind.icon(),
                                 theme.accent,
@@ -1537,7 +1529,7 @@ fn find_icon_button(
     } else {
         theme.text_dim
     };
-    icons::paint(&ui.painter(), rect.shrink(4.0), icon, color, 1.3);
+    icons::paint(ui.painter(), rect.shrink(4.0), icon, color, 1.3);
     resp.on_hover_text(tip).clicked()
 }
 

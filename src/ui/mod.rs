@@ -199,7 +199,7 @@ impl KestrelApp {
             Vec2::splat(14.0),
         );
         icons::paint(
-            &ui.painter(),
+            ui.painter(),
             search_icon,
             Icon::Search,
             theme.text_dim,
@@ -246,7 +246,7 @@ impl KestrelApp {
                 .rect_filled(close_rect, 0.0, Color32::from_rgb(0xC4, 0x2B, 0x1C));
         }
         icons::paint(
-            &ui.painter(),
+            ui.painter(),
             Rect::from_center_size(close_rect.center(), Vec2::splat(13.0)),
             Icon::Close,
             if close_resp.hovered() {
@@ -368,7 +368,7 @@ impl KestrelApp {
                 }
             }
             icons::paint(
-                &ui.painter(),
+                ui.painter(),
                 r.shrink(5.5),
                 icon,
                 if active { theme.accent } else { theme.text_dim },
@@ -507,7 +507,7 @@ impl KestrelApp {
                 ui,
                 style,
                 &[
-                    Command::CommandPalette,
+                    Command::ShowPalette,
                     Command::QuickOpen,
                     Command::ShowExplorer,
                     Command::ShowSearch,
@@ -569,7 +569,7 @@ impl KestrelApp {
                 .rect_filled(rect, CornerRadius::same(4), theme.hover);
         }
         icons::paint(
-            &ui.painter(),
+            ui.painter(),
             Rect::from_center_size(Pos2::new(rect.left() + 13.0, rect.center().y), Vec2::splat(14.0)),
             command.icon(),
             if response.hovered() {
@@ -651,7 +651,7 @@ impl KestrelApp {
                 );
             }
             icons::paint(
-                &ui.painter(),
+                ui.painter(),
                 Rect::from_center_size(r.center(), Vec2::splat(20.0)),
                 icon,
                 if selected {
@@ -1305,7 +1305,7 @@ impl KestrelApp {
                     .rect_filled(r, CornerRadius::same(5), theme.hover);
             }
             icons::paint(
-                &ui.painter(),
+                ui.painter(),
                 r.shrink(4.0),
                 icon,
                 if resp.hovered() {
@@ -1508,9 +1508,7 @@ impl KestrelApp {
         let caret_line = editor.doc.char_to_line(editor.caret);
         let active_symbol = editor
             .symbols
-            .iter()
-            .filter(|s| caret_line >= s.start_line && caret_line <= s.end_line)
-            .next_back()
+            .iter().rfind(|s| caret_line >= s.start_line && caret_line <= s.end_line)
             .cloned();
 
         let mut x = rect.left() + 14.0;
@@ -1519,7 +1517,7 @@ impl KestrelApp {
                 let chevron =
                     Rect::from_center_size(Pos2::new(x + 5.0, rect.center().y), Vec2::splat(11.0));
                 icons::paint(
-                    &ui.painter(),
+                    ui.painter(),
                     chevron,
                     Icon::ChevronRight,
                     theme.text_faint,
@@ -1533,9 +1531,9 @@ impl KestrelApp {
                     Vec2::splat(13.0),
                 );
                 if let Some(p) = &editor.doc.path {
-                    icons::paint_path_icon(&ui.painter(), icon_rect, p, false, false, theme.text_dim);
+                    icons::paint_path_icon(ui.painter(), icon_rect, p, false, false, theme.text_dim);
                 } else {
-                    icons::file_glyph(&ui.painter(), icon_rect, theme.text_dim, false, false);
+                    icons::file_glyph(ui.painter(), icon_rect, theme.text_dim, false, false);
                 }
                 x += 16.0;
             }
@@ -1565,7 +1563,7 @@ impl KestrelApp {
             let chevron =
                 Rect::from_center_size(Pos2::new(x + 5.0, rect.center().y), Vec2::splat(11.0));
             icons::paint(
-                &ui.painter(),
+                ui.painter(),
                 chevron,
                 Icon::ChevronRight,
                 theme.text_faint,
@@ -1589,7 +1587,7 @@ impl KestrelApp {
                     .rect_filled(sym_rect, CornerRadius::same(4), theme.hover);
             }
             icons::paint(
-                &ui.painter(),
+                ui.painter(),
                 Rect::from_center_size(Pos2::new(x + 8.0, rect.center().y), Vec2::splat(13.0)),
                 sym.kind.icon(),
                 theme.accent,
@@ -1716,9 +1714,7 @@ impl KestrelApp {
         tab_idx: usize,
         pane_tag: &str,
     ) -> Option<crate::editor::EditorEvent> {
-        let Some(tab) = self.tabs.get(tab_idx) else {
-            return None;
-        };
+        let tab = self.tabs.get(tab_idx)?;
         if let Some(diff_id) = tab.diff.as_ref().map(|_| tab.id) {
             let mut action = crate::diff::DiffAction::None;
             if let Some(ed) = self.tabs.get_mut(tab_idx)
@@ -1946,11 +1942,10 @@ impl KestrelApp {
                                 ui.ctx().request_repaint();
                             }
                         }
-                    } else if hold_source {
-                        if let Some(ed) = self.tabs.get_mut(tab_idx) {
+                    } else if hold_source
+                        && let Some(ed) = self.tabs.get_mut(tab_idx) {
                             ed.md_preview.hold_source_sync = false;
                         }
-                    }
                 }
 
                 ui.advance_cursor_after_rect(avail);
@@ -2001,7 +1996,7 @@ impl KestrelApp {
         // 1. Git Branch indicator (clickable to switch branch)
         if self.git.snapshot.is_repo && !self.git.snapshot.branch.is_empty() {
             let icon_r = Rect::from_center_size(Pos2::new(x + 7.0, rect.center().y), Vec2::splat(13.0));
-            icons::paint(&ui.painter(), icon_r, Icon::GitBranch, theme.accent, 1.2);
+            icons::paint(ui.painter(), icon_r, Icon::GitBranch, theme.accent, 1.2);
             x += 16.0;
             let branch_label = if self.git.snapshot.changes.is_empty() {
                 self.git.snapshot.branch.clone()
@@ -2062,7 +2057,7 @@ impl KestrelApp {
         let diag_start_x = x;
         let er_r = Rect::from_center_size(Pos2::new(x + 6.0, rect.center().y), Vec2::splat(12.0));
         icons::paint(
-            &ui.painter(),
+            ui.painter(),
             er_r,
             Icon::Error,
             if err_count > 0 {
@@ -2087,7 +2082,7 @@ impl KestrelApp {
         x += 8.0;
         let wn_r = Rect::from_center_size(Pos2::new(x + 6.0, rect.center().y), Vec2::splat(12.0));
         icons::paint(
-            &ui.painter(),
+            ui.painter(),
             wn_r,
             Icon::Warning,
             if warn_count > 0 {
@@ -2196,9 +2191,9 @@ impl KestrelApp {
             } else if editor.diff.is_some() {
                 item(ui, "Git 差异", theme.text_dim);
             } else {
-                language_rect = Some(item(ui, &editor.language.name(), theme.text_dim));
+                language_rect = Some(item(ui, editor.language.name(), theme.text_dim));
                 active_language = Some(editor.language);
-                item(ui, &editor.doc.eol.as_str(), theme.text_faint);
+                item(ui, editor.doc.eol.as_str(), theme.text_faint);
                 item(ui, editor.doc.encoding.as_str(), theme.text_faint);
                 item(
                     ui,
@@ -2227,8 +2222,8 @@ impl KestrelApp {
                 pos_rect = Some(item(ui, &pos, theme.text_dim));
             }
         }
-        if let Some(z_rect) = zoom_rect {
-            if ui
+        if let Some(z_rect) = zoom_rect
+            && ui
                 .interact(
                     z_rect.expand2(Vec2::new(4.0, 4.0)),
                     ui.scope_id().with("status_zoom_reset"),
@@ -2240,9 +2235,8 @@ impl KestrelApp {
                 let ctx = ui.ctx().clone();
                 self.set_ui_zoom(1.0, &ctx);
             }
-        }
-        if let Some(p_rect) = pos_rect {
-            if ui
+        if let Some(p_rect) = pos_rect
+            && ui
                 .interact(
                     p_rect.expand2(Vec2::new(4.0, 4.0)),
                     ui.scope_id().with("status_goto_line"),
@@ -2253,7 +2247,6 @@ impl KestrelApp {
             {
                 self.open_palette(PaletteMode::GotoLine);
             }
-        }
         if let Some(lang_rect) = language_rect
             && let Some(language) = active_language
         {
@@ -2296,11 +2289,10 @@ impl KestrelApp {
                     ui.scope_id().with(("status_plugin", index)),
                     Sense::click(),
                 );
-                if resp.clicked() {
-                    if let Some(command_index) = self.plugins.command_index_of_id(&command) {
+                if resp.clicked()
+                    && let Some(command_index) = self.plugins.command_index_of_id(&command) {
                         self.run_plugin_command(command_index);
                     }
-                }
             }
         }
     }
@@ -2432,7 +2424,7 @@ impl KestrelApp {
                         .rect_filled(row, CornerRadius::same(5), theme.hover);
                 }
                 icons::paint_path_icon(
-                    &ui.painter(),
+                    ui.painter(),
                     Rect::from_center_size(
                         Pos2::new(row.left() + 14.0, row.center().y),
                         Vec2::splat(14.0),
@@ -2540,7 +2532,7 @@ impl KestrelApp {
             theme.warning.gamma_multiply(0.16),
         );
         icons::paint(
-            &ui.painter(),
+            ui.painter(),
             badge.shrink(9.0),
             Icon::Warning,
             theme.warning,

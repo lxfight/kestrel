@@ -1,7 +1,7 @@
 //! Sidebar panels: Explorer (with Open Editors & Outline), Project Search & Replace,
 //! Source Control (Git), and Symbol Outline.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use egui::text::LayoutJob;
@@ -68,7 +68,7 @@ impl KestrelApp {
                         .rect_filled(r, CornerRadius::same(5), theme.hover);
                 }
                 icons::paint(
-                    &ui.painter(),
+                    ui.painter(),
                     r.shrink(4.0),
                     icon,
                     if resp.hovered() {
@@ -230,7 +230,7 @@ impl KestrelApp {
                 egui::StrokeKind::Inside,
             );
             if !pointer_down {
-                move_tree = Some((src.clone(), root_path.clone()));
+                move_tree = Some((src.clone(), root_path.to_path_buf()));
             }
         }
         let mut commit_edit = false;
@@ -348,7 +348,7 @@ impl KestrelApp {
                     let expanded = self.workspace.tree.is_expanded(&row.path);
                     if row.is_dir {
                         icons::paint(
-                            &ui.painter(),
+                            ui.painter(),
                             chevron_rect,
                             if expanded {
                                 Icon::ChevronDown
@@ -364,7 +364,7 @@ impl KestrelApp {
                         Vec2::splat(15.0),
                     );
                     icons::paint_path_icon(
-                        &ui.painter(),
+                        ui.painter(),
                         icon_rect,
                         &row.path,
                         row.is_dir,
@@ -481,7 +481,7 @@ impl KestrelApp {
                     let parent_dir = row_path
                         .parent()
                         .map(|p| p.to_path_buf())
-                        .unwrap_or_else(|| root_path.clone());
+                        .unwrap_or_else(|| root_path.to_path_buf());
                     let target_dir = if is_dir {
                         row_path.clone()
                     } else {
@@ -874,26 +874,26 @@ impl KestrelApp {
     fn root_context_menu(
         ui: &mut Ui,
         style: &UiStyle,
-        root_path: &PathBuf,
+        root_path: &Path,
         has_clipboard: bool,
         context_action: &mut Option<TreeContext>,
     ) {
         ui.set_width(212.0);
         if Self::context_item(ui, style, Icon::NewFile, "新建文件", None) {
-            *context_action = Some(TreeContext::NewFile(root_path.clone()));
+            *context_action = Some(TreeContext::NewFile(root_path.to_path_buf()));
             ui.close();
         }
         if Self::context_item(ui, style, Icon::NewFolder, "新建文件夹", None) {
-            *context_action = Some(TreeContext::NewFolder(root_path.clone()));
+            *context_action = Some(TreeContext::NewFolder(root_path.to_path_buf()));
             ui.close();
         }
         if has_clipboard && Self::context_item(ui, style, Icon::Plus, "粘贴", None) {
-            *context_action = Some(TreeContext::Paste(root_path.clone()));
+            *context_action = Some(TreeContext::Paste(root_path.to_path_buf()));
             ui.close();
         }
         ui.separator();
         if Self::context_item(ui, style, Icon::Terminal, "在集成终端中打开", None) {
-            *context_action = Some(TreeContext::OpenInTerminal(root_path.clone()));
+            *context_action = Some(TreeContext::OpenInTerminal(root_path.to_path_buf()));
             ui.close();
         }
         if Self::context_item(ui, style, Icon::Refresh, "刷新资源管理器", None) {
@@ -906,11 +906,11 @@ impl KestrelApp {
         }
         ui.separator();
         if Self::context_item(ui, style, Icon::Copy, "复制工作区路径", None) {
-            *context_action = Some(TreeContext::CopyPath(root_path.clone()));
+            *context_action = Some(TreeContext::CopyPath(root_path.to_path_buf()));
             ui.close();
         }
         if Self::context_item(ui, style, Icon::FolderOpen, "在资源管理器中显示", None) {
-            *context_action = Some(TreeContext::Reveal(root_path.clone()));
+            *context_action = Some(TreeContext::Reveal(root_path.to_path_buf()));
             ui.close();
         }
     }
@@ -937,7 +937,7 @@ impl KestrelApp {
             Stroke::new(1.0, theme.border),
         );
         icons::paint(
-            &ui.painter(),
+            ui.painter(),
             Rect::from_center_size(Pos2::new(rect.left() + 12.0, rect.center().y), Vec2::splat(12.0)),
             if *expanded {
                 Icon::ChevronDown
@@ -985,7 +985,7 @@ impl KestrelApp {
                 .rect_filled(rect, CornerRadius::same(4), theme.hover);
         }
         icons::paint(
-            &ui.painter(),
+            ui.painter(),
             Rect::from_center_size(Pos2::new(rect.left() + 13.0, rect.center().y), Vec2::splat(14.0)),
             icon,
             if resp.hovered() {
@@ -1112,7 +1112,7 @@ impl KestrelApp {
                         );
                         if is_diff {
                             icons::paint(
-                                &ui.painter(),
+                                ui.painter(),
                                 icon_rect,
                                 Icon::GitCompare,
                                 theme.accent,
@@ -1120,7 +1120,7 @@ impl KestrelApp {
                             );
                         } else if let Some(p) = &path {
                             icons::paint_path_icon(
-                                &ui.painter(),
+                                ui.painter(),
                                 icon_rect,
                                 p,
                                 false,
@@ -1129,7 +1129,7 @@ impl KestrelApp {
                             );
                         } else {
                             icons::file_glyph(
-                                &ui.painter(),
+                                ui.painter(),
                                 icon_rect,
                                 theme.text_dim,
                                 false,
@@ -1150,7 +1150,7 @@ impl KestrelApp {
                         );
                         if pinned {
                             icons::paint(
-                                &ui.painter(),
+                                ui.painter(),
                                 Rect::from_center_size(
                                     Pos2::new(rect.right() - 28.0, rect.center().y),
                                     Vec2::splat(12.0),
@@ -1172,7 +1172,7 @@ impl KestrelApp {
                                 Vec2::splat(16.0),
                             );
                             icons::paint(
-                                &ui.painter(),
+                                ui.painter(),
                                 close_rect.shrink(3.0),
                                 Icon::Close,
                                 theme.text_dim,
@@ -1506,12 +1506,12 @@ impl KestrelApp {
             .id_salt("search_results")
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
-                let mut rendered = 0usize;
-                for result in &self.workspace.search_panel.results {
+                for (rendered, result) in
+                    self.workspace.search_panel.results.iter().enumerate()
+                {
                     if rendered > 400 {
                         break;
                     }
-                    rendered += 1;
                     let rel = root
                         .as_ref()
                         .and_then(|r| result.path.strip_prefix(r).ok())
@@ -1530,7 +1530,7 @@ impl KestrelApp {
                         ui.painter().rect_filled(rect, 0.0, theme.hover);
                     }
                     icons::paint(
-                        &ui.painter(),
+                        ui.painter(),
                         Rect::from_center_size(
                             Pos2::new(rect.left() + 15.0, rect.center().y),
                             Vec2::splat(12.0),
@@ -1544,7 +1544,7 @@ impl KestrelApp {
                         1.1,
                     );
                     icons::paint_path_icon(
-                        &ui.painter(),
+                        ui.painter(),
                         Rect::from_center_size(
                             Pos2::new(rect.left() + 31.0, rect.center().y),
                             Vec2::splat(14.0),
@@ -1619,11 +1619,10 @@ impl KestrelApp {
                     }
                 }
             });
-        if let Some(path) = toggle_file {
-            if !self.workspace.search_panel.collapsed.remove(&path) {
+        if let Some(path) = toggle_file
+            && !self.workspace.search_panel.collapsed.remove(&path) {
                 self.workspace.search_panel.collapsed.insert(path);
             }
-        }
         if let Some((path, offset)) = open_at {
             self.open_file_at(path, offset);
         }
@@ -3158,7 +3157,7 @@ impl KestrelApp {
                         let chevron_hovered =
                             pointer_pos.is_some_and(|pos| chevron_rect.contains(pos));
                         icons::paint(
-                            &ui.painter(),
+                            ui.painter(),
                             chevron_rect.shrink(2.0),
                             chevron,
                             if chevron_hovered {
@@ -3170,7 +3169,7 @@ impl KestrelApp {
                         );
                     }
                     icons::paint(
-                        &ui.painter(),
+                        ui.painter(),
                         Rect::from_center_size(
                             Pos2::new(row.left() + indent + 19.0, row.center().y),
                             Vec2::splat(14.0),
@@ -3214,11 +3213,10 @@ impl KestrelApp {
                 }
             });
 
-        if let Some(offset) = toggle {
-            if !self.sidebar.outline_collapsed.remove(&offset) {
+        if let Some(offset) = toggle
+            && !self.sidebar.outline_collapsed.remove(&offset) {
                 self.sidebar.outline_collapsed.insert(offset);
             }
-        }
         if let Some(byte_offset) = jump_to
             && let Some(editor) = self.tabs.get_mut(self.active)
         {
@@ -3270,7 +3268,7 @@ fn sidebar_icon_toggle(
             .rect_filled(rect, CornerRadius::same(4), theme.hover);
     }
     icons::paint(
-        &ui.painter(),
+        ui.painter(),
         rect.shrink(4.0),
         icon,
         if active {

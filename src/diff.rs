@@ -673,8 +673,10 @@ fn fallback_ops(left: &[&str], right: &[&str]) -> Vec<Op> {
     ops
 }
 
-/// Word-level highlight ranges for a pair of replaced lines (character based).
-fn word_diff(left: &str, right: &str) -> (Option<(u32, u32)>, Option<(u32, u32)>) {
+/// Highlight ranges for the changed middle of a replaced line pair.
+type WordRanges = (Option<(u32, u32)>, Option<(u32, u32)>);
+
+fn word_diff(left: &str, right: &str) -> WordRanges {
     let a: Vec<char> = left.chars().collect();
     let b: Vec<char> = right.chars().collect();
     let mut prefix = 0;
@@ -801,7 +803,7 @@ pub fn diff_ui(
                     .rect_filled(rect, CornerRadius::same(5), theme.hover);
             }
             icons::paint(
-                &ui.painter(),
+                ui.painter(),
                 rect.shrink(4.0),
                 icon,
                 if !enabled {
@@ -830,18 +832,16 @@ pub fn diff_ui(
     let data = tab.data.as_ref();
     let change_count = data.map(FileDiff::change_count).unwrap_or(0);
     let has_changes = change_count > 0;
-    if icon_action(ui, &mut ax, Icon::ArrowDown, "下一个更改", has_changes) {
-        if let Some(data) = &tab.data {
+    if icon_action(ui, &mut ax, Icon::ArrowDown, "下一个更改", has_changes)
+        && let Some(data) = &tab.data {
             tab.current_change = (tab.current_change + 1) % data.changes.len();
             tab.pending_scroll_row = data.changes.get(tab.current_change).copied();
         }
-    }
-    if icon_action(ui, &mut ax, Icon::ArrowUp, "上一个更改", has_changes) {
-        if let Some(data) = &tab.data {
+    if icon_action(ui, &mut ax, Icon::ArrowUp, "上一个更改", has_changes)
+        && let Some(data) = &tab.data {
             tab.current_change = (tab.current_change + data.changes.len() - 1) % data.changes.len();
             tab.pending_scroll_row = data.changes.get(tab.current_change).copied();
         }
-    }
     if has_changes {
         ui.painter().text(
             Pos2::new(ax - 6.0, header.center().y),
@@ -1022,7 +1022,7 @@ pub fn diff_ui(
                     ui,
                     &painter,
                     data,
-                    &tab,
+                    tab,
                     &layout,
                     row_index,
                     y,
@@ -1046,7 +1046,7 @@ pub fn diff_ui(
                     ui,
                     &painter,
                     data,
-                    &tab,
+                    tab,
                     left_rect,
                     gutter_w,
                     row_index,
@@ -1061,7 +1061,7 @@ pub fn diff_ui(
                     ui,
                     &painter,
                     data,
-                    &tab,
+                    tab,
                     right_rect,
                     gutter_w,
                     row_index,

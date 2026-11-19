@@ -34,7 +34,8 @@ impl FileIndex {
         let generation = self.generation;
         self.loading = true;
         let root = root.to_path_buf();
-        let (tx, rx): (Sender<(u64, Vec<PathBuf>)>, Receiver<(u64, Vec<PathBuf>)>) = channel();
+        type IndexMessage = (u64, Vec<PathBuf>);
+        let (tx, rx): (Sender<IndexMessage>, Receiver<IndexMessage>) = channel();
         std::thread::spawn(move || {
             let files = walk_project(&root);
             let _ = tx.send((generation, files));

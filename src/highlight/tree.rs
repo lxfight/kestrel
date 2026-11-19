@@ -32,9 +32,9 @@ impl TreeEngine {
         let mut parser = Parser::new();
         let mut query = None;
         let mut capture_kinds = Vec::new();
-        if let Some((ts_language, source)) = grammar(language) {
-            if parser.set_language(&ts_language).is_ok() {
-                if let Ok(compiled) = Query::new(&ts_language, &source) {
+        if let Some((ts_language, source)) = grammar(language)
+            && parser.set_language(&ts_language).is_ok()
+                && let Ok(compiled) = Query::new(&ts_language, &source) {
                     capture_kinds = compiled
                         .capture_names()
                         .iter()
@@ -42,8 +42,6 @@ impl TreeEngine {
                         .collect();
                     query = Some(compiled);
                 }
-            }
-        }
         Self {
             parser,
             query,
