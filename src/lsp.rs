@@ -351,6 +351,12 @@ fn extract_symbol_name(node: Node, text: &str) -> Option<String> {
     None
 }
 
+/// Completion rows that fit in the popup; navigation never exceeds what is painted.
+pub const COMPLETION_MAX_ITEMS: usize = 8;
+
+/// Bytes of document text the completion matcher inspects.
+const COMPLETION_SCAN_BYTES: usize = 160_000;
+
 /// Build completion candidates for `prefix` at the current cursor position.
 pub fn complete(
     prefix: &str,
@@ -401,8 +407,8 @@ pub fn complete(
     }
 
     // 3. Buffer identifier words (bounded scan for speed).
-    let scan_slice = if doc_text.len() > 160_000 {
-        &doc_text[..160_000]
+    let scan_slice = if doc_text.len() > COMPLETION_SCAN_BYTES {
+        &doc_text[..doc_text.floor_char_boundary(COMPLETION_SCAN_BYTES)]
     } else {
         doc_text
     };
@@ -431,7 +437,49 @@ pub fn complete(
     }
 
     items.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.label.cmp(&b.label)));
-    items.truncate(12);
+    items.truncate(COMPLETION_MAX_ITEMS);
+    items
+}
+
+/// Candidates shown right after `.` or `::`: current file symbols followed by
+/// the language keywords, capped to the popup row count.
+pub fn member_candidates(language: Language, symbols: &[OutlineSymbol]) -> Vec<CompletionItem> {
+    let mut seen = HashSet::new();
+    let mut items = Vec::with_capacity(COMPLETION_MAX_ITEMS);
+    for sym in symbols {
+        if !seen.insert(sym.name.as_str()) {
+            continue;
+        }
+        items.push(CompletionItem {
+            label: sym.name.clone(),
+            insert_text: sym.name.clone(),
+            detail: format!("{} (行 {})", sym.detail, sym.start_line + 1),
+            kind: sym.kind,
+            score: 0,
+        });
+        if items.len() >= COMPLETION_MAX_ITEMS {
+            return items;
+        }
+    }
+    for &(kw, detail, snippet) in language_keywords(language) {
+        if !seen.insert(kw) {
+            continue;
+        }
+        items.push(CompletionItem {
+            label: kw.to_string(),
+            insert_text: snippet.unwrap_or(kw).to_string(),
+            detail: detail.to_string(),
+            kind: if snippet.is_some() {
+                SymbolKind::Snippet
+            } else {
+                SymbolKind::Keyword
+            },
+            score: 0,
+        });
+        if items.len() >= COMPLETION_MAX_ITEMS {
+            break;
+        }
+    }
     items
 }
 
@@ -501,12 +549,27 @@ pub fn hover_documentation(
     None
 }
 
-/// Format document text using external language formatter or built-in clean formatter.
-pub fn format_document(language: Language, text: &str, tab_size: usize, insert_spaces: bool) -> String {
+/// Formatted document text plus whether an external formatter produced it.
+pub struct FormatResult {
+    pub text: String,
+    pub external: bool,
+}
+
+/// Format document text using an external language formatter or the built-in
+/// whitespace cleaner.
+pub fn format_document(
+    language: Language,
+    text: &str,
+    tab_size: usize,
+    insert_spaces: bool,
+) -> FormatResult {
     if let Some((cmd, args)) = external_formatter(language)
-        && let Some(formatted) = run_stdio_formatter(cmd, args, text)
+        && let Some(text) = run_stdio_formatter(cmd, args, text)
     {
-        return formatted;
+        return FormatResult {
+            text,
+            external: true,
+        };
     }
     // Built-in clean formatter: normalize trailing whitespace, tabs/spaces, and final newline.
     let indent_unit = if insert_spaces {
@@ -531,7 +594,10 @@ pub fn format_document(language: Language, text: &str, tab_size: usize, insert_s
     if !out.ends_with('\n') && !out.is_empty() {
         out.push('\n');
     }
-    out
+    FormatResult {
+        text: out,
+        external: false,
+    }
 }
 
 fn external_formatter(language: Language) -> Option<(&'static str, &'static [&'static str])> {
@@ -671,5 +737,48 @@ mod tests {
         let items = complete("rend", Language::Rust, &symbols, "let x = 1;");
         assert!(!items.is_empty());
         assert_eq!(items[0].label, "render_view");
+    }
+
+    fn function_symbol(name: &str) -> OutlineSymbol {
+        OutlineSymbol {
+            name: name.to_string(),
+            detail: "fn".to_string(),
+            kind: SymbolKind::Function,
+            start_line: 0,
+            end_line: 0,
+            byte_offset: 0,
+            depth: 0,
+        }
+    }
+
+    #[test]
+    fn completion_results_fit_the_popup() {
+        let symbols: Vec<OutlineSymbol> = (0..20)
+            .map(|index| function_symbol(&format!("symbol_{index}")))
+            .collect();
+        let members = member_candidates(Language::Rust, &symbols);
+        assert_eq!(members.len(), COMPLETION_MAX_ITEMS);
+        let items = complete("symbol", Language::Rust, &symbols, "symbol_alpha symbol_beta");
+        assert!(items.len() <= COMPLETION_MAX_ITEMS);
+    }
+
+    #[test]
+    fn member_candidates_fall_back_to_keywords() {
+        let members = member_candidates(Language::Rust, &[]);
+        assert!(!members.is_empty());
+        assert!(members.len() <= COMPLETION_MAX_ITEMS);
+        assert!(
+            members
+                .iter()
+                .any(|item| matches!(item.kind, SymbolKind::Keyword | SymbolKind::Snippet))
+        );
+    }
+
+    #[test]
+    fn completion_scan_handles_multibyte_boundary() {
+        // 180 KB of 3-byte characters: the 160 KB scan boundary lands mid-character.
+        let text = "中".repeat(60_000);
+        let items = complete("a", Language::Rust, &[], &text);
+        assert!(items.len() <= COMPLETION_MAX_ITEMS);
     }
 }

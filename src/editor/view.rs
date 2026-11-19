@@ -105,9 +105,16 @@ impl Editor {
         );
         let focused = response.has_focus();
         self.has_focus = focused;
-        if !focused {
+        if !focused && !self.ime_preedit.is_empty() {
+            // Losing focus must end the composition instead of leaving a preedit
+            // string behind that would later jump to a new caret.
             self.ime_preedit.clear();
             self.ime_active_range = None;
+            ui.ctx().output_mut(|output| {
+                if let Some(ime) = &mut output.ime {
+                    ime.should_interrupt_composition = true;
+                }
+            });
         }
         if self.focus_requested {
             response.request_focus();
@@ -184,6 +191,14 @@ impl Editor {
             && response.contains_pointer()
             && let Some(pos) = response.interact_pointer_pos()
         {
+            // A canvas click always dismisses completion and aborts any composition,
+            // so the preedit string never jumps to the new caret.
+            self.completion.open = false;
+            if !self.ime_preedit.is_empty() {
+                self.ime_preedit.clear();
+                self.ime_active_range = None;
+                self.ime_interrupt = true;
+            }
             let in_text = pos.y >= view_top;
             let row = self.row_at_y(pos.y, view_top, line_h, row_count);
             let clicked_line = self.line_of_row(row);
@@ -215,7 +230,6 @@ impl Editor {
                 }
                 self.desired_col = None;
                 self.blink_base = ui.input(|i| i.time);
-                self.completion.open = false;
             }
         }
         if self.dragging_selection
@@ -1100,12 +1114,14 @@ impl Editor {
                 .unwrap_or_default();
             let cursor_rect = Rect::from_min_size(caret, Vec2::new(2.0, line_h));
             let editor_rect = to_global * rect;
+            let interrupt_composition = std::mem::take(&mut self.ime_interrupt);
             ui.output_mut(|output| {
                 output.ime = Some(egui::output::IMEOutput {
                     purpose: egui::IMEPurpose::Normal,
                     rect: editor_rect,
+                    // The OS candidate window follows the caret rectangle.
                     cursor_rect: to_global * cursor_rect,
-                    should_interrupt_composition: false,
+                    should_interrupt_composition: interrupt_composition,
                 });
             });
             if let Some(caret) = caret_pos
@@ -1458,7 +1474,13 @@ impl Editor {
                     })
                     .show(ui, |ui| {
                         ui.set_width(300.0);
-                        for (idx, item) in self.completion.items.iter().take(8).enumerate() {
+                        for (idx, item) in self
+                            .completion
+                            .items
+                            .iter()
+                            .take(crate::lsp::COMPLETION_MAX_ITEMS)
+                            .enumerate()
+                        {
                             let selected = idx == self.completion.selected;
                             let (row_rect, resp) = ui.allocate_exact_size(
                                 Vec2::new(292.0, 24.0),
