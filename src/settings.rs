@@ -2,6 +2,8 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -130,17 +132,40 @@ impl Settings {
         settings
     }
 
+    /// Mark the settings dirty. The hot paths (ctrl+wheel zoom, view toggles)
+    /// used to rewrite settings.json per event; the app now flushes at most
+    /// once per quiet second and force-flushes on exit.
     pub fn save(&self) {
-        let dir = Self::config_dir();
-        let _ = std::fs::create_dir_all(&dir);
-        if let Ok(text) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write(Self::settings_path(), text);
+        if let Ok(mut state) = SAVE_STATE.lock() {
+            state.dirty = true;
+            state.requested = Instant::now();
         }
-        if !self.keybindings.is_empty()
-            && let Ok(kb) = serde_json::to_string_pretty(&self.keybindings)
-        {
-            let _ = std::fs::write(Self::keybindings_path(), kb);
+    }
+
+    /// Write immediately and drop any pending debounce.
+    pub fn flush(&self) {
+        if let Ok(mut state) = SAVE_STATE.lock() {
+            state.dirty = false;
         }
+        write_settings(self);
+    }
+
+    /// True once the debounce window has elapsed with no new change.
+    pub fn save_due() -> bool {
+        SAVE_STATE
+            .lock()
+            .is_ok_and(|state| state.dirty && state.requested.elapsed() >= SAVE_IDLE)
+    }
+
+    /// Time left before the debounced flush, for the frame wake timer.
+    pub fn save_delay() -> Option<Duration> {
+        SAVE_STATE.lock().ok().and_then(|state| {
+            state.dirty.then(|| {
+                SAVE_IDLE
+                    .saturating_sub(state.requested.elapsed())
+                    .max(Duration::from_millis(1))
+            })
+        })
     }
 
     pub fn note_folder(&mut self, folder: &str) {
@@ -153,6 +178,34 @@ impl Settings {
 
     pub fn line_px(&self) -> f32 {
         (self.font_size * self.line_height).round()
+    }
+}
+
+/// Quiet period before a dirty settings file reaches the disk.
+const SAVE_IDLE: Duration = Duration::from_millis(1000);
+
+struct SaveState {
+    dirty: bool,
+    requested: Instant,
+}
+
+static SAVE_STATE: LazyLock<Mutex<SaveState>> = LazyLock::new(|| {
+    Mutex::new(SaveState {
+        dirty: false,
+        requested: Instant::now(),
+    })
+});
+
+fn write_settings(settings: &Settings) {
+    let dir = Settings::config_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(text) = serde_json::to_string_pretty(settings) {
+        let _ = std::fs::write(Settings::settings_path(), text);
+    }
+    if !settings.keybindings.is_empty()
+        && let Ok(kb) = serde_json::to_string_pretty(&settings.keybindings)
+    {
+        let _ = std::fs::write(Settings::keybindings_path(), kb);
     }
 }
 

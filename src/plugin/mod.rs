@@ -9,6 +9,9 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use mlua::{Function, HookTriggers, Lua, LuaOptions, RegistryKey, StdLib, VmState};
@@ -19,6 +22,8 @@ use crate::settings::Settings;
 use actions::{HostAction, PluginContext};
 
 pub const INSTRUCTION_BUDGET: u64 = 5_000_000;
+/// Concurrent `kestrel.exec` processes across all plugins; extra calls are rejected.
+pub(crate) const MAX_CONCURRENT_EXEC: usize = 4;
 
 fn libraries() -> StdLib {
     StdLib::COROUTINE | StdLib::TABLE | StdLib::STRING | StdLib::UTF8 | StdLib::MATH
@@ -141,6 +146,10 @@ pub(crate) struct PluginShared {
     pub exec_callbacks: Vec<(u64, RegistryKey)>,
     pub next_task: u64,
     pub exec_tx: Sender<ExecDone>,
+    /// Slots held by running `exec` processes; the thread releases its own slot.
+    pub exec_running: Arc<AtomicUsize>,
+    /// Set on disable/reload so running `exec` processes stop and report cancelled.
+    pub cancel_exec: Arc<AtomicBool>,
 }
 
 impl PluginShared {
@@ -150,6 +159,7 @@ impl PluginShared {
         changed_allowed: bool,
         config: HashMap<String, serde_json::Value>,
         exec_tx: Sender<ExecDone>,
+        exec_running: Arc<AtomicUsize>,
     ) -> Self {
         Self {
             plugin_id,
@@ -165,6 +175,8 @@ impl PluginShared {
             exec_callbacks: Vec::new(),
             next_task: 0,
             exec_tx,
+            exec_running,
+            cancel_exec: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -283,6 +295,7 @@ pub struct PluginHost {
     open_docs: HashMap<u64, TrackedDoc>,
     exec_tx: Sender<ExecDone>,
     exec_rx: Receiver<ExecDone>,
+    exec_running: Arc<AtomicUsize>,
     next_runtime: u64,
     load_errors: Vec<String>,
     errors: Vec<String>,
@@ -310,6 +323,7 @@ impl PluginHost {
             open_docs: HashMap::new(),
             exec_tx,
             exec_rx,
+            exec_running: Arc::new(AtomicUsize::new(0)),
             next_runtime: 1,
             load_errors: Vec::new(),
             errors: Vec::new(),
@@ -404,6 +418,7 @@ impl PluginHost {
             manifest.events.iter().any(|event| event == "changed"),
             config,
             self.exec_tx.clone(),
+            self.exec_running.clone(),
         )));
         let budget = Rc::new(Cell::new(0u64));
         let result = (|| -> Result<Option<Lua>, String> {
@@ -503,6 +518,9 @@ impl PluginHost {
         self.actions.retain(|(plugin, _)| *plugin != runtime);
         if let Some(shared) = self.plugins[index].shared.take() {
             let mut shared = shared.borrow_mut();
+            // Running exec processes see the flag and kill themselves instead of
+            // reporting into a runtime that no longer exists.
+            shared.cancel_exec.store(true, std::sync::atomic::Ordering::Relaxed);
             shared.ctx = None;
             shared.actions.clear();
             shared.commands.clear();
