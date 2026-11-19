@@ -1,6 +1,8 @@
 //! Application state, file/tab lifecycle, Git/LSP orchestration, command dispatch, and background work.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use egui::FontFamily;
@@ -12,7 +14,7 @@ use crate::editor::{Editor, EditorStyle, FormatOutcome};
 use crate::fuzzy;
 use crate::git::{GitFileStatus, GitService};
 use crate::highlight::Language;
-use crate::lsp::OutlineSymbol;
+use crate::lsp::{DiagSeverity, OutlineSymbol};
 use crate::plugin::{Event, PluginHost};
 use crate::settings::{Session, Settings, TabSession, UntitledSession};
 use crate::terminal::ShellKind;
@@ -357,6 +359,167 @@ pub struct Toast {
     pub created: Instant,
 }
 
+/// Status-bar strings, rebuilt only when the value behind them changes.
+///
+/// The status bar repaints every frame, but the cursor position, diagnostics
+/// totals, branch label, indent and file size change only on edits and background
+/// updates. Formatting them per frame allocated and re-laid-out text that was
+/// immediately thrown away.
+#[derive(Default)]
+pub struct StatusCache {
+    indent_key: (usize, bool),
+    indent_text: String,
+    pos_key: (u64, usize, usize, usize),
+    pos_text: String,
+    zoom_key: i32,
+    zoom_text: String,
+    size_key: (u64, u64),
+    size_text: String,
+    branch_key: (String, bool, usize, usize),
+    branch_label: String,
+    branch_counts: String,
+    diag_key: (usize, usize),
+    diag_errors: usize,
+    diag_warnings: usize,
+    diag_error_text: String,
+    diag_warning_text: String,
+}
+
+impl StatusCache {
+    /// Indent label, for example 4空格 or 2制表符.
+    pub fn indent(&mut self, tab_size: usize, insert_spaces: bool) -> &str {
+        if self.indent_key != (tab_size, insert_spaces) {
+            self.indent_key = (tab_size, insert_spaces);
+            self.indent_text.clear();
+            let _ = write!(self.indent_text, "{tab_size}");
+            self.indent_text
+                .push_str(if insert_spaces { "空格" } else { "制表符" });
+        }
+        &self.indent_text
+    }
+
+    /// Cursor label: line/column, plus the cursor count with extra cursors.
+    pub fn cursor(&mut self, doc_version: u64, line: usize, col: usize, cursors: usize) -> &str {
+        let key = (doc_version, line, col, cursors);
+        if self.pos_key != key {
+            self.pos_key = key;
+            self.pos_text.clear();
+            if cursors <= 1 {
+                let _ = write!(self.pos_text, "行 {}, 列 {}", line + 1, col + 1);
+            } else {
+                let _ = write!(
+                    self.pos_text,
+                    "行 {}, 列 {} ({} 个光标)",
+                    line + 1,
+                    col + 1,
+                    cursors
+                );
+            }
+        }
+        &self.pos_text
+    }
+
+    pub fn zoom(&mut self, zoom: f32) -> &str {
+        let key = (zoom * 1000.0).round() as i32;
+        if self.zoom_key != key {
+            self.zoom_key = key;
+            self.zoom_text.clear();
+            let _ = write!(self.zoom_text, "缩放 {:.0}%", zoom * 100.0);
+        }
+        &self.zoom_text
+    }
+
+    /// File size label; the metadata syscall only runs when the tab or buffer changes.
+    pub fn file_size(&mut self, editor_id: u64, doc_version: u64, path: Option<&Path>) -> &str {
+        if self.size_key != (editor_id, doc_version) {
+            self.size_key = (editor_id, doc_version);
+            self.size_text.clear();
+            if let Some(path) = path
+                && let Ok(meta) = std::fs::metadata(path)
+            {
+                self.size_text = crate::viewer::image_view::format_bytes(meta.len());
+            }
+        }
+        &self.size_text
+    }
+
+    /// Branch label and ahead/behind counters, formatted only when Git state changes.
+    pub fn branch(
+        &mut self,
+        branch: &str,
+        modified: bool,
+        ahead: usize,
+        behind: usize,
+    ) -> (&str, &str) {
+        let (cached_branch, cached_modified, cached_ahead, cached_behind) = &self.branch_key;
+        if cached_branch != branch
+            || *cached_modified != modified
+            || *cached_ahead != ahead
+            || *cached_behind != behind
+        {
+            self.branch_key = (branch.to_string(), modified, ahead, behind);
+            self.branch_label.clear();
+            self.branch_label.push_str(branch);
+            if modified {
+                self.branch_label.push('*');
+            }
+            self.branch_counts.clear();
+            if ahead > 0 || behind > 0 {
+                let _ = write!(self.branch_counts, "↑{ahead} ↓{behind}");
+            }
+        }
+        (&self.branch_label, &self.branch_counts)
+    }
+
+    /// Document-wide error/warning totals. The key is the tab count plus the total
+    /// diagnostic count, so the per-diagnostic walk only runs when that changes.
+    pub fn diagnostics(&mut self, tabs: &[Editor]) -> (usize, usize, &str, &str) {
+        let key = (
+            tabs.len(),
+            tabs.iter().map(|tab| tab.diagnostics.len()).sum::<usize>(),
+        );
+        if self.diag_key != key {
+            self.diag_key = key;
+            let (mut errors, mut warnings) = (0usize, 0usize);
+            for tab in tabs {
+                for diagnostic in &tab.diagnostics {
+                    match diagnostic.severity {
+                        DiagSeverity::Error => errors += 1,
+                        DiagSeverity::Warning => warnings += 1,
+                        DiagSeverity::Info => {}
+                    }
+                }
+            }
+            self.diag_errors = errors;
+            self.diag_warnings = warnings;
+            self.diag_error_text = errors.to_string();
+            self.diag_warning_text = warnings.to_string();
+        }
+        (
+            self.diag_errors,
+            self.diag_warnings,
+            &self.diag_error_text,
+            &self.diag_warning_text,
+        )
+    }
+}
+
+/// Every command with a built-in shortcut, sorted once so a Shift/Alt chord is
+/// matched before its unmodified prefix (Ctrl+Shift+X must not fire Ctrl+X).
+///
+/// The old code rebuilt and sorted this list on every frame. Only key events can
+/// match a shortcut, so it is built lazily and read-only afterwards.
+static DEFAULT_SHORTCUTS: LazyLock<Vec<(Command, Shortcut)>> = LazyLock::new(|| {
+    let mut bindings: Vec<(Command, Shortcut)> = Command::ALL
+        .iter()
+        .filter_map(|command| command.shortcut().map(|shortcut| (*command, shortcut)))
+        .collect();
+    bindings.sort_by_key(|(_, shortcut)| {
+        std::cmp::Reverse((shortcut.mods.shift as u8) * 2 + (shortcut.mods.alt as u8))
+    });
+    bindings
+});
+
 pub struct KestrelApp {
     pub settings: Settings,
     pub theme: Theme,
@@ -404,6 +567,13 @@ pub struct KestrelApp {
     pub dev_ui: Option<String>,
     /// Kept so background producers (watcher) can wake egui without a UI call site.
     pub egui_ctx: egui::Context,
+    /// Cross-frame status-bar strings.
+    pub status_cache: StatusCache,
+    /// Key events collected this frame; reused so a keystroke does not allocate.
+    pressed_keys: Vec<(egui::Key, egui::Modifiers)>,
+    title_key: (Option<u64>, u64, bool),
+    title_path: Option<PathBuf>,
+    title_root: Option<PathBuf>,
 }
 
 impl KestrelApp {
@@ -483,6 +653,11 @@ impl KestrelApp {
             shot_frame: 0,
             dev_ui: None,
             egui_ctx: cc.egui_ctx.clone(),
+            status_cache: StatusCache::default(),
+            pressed_keys: Vec::new(),
+            title_key: (None, 0, false),
+            title_path: None,
+            title_root: None,
         };
         app.apply_dev_env();
         if app.workspace.root.is_none() && app.tabs.is_empty() && app.dev_ui.is_none() {
@@ -1481,7 +1656,7 @@ impl KestrelApp {
                 if let Some(root) = &self.workspace.root
                     && let Some(head_text) = crate::git::read_head_blob(root, &path)
                 {
-                    doc.baseline_text = Some(head_text.replace("\r\n", "\n"));
+                    doc.baseline_text = Some(head_text.replace("\r\n", "\n").into());
                 }
                 if doc.lossy && doc.encoding != crate::doc::Encoding::Binary {
                     self.toast(
@@ -1564,7 +1739,7 @@ impl KestrelApp {
             if let Some(root) = &self.workspace.root
                 && let Some(head_text) = crate::git::read_head_blob(root, &path)
             {
-                doc.baseline_text = Some(head_text.replace("\r\n", "\n"));
+                doc.baseline_text = Some(head_text.replace("\r\n", "\n").into());
             }
             let id = self.next_id;
             self.next_id += 1;
@@ -3240,6 +3415,27 @@ impl KestrelApp {
     }
 
     fn update_window_title(&mut self, ctx: &egui::Context) {
+        let active_id = self.tabs.get(self.active).map(|tab| tab.id);
+        let version = self.tabs.get(self.active).map_or(0, |tab| tab.doc.version);
+        let dirty = self.tabs.get(self.active).is_some_and(|tab| tab.is_dirty());
+        // The title only changes with the active document, its dirty flag, or the
+        // folder. Every other frame used to format three strings and drop them.
+        if self.title_key == (active_id, version, dirty)
+            && self.title_path.as_deref()
+                == self
+                    .tabs
+                    .get(self.active)
+                    .and_then(|tab| tab.doc.path.as_deref())
+            && self.title_root.as_deref() == self.workspace.root.as_deref()
+        {
+            return;
+        }
+        self.title_key = (active_id, version, dirty);
+        self.title_path = self
+            .tabs
+            .get(self.active)
+            .and_then(|tab| tab.doc.path.clone());
+        self.title_root = self.workspace.root.clone();
         let file = self
             .active_editor()
             .map(|e| {
@@ -3267,6 +3463,32 @@ impl KestrelApp {
     }
 
     fn handle_global_shortcuts(&mut self, ctx: &egui::Context) {
+        // Reuse the scratch buffer: typing pushes key events every frame, and a
+        // fresh Vec per keystroke is pure churn.
+        let mut pressed = std::mem::take(&mut self.pressed_keys);
+        pressed.clear();
+        ctx.input(|input| {
+            for event in &input.events {
+                if let egui::Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } = event
+                {
+                    pressed.push((*key, *modifiers));
+                }
+            }
+        });
+        if !pressed.is_empty() {
+            self.route_shortcuts(ctx, &pressed);
+        }
+        self.pressed_keys = pressed;
+    }
+
+    /// Dispatch this frame's key events. Frames without keys return before the
+    /// shortcut table is touched.
+    fn route_shortcuts(&mut self, ctx: &egui::Context, pressed: &[(egui::Key, egui::Modifiers)]) {
         if self.palette.open || self.dialog.is_some() {
             return;
         }
@@ -3307,45 +3529,16 @@ impl KestrelApp {
         let editor_focused = self
             .active_editor()
             .is_some_and(|tab| tab.has_focus && tab.ime_preedit.is_empty());
-        let mut candidates: Vec<(Command, crate::commands::Shortcut)> = Command::ALL
-            .iter()
-            .filter_map(|command| {
-                self.custom_shortcuts
-                    .get(command)
-                    .copied()
-                    .or_else(|| command.shortcut())
-                    .map(|shortcut| (*command, shortcut))
-            })
-            .collect();
-        candidates.sort_by_key(|(_, s)| {
-            (
-                std::cmp::Reverse((s.mods.shift as u8) * 2 + (s.mods.alt as u8)),
-                0,
-            )
-        });
-        // Read modifiers from the key events themselves: the current modifier
-        // state is already cleared when a quick tap is processed in the next
-        // frame, which used to swallow Ctrl shortcuts. Exact matching keeps
-        // Ctrl+Shift+X from firing a Ctrl+X binding.
-        let pressed: Vec<(egui::Key, egui::Modifiers)> = ctx.input(|i| {
-            i.events
-                .iter()
-                .filter_map(|event| match event {
-                    egui::Event::Key {
-                        key,
-                        pressed: true,
-                        modifiers,
-                        ..
-                    } => Some((*key, *modifiers)),
-                    _ => None,
-                })
-                .collect()
-        });
         let mut handled = false;
-        for (command, shortcut) in candidates {
+        for &(command, default_shortcut) in DEFAULT_SHORTCUTS.iter() {
             if command.is_editor_command() && !editor_focused {
                 continue;
             }
+            let shortcut = self
+                .custom_shortcuts
+                .get(&command)
+                .copied()
+                .unwrap_or(default_shortcut);
             if !pressed
                 .iter()
                 .any(|(key, mods)| *key == shortcut.key && mods.matches_exact(shortcut.mods))
@@ -3735,7 +3928,7 @@ impl eframe::App for KestrelApp {
             let ctx = self.plugin_context(None);
             self.plugins.emit(Event::Shutdown, &ctx);
         }
-        if std::env::var("KESTREL_SHOT").is_err() {
+        if !devshot::enabled() {
             self.settings.sidebar_width = self.sidebar.width;
             self.settings.terminal_height = self.bottom.height;
             // Settings writes are debounced; exit must land them immediately.
@@ -3922,8 +4115,12 @@ impl KestrelApp {
 
     fn handle_drag_and_drop_overlay(&mut self, ctx: &egui::Context) {
         let payload = self.drag_payload.clone();
-        let pointer_pos = ctx.input(|i| i.pointer.interact_pos().or(i.pointer.hover_pos()));
-        let primary_down = ctx.input(|i| i.pointer.primary_down());
+        let (pointer_pos, primary_down) = ctx.input(|i| {
+            (
+                i.pointer.interact_pos().or(i.pointer.hover_pos()),
+                i.pointer.primary_down(),
+            )
+        });
 
         let spot = payload
             .as_ref()
@@ -3985,8 +4182,19 @@ impl KestrelApp {
     }
 
     fn handle_os_file_drops(&mut self, ctx: &egui::Context) {
-        let hovered = ctx.input(|i| !i.raw.hovered_files.is_empty());
-        let pointer_pos = ctx.input(|i| i.pointer.interact_pos().or(i.pointer.hover_pos()));
+        // One input lock per frame instead of three; dragging files clones the
+        // list once, but the common no-drop frame stays allocation-free.
+        let (hovered, pointer_pos, dropped) = ctx.input(|i| {
+            (
+                !i.raw.hovered_files.is_empty(),
+                i.pointer.interact_pos().or(i.pointer.hover_pos()),
+                if i.raw.dropped_files.is_empty() {
+                    Vec::new()
+                } else {
+                    i.raw.dropped_files.clone()
+                },
+            )
+        });
         let spot = pointer_pos.and_then(|pos| self.drop_spot_at(pos));
         if hovered {
             let target = spot.and_then(|spot| self.drop_preview_target(spot));
@@ -3994,7 +4202,6 @@ impl KestrelApp {
             self.paint_drop_preview(ctx);
         }
 
-        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         if dropped.is_empty() {
             return;
         }
@@ -4030,4 +4237,116 @@ fn build_custom_shortcuts(settings: &Settings) -> std::collections::HashMap<Comm
         }
     }
     map
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::doc::Document;
+    use crate::editor::Editor;
+    use crate::lsp::Diagnostic;
+
+    fn editor_with(id: u64, severities: &[DiagSeverity]) -> Editor {
+        let mut editor = Editor::new(Document::from_text(""), id, 0);
+        editor.diagnostics = severities
+            .iter()
+            .map(|severity| Diagnostic {
+                line: 0,
+                col: 0,
+                end_col: 1,
+                start_byte: 0,
+                end_byte: 1,
+                severity: *severity,
+                message: String::new(),
+                source: String::new(),
+            })
+            .collect();
+        editor
+    }
+
+    #[test]
+    fn status_cache_rebuilds_strings_when_values_change() {
+        let mut cache = StatusCache::default();
+        assert_eq!(cache.cursor(3, 1, 2, 1), "行 2, 列 3");
+        assert_eq!(cache.cursor(3, 1, 2, 1), "行 2, 列 3");
+        assert_eq!(cache.cursor(3, 4, 2, 1), "行 5, 列 3");
+        assert_eq!(cache.cursor(3, 4, 6, 3), "行 5, 列 7 (3 个光标)");
+        assert_eq!(cache.cursor(9, 4, 6, 3), "行 5, 列 7 (3 个光标)");
+        assert_eq!(cache.indent(4, true), "4空格");
+        assert_eq!(cache.indent(2, false), "2制表符");
+        assert_eq!(cache.zoom(1.5), "缩放 150%");
+        let (label, counts) = cache.branch("main", false, 0, 0);
+        assert_eq!((label, counts), ("main", ""));
+        let (label, counts) = cache.branch("main", true, 2, 1);
+        assert_eq!((label, counts), ("main*", "↑2 ↓1"));
+        // Unchanged Git state must not rebuild the label or the counters.
+        let label_ptr = cache.branch_label.as_ptr();
+        let counts_ptr = cache.branch_counts.as_ptr();
+        let (label, counts) = cache.branch("main", true, 2, 1);
+        assert_eq!((label, counts), ("main*", "↑2 ↓1"));
+        assert_eq!(cache.branch_label.as_ptr(), label_ptr);
+        assert_eq!(cache.branch_counts.as_ptr(), counts_ptr);
+    }
+
+    #[test]
+    fn status_cache_counts_diagnostics_until_the_set_changes() {
+        let mut cache = StatusCache::default();
+        let tabs = [editor_with(1, &[DiagSeverity::Error, DiagSeverity::Warning])];
+        let (errors, warnings, error_text, warning_text) = cache.diagnostics(&tabs);
+        assert_eq!(
+            (errors, warnings, error_text, warning_text),
+            (1, 1, "1", "1")
+        );
+        let key_before = cache.diag_key;
+        let tabs = [editor_with(1, &[DiagSeverity::Error, DiagSeverity::Warning])];
+        let (errors, warnings, ..) = cache.diagnostics(&tabs);
+        assert_eq!((errors, warnings), (1, 1));
+        assert_eq!(cache.diag_key, key_before);
+        let tabs = [editor_with(
+            1,
+            &[
+                DiagSeverity::Error,
+                DiagSeverity::Error,
+                DiagSeverity::Error,
+            ],
+        )];
+        let (errors, warnings, error_text, _) = cache.diagnostics(&tabs);
+        assert_eq!((errors, warnings, error_text), (3, 0, "3"));
+    }
+
+    #[test]
+    fn default_shortcut_table_covers_every_bound_command_once() {
+        let mut seen = std::collections::HashSet::new();
+        for &(command, shortcut) in DEFAULT_SHORTCUTS.iter() {
+            assert_eq!(command.shortcut(), Some(shortcut), "{}", command.id());
+            assert!(seen.insert(command), "duplicate {}", command.id());
+        }
+        for command in Command::ALL {
+            assert_eq!(
+                seen.contains(command),
+                command.shortcut().is_some(),
+                "{}",
+                command.id()
+            );
+        }
+        // Shift/Alt chords sort before their unmodified prefix, so they win dispatch.
+        let priority =
+            |shortcut: Shortcut| (shortcut.mods.shift as u8) * 2 + shortcut.mods.alt as u8;
+        for pair in DEFAULT_SHORTCUTS.windows(2) {
+            assert!(priority(pair[0].1) >= priority(pair[1].1));
+        }
+    }
+
+    #[test]
+    fn custom_shortcut_overrides_default_when_resolved() {
+        let mut overrides = std::collections::HashMap::new();
+        let save = Shortcut::new(egui::Modifiers::COMMAND, egui::Key::S);
+        overrides.insert(Command::Save, save);
+        let default = Shortcut::new(egui::Modifiers::COMMAND, egui::Key::D);
+        let resolve = |command: Command, fallback: Shortcut| -> Shortcut {
+            overrides.get(&command).copied().unwrap_or(fallback)
+        };
+        assert_eq!(resolve(Command::Save, default), save);
+        assert_eq!(resolve(Command::Copy, default), default);
+    }
 }

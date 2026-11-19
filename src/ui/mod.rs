@@ -18,7 +18,6 @@ use crate::app::{BottomTab, DragPayload, KestrelApp, PaletteMode, SidebarMode};
 use crate::commands::Command;
 use crate::git::GitFileStatus;
 use crate::icons::{self, Icon};
-use crate::lsp::DiagSeverity;
 use crate::theme::{Theme, ThemeKind, R_MD, R_SM};
 
 #[derive(Clone)]
@@ -2064,74 +2063,188 @@ impl KestrelApp {
             ],
             Stroke::new(1.0, theme.border),
         );
-        // The right cluster owns a fixed slice (zoom, plugins, language, EOL,
-        // encoding, indent, line/col). Measuring it first keeps the left cluster
-        // from painting underneath it on narrow windows.
-        let measure = |s: &str, font: FontId| -> f32 {
-            ui.ctx().fonts_mut(|fonts| {
-                fonts
-                    .layout_job(LayoutJob::simple_singleline(
-                        s.to_string(),
-                        font,
-                        Color32::WHITE,
-                    ))
-                    .rect
-                    .width()
-            })
+
+        // Paint the right cluster first: Painter::text lays the galley out once and
+        // returns its rect, so the position comes from the paint call instead of a
+        // separate measurement layout. Its left edge then bounds the left cluster,
+        // which keeps the two from overlapping on narrow windows.
+        let center_y = rect.center().y;
+        let mut rx = rect.right() - 12.0;
+        let item = |ui: &Ui, rx: &mut f32, text: &str, color: Color32, font: FontId| -> Rect {
+            let painted = ui.painter().text(
+                Pos2::new(*rx, center_y),
+                Align2::RIGHT_CENTER,
+                text,
+                font,
+                color,
+            );
+            *rx -= painted.width();
+            let slot = Rect::from_min_size(
+                Pos2::new(*rx, center_y - 8.0),
+                Vec2::new(painted.width(), 16.0),
+            );
+            *rx -= 16.0;
+            slot
         };
-        let mut right_reserved = 12.0;
+        let mut zoom_rect = None;
         if (self.settings.ui_zoom - 1.0).abs() > 0.01 {
-            right_reserved += 74.0;
+            let zoom = self.status_cache.zoom(self.settings.ui_zoom);
+            zoom_rect = Some(item(ui, &mut rx, zoom, theme.accent, style.small()));
         }
+        let mut language_rect = None;
+        let mut active_language = None;
+        let mut pos_rect = None;
         if let Some(editor) = self.tabs.get(self.active) {
-            if let Some(mm) = editor.multimodal.as_ref().filter(|m| !m.is_showing_source()) {
-                right_reserved += measure(mm.kind().label(), style.small()) + 16.0;
-            } else if editor.doc.encoding == crate::doc::Encoding::Binary {
-                right_reserved += 168.0;
-            } else if editor.diff.is_some() {
-                right_reserved += 72.0;
-            } else {
-                let indent = format!(
-                    "{}{}",
-                    self.settings.tab_size,
-                    if self.settings.insert_spaces {
-                        "空格"
-                    } else {
-                        "制表符"
-                    }
+            if let Some(mm) = &editor.multimodal
+                && !mm.is_showing_source()
+            {
+                let size = self.status_cache.file_size(
+                    editor.id,
+                    editor.doc.version,
+                    editor.doc.path.as_deref(),
                 );
-                let (line, col) = editor.doc.char_to_line_col(editor.caret);
-                let pos = format!("行 {}, 列 {}", line + 1, col + 1);
-                for s in [
-                    editor.language.name(),
-                    editor.doc.eol.as_str(),
-                    editor.doc.encoding.as_str(),
-                    indent.as_str(),
-                    pos.as_str(),
-                ] {
-                    right_reserved += measure(s, style.small()) + 16.0;
+                item(ui, &mut rx, mm.kind().label(), theme.text_dim, style.small());
+                if !size.is_empty() {
+                    item(ui, &mut rx, size, theme.text_faint, style.small());
                 }
+            } else if editor.doc.encoding == crate::doc::Encoding::Binary {
+                let size = self.status_cache.file_size(
+                    editor.id,
+                    editor.doc.version,
+                    editor.doc.path.as_deref(),
+                );
+                item(
+                    ui,
+                    &mut rx,
+                    "二进制文件 (不可读取)",
+                    theme.warning,
+                    style.small(),
+                );
+                if !size.is_empty() {
+                    item(ui, &mut rx, size, theme.text_faint, style.small());
+                }
+            } else if editor.diff.is_some() {
+                item(ui, &mut rx, "Git 差异", theme.text_dim, style.small());
+            } else {
+                language_rect = Some(item(ui, &mut rx, editor.language.name(), theme.text_dim, style.small()));
+                active_language = Some(editor.language);
+                item(
+                    ui,
+                    &mut rx,
+                    editor.doc.eol.as_str(),
+                    theme.text_faint,
+                    style.small(),
+                );
+                item(
+                    ui,
+                    &mut rx,
+                    editor.doc.encoding.as_str(),
+                    theme.text_faint,
+                    style.small(),
+                );
+                let indent = self.status_cache.indent(self.settings.tab_size, self.settings.insert_spaces);
+                item(ui, &mut rx, indent, theme.text_faint, style.small());
+                let (line, col) = editor.doc.char_to_line_col(editor.caret);
+                let cursors = editor.extra_cursors.len() + 1;
+                let position = self
+                    .status_cache
+                    .cursor(editor.doc.version, line, col, cursors);
+                pos_rect = Some(item(ui, &mut rx, position, theme.text_dim, style.small()));
             }
         }
-        for item in self.plugins.status_items() {
-            right_reserved += measure(&item.text, style.small()) + 16.0;
+        let mut clicked_plugin = None;
+        for (index, status) in self.plugins.status_items().iter().enumerate() {
+            let slot = item(ui, &mut rx, &status.text, theme.text_dim, style.small());
+            if status.command.is_some()
+                && ui
+                    .interact(
+                        slot.expand2(Vec2::new(4.0, 4.0)),
+                        ui.scope_id().with(("status_plugin", index)),
+                        Sense::click(),
+                    )
+                    .clicked()
+            {
+                clicked_plugin = Some(index);
+            }
         }
-        let left_limit = (rect.right() - right_reserved).max(rect.left() + 96.0);
+        if let Some(index) = clicked_plugin
+            && let Some(command) = self
+                .plugins
+                .status_items()
+                .get(index)
+                .and_then(|status| status.command.clone())
+            && let Some(command_index) = self.plugins.command_index_of_id(&command)
+        {
+            self.run_plugin_command(command_index);
+        }
 
+        if let Some(z_rect) = zoom_rect
+            && ui
+                .interact(
+                    z_rect.expand2(Vec2::new(4.0, 4.0)),
+                    ui.scope_id().with("status_zoom_reset"),
+                    Sense::click(),
+                )
+                .on_hover_text("点击重置界面缩放为 100% (Ctrl+0)")
+                .clicked()
+        {
+            let ctx = ui.ctx().clone();
+            self.set_ui_zoom(1.0, &ctx);
+        }
+        if let Some(p_rect) = pos_rect
+            && ui
+                .interact(
+                    p_rect.expand2(Vec2::new(4.0, 4.0)),
+                    ui.scope_id().with("status_goto_line"),
+                    Sense::click(),
+                )
+                .on_hover_text("转到行 (Ctrl+G)")
+                .clicked()
+        {
+            self.open_palette(PaletteMode::GotoLine);
+        }
+        if let Some(lang_rect) = language_rect
+            && let Some(language) = active_language
+        {
+            let resp = ui.interact(
+                lang_rect.expand2(Vec2::new(4.0, 4.0)),
+                ui.scope_id().with("status_language"),
+                Sense::click(),
+            );
+            if resp.hovered() {
+                ui.painter().rect_filled(
+                    lang_rect.expand2(Vec2::new(4.0, 3.0)),
+                    CornerRadius::same(4),
+                    theme.hover,
+                );
+                ui.painter().text(
+                    Pos2::new(lang_rect.left(), center_y),
+                    Align2::LEFT_CENTER,
+                    language.name(),
+                    style.small(),
+                    theme.text,
+                );
+            }
+            if resp.on_hover_text("点击切换语言模式").clicked() {
+                self.open_palette(PaletteMode::Language);
+                self.palette.focus = true;
+            }
+        }
+
+        let left_limit = rx.max(rect.left() + 96.0);
         let mut x = rect.left() + 10.0;
+        // Left cluster: ellipsize keeps long branch names and folder labels from
+        // running under the right cluster on narrow windows.
         let text = |ui: &mut Ui, x: &mut f32, s: &str, color: Color32, font: FontId| -> Rect {
             let avail = (left_limit - *x - 6.0).max(0.0);
-            let origin = Pos2::new(*x, rect.center().y - 9.0);
+            let origin = Pos2::new(*x, center_y - 9.0);
             if avail < 12.0 {
                 return Rect::from_min_size(origin, Vec2::ZERO);
             }
             let (galley, clipped) = widgets::ellipsize(ui, s, font, color, avail);
             let width = galley.rect.width();
-            ui.painter().galley(
-                Pos2::new(*x, rect.center().y - galley.rect.height() * 0.5),
-                galley,
-                color,
-            );
+            ui.painter()
+                .galley(Pos2::new(*x, center_y - galley.rect.height() * 0.5), galley, color);
             let r = Rect::from_min_size(origin, Vec2::new(width, 18.0));
             let _ = clipped;
             *x += width;
@@ -2140,23 +2253,20 @@ impl KestrelApp {
 
         // 1. Git Branch indicator (clickable to switch branch)
         if self.git.snapshot.is_repo && !self.git.snapshot.branch.is_empty() {
-            let icon_r = Rect::from_center_size(Pos2::new(x + 7.0, rect.center().y), Vec2::splat(13.0));
+            let icon_r = Rect::from_center_size(Pos2::new(x + 7.0, center_y), Vec2::splat(13.0));
             icons::paint(ui.painter(), icon_r, Icon::GitBranch, theme.accent, 1.2);
             x += 16.0;
-            let branch_label = if self.git.snapshot.changes.is_empty() {
-                self.git.snapshot.branch.clone()
-            } else {
-                format!("{}*", self.git.snapshot.branch)
-            };
-            let br_rect = text(ui, &mut x, &branch_label, theme.text, style.small());
+            let (label, counts) = self.status_cache.branch(
+                &self.git.snapshot.branch,
+                !self.git.snapshot.changes.is_empty(),
+                self.git.snapshot.ahead,
+                self.git.snapshot.behind,
+            );
+            let br_rect = text(ui, &mut x, label, theme.text, style.small());
             let mut hit = Rect::from_min_max(icon_r.min, br_rect.max);
-            if self.git.snapshot.ahead > 0 || self.git.snapshot.behind > 0 {
+            if !counts.is_empty() {
                 x += 6.0;
-                let counts = format!(
-                    "↑{} ↓{}",
-                    self.git.snapshot.ahead, self.git.snapshot.behind
-                );
-                let counts_rect = text(ui, &mut x, &counts, theme.text_faint, style.tiny());
+                let counts_rect = text(ui, &mut x, counts, theme.text_faint, style.tiny());
                 hit = hit.union(counts_rect);
             }
             let hit = hit.expand2(Vec2::new(4.0, 2.0));
@@ -2188,71 +2298,54 @@ impl KestrelApp {
         x += 14.0;
 
         // 3. Error & Warning Diagnostic Counters (clickable to open Problems panel)
-        let mut err_count = 0usize;
-        let mut warn_count = 0usize;
-        for tab in &self.tabs {
-            for d in &tab.diagnostics {
-                match d.severity {
-                    DiagSeverity::Error => err_count += 1,
-                    DiagSeverity::Warning => warn_count += 1,
-                    DiagSeverity::Info => {}
-                }
-            }
-        }
-        let diag_start_x = x;
-        let er_r = Rect::from_center_size(Pos2::new(x + 6.0, rect.center().y), Vec2::splat(12.0));
-        icons::paint(
-            ui.painter(),
-            er_r,
-            Icon::Error,
-            if err_count > 0 {
+        let diag_hit = {
+            let (err_count, warn_count, err_text, warn_text) =
+                self.status_cache.diagnostics(&self.tabs);
+            let diag_start_x = x;
+            let er_r = Rect::from_center_size(Pos2::new(x + 6.0, center_y), Vec2::splat(12.0));
+            icons::paint(
+                ui.painter(),
+                er_r,
+                Icon::Error,
+                if err_count > 0 {
+                    theme.error
+                } else {
+                    theme.text_faint
+                },
+                1.2,
+            );
+            x += 14.0;
+            let err_color = if err_count > 0 {
                 theme.error
             } else {
                 theme.text_faint
-            },
-            1.2,
-        );
-        x += 14.0;
-        text(
-            ui,
-            &mut x,
-            &err_count.to_string(),
-            if err_count > 0 {
-                theme.error
-            } else {
-                theme.text_faint
-            },
-            style.tiny(),
-        );
-        x += 8.0;
-        let wn_r = Rect::from_center_size(Pos2::new(x + 6.0, rect.center().y), Vec2::splat(12.0));
-        icons::paint(
-            ui.painter(),
-            wn_r,
-            Icon::Warning,
-            if warn_count > 0 {
+            };
+            text(ui, &mut x, err_text, err_color, style.tiny());
+            x += 8.0;
+            let wn_r = Rect::from_center_size(Pos2::new(x + 6.0, center_y), Vec2::splat(12.0));
+            icons::paint(
+                ui.painter(),
+                wn_r,
+                Icon::Warning,
+                if warn_count > 0 {
+                    theme.warning
+                } else {
+                    theme.text_faint
+                },
+                1.2,
+            );
+            x += 14.0;
+            let warn_color = if warn_count > 0 {
                 theme.warning
             } else {
                 theme.text_faint
-            },
-            1.2,
-        );
-        x += 14.0;
-        text(
-            ui,
-            &mut x,
-            &warn_count.to_string(),
-            if warn_count > 0 {
-                theme.warning
-            } else {
-                theme.text_faint
-            },
-            style.tiny(),
-        );
-        let diag_hit = Rect::from_min_max(
-            Pos2::new(diag_start_x - 2.0, rect.top()),
-            Pos2::new(x + 2.0, rect.bottom()),
-        );
+            };
+            text(ui, &mut x, warn_text, warn_color, style.tiny());
+            Rect::from_min_max(
+                Pos2::new(diag_start_x - 2.0, rect.top()),
+                Pos2::new(x + 2.0, rect.bottom()),
+            )
+        };
         if ui
             .interact(diag_hit, ui.scope_id().with("status_problems"), Sense::click())
             .on_hover_text("显示问题面板 (Ctrl+Shift+M)")
@@ -2267,178 +2360,6 @@ impl KestrelApp {
             && editor.is_dirty()
         {
             text(ui, &mut x, "● 未保存", theme.accent, style.small());
-        }
-
-        // Right side
-        let mut rx = rect.right() - 12.0;
-        let mut item = |ui: &mut Ui, text_str: &str, color: Color32| -> Rect {
-            let width = ui.ctx().fonts_mut(|fonts| {
-                fonts
-                    .layout_job(LayoutJob::simple_singleline(
-                        text_str.to_string(),
-                        style.small(),
-                        color,
-                    ))
-                    .rect
-                    .width()
-            });
-            rx -= width;
-            let item_rect =
-                Rect::from_min_size(Pos2::new(rx, rect.center().y - 8.0), Vec2::new(width, 16.0));
-            ui.painter().text(
-                Pos2::new(rx, rect.center().y),
-                Align2::LEFT_CENTER,
-                text_str,
-                style.small(),
-                color,
-            );
-            rx -= 16.0;
-            item_rect
-        };
-        let mut zoom_rect = None;
-        if (self.settings.ui_zoom - 1.0).abs() > 0.01 {
-            zoom_rect = Some(item(
-                ui,
-                &format!("缩放 {:.0}%", self.settings.ui_zoom * 100.0),
-                theme.accent,
-            ));
-        }
-        let mut language_rect = None;
-        let mut active_language = None;
-        let mut pos_rect = None;
-        if let Some(editor) = self.tabs.get(self.active) {
-            if let Some(mm) = &editor.multimodal
-                && !mm.is_showing_source()
-            {
-                let size_str = editor
-                    .doc
-                    .path
-                    .as_deref()
-                    .and_then(|p| std::fs::metadata(p).ok())
-                    .map(|m| crate::viewer::image_view::format_bytes(m.len()))
-                    .unwrap_or_default();
-                item(ui, mm.kind().label(), theme.text_dim);
-                if !size_str.is_empty() {
-                    item(ui, &size_str, theme.text_faint);
-                }
-            } else if editor.doc.encoding == crate::doc::Encoding::Binary {
-                let size_str = editor
-                    .doc
-                    .path
-                    .as_deref()
-                    .and_then(|p| std::fs::metadata(p).ok())
-                    .map(|m| crate::viewer::image_view::format_bytes(m.len()))
-                    .unwrap_or_default();
-                item(ui, "二进制文件 (不可读取)", theme.warning);
-                if !size_str.is_empty() {
-                    item(ui, &size_str, theme.text_faint);
-                }
-            } else if editor.diff.is_some() {
-                item(ui, "Git 差异", theme.text_dim);
-            } else {
-                language_rect = Some(item(ui, editor.language.name(), theme.text_dim));
-                active_language = Some(editor.language);
-                item(ui, editor.doc.eol.as_str(), theme.text_faint);
-                item(ui, editor.doc.encoding.as_str(), theme.text_faint);
-                item(
-                    ui,
-                    &format!(
-                        "{}:{}",
-                        self.settings.tab_size,
-                        if self.settings.insert_spaces {
-                            "空格"
-                        } else {
-                            "制表符"
-                        }
-                    ),
-                    theme.text_faint,
-                );
-                let (line, col) = editor.doc.char_to_line_col(editor.caret);
-                let pos = if editor.extra_cursors.is_empty() {
-                    format!("行 {}, 列 {}", line + 1, col + 1)
-                } else {
-                    format!(
-                        "行 {}, 列 {} ({} 个光标)",
-                        line + 1,
-                        col + 1,
-                        editor.extra_cursors.len() + 1
-                    )
-                };
-                pos_rect = Some(item(ui, &pos, theme.text_dim));
-            }
-        }
-        if let Some(z_rect) = zoom_rect
-            && ui
-                .interact(
-                    z_rect.expand2(Vec2::new(4.0, 4.0)),
-                    ui.scope_id().with("status_zoom_reset"),
-                    Sense::click(),
-                )
-                .on_hover_text("点击重置界面缩放为 100% (Ctrl+0)")
-                .clicked()
-            {
-                let ctx = ui.ctx().clone();
-                self.set_ui_zoom(1.0, &ctx);
-            }
-        if let Some(p_rect) = pos_rect
-            && ui
-                .interact(
-                    p_rect.expand2(Vec2::new(4.0, 4.0)),
-                    ui.scope_id().with("status_goto_line"),
-                    Sense::click(),
-                )
-                .on_hover_text("转到行 (Ctrl+G)")
-                .clicked()
-            {
-                self.open_palette(PaletteMode::GotoLine);
-            }
-        if let Some(lang_rect) = language_rect
-            && let Some(language) = active_language
-        {
-            let resp = ui.interact(
-                lang_rect.expand2(Vec2::new(4.0, 4.0)),
-                ui.scope_id().with("status_language"),
-                Sense::click(),
-            );
-            if resp.hovered() {
-                ui.painter().rect_filled(
-                    lang_rect.expand2(Vec2::new(4.0, 3.0)),
-                    CornerRadius::same(4),
-                    theme.hover,
-                );
-                ui.painter().text(
-                    Pos2::new(lang_rect.left(), rect.center().y),
-                    Align2::LEFT_CENTER,
-                    language.name(),
-                    style.small(),
-                    theme.text,
-                );
-            }
-            if resp.on_hover_text("点击切换语言模式").clicked() {
-                self.open_palette(PaletteMode::Language);
-                self.palette.focus = true;
-            }
-        }
-
-        let plugin_items: Vec<(String, Option<String>)> = self
-            .plugins
-            .status_items()
-            .iter()
-            .map(|item| (item.text.clone(), item.command.clone()))
-            .collect();
-        for (index, (text, command)) in plugin_items.into_iter().enumerate() {
-            let rect_item = item(ui, &text, theme.text_dim);
-            if let Some(command) = command {
-                let resp = ui.interact(
-                    rect_item.expand2(Vec2::new(4.0, 4.0)),
-                    ui.scope_id().with(("status_plugin", index)),
-                    Sense::click(),
-                );
-                if resp.clicked()
-                    && let Some(command_index) = self.plugins.command_index_of_id(&command) {
-                        self.run_plugin_command(command_index);
-                    }
-            }
         }
     }
 

@@ -11,6 +11,10 @@ use ropey::Rope;
 use crate::highlight::{HighlightState, Language, Span, SyntaxEdit};
 use crate::lsp::{Diagnostic, OutlineSymbol};
 
+/// tree-sitter parses recursively. 1 MB covers deep nesting; reserving the old
+/// 4 MB per document bought nothing and cost address space per open tab.
+const WORKER_STACK_BYTES: usize = 1024 * 1024;
+
 enum Request {
     Edit(SyntaxEdit),
     ComputeRope { version: u64, rope: Rope },
@@ -27,7 +31,10 @@ pub struct SyntaxAnalysis {
 }
 
 pub struct SyntaxService {
-    tx: Sender<Request>,
+    language: Language,
+    /// Created on the first parse request: restored tabs nobody looks at must not
+    /// own a thread. `None` also means the worker failed to start.
+    tx: Option<Sender<Request>>,
     rx: Receiver<SyntaxAnalysis>,
     busy: bool,
     latest_version: u64,
@@ -35,28 +42,57 @@ pub struct SyntaxService {
 
 impl SyntaxService {
     pub fn new(language: Language) -> Self {
-        let (tx, req_rx) = channel();
-        let (out_tx, rx) = channel();
-        std::thread::Builder::new()
-            .name("kestrel-highlight".to_string())
-            .stack_size(4 * 1024 * 1024)
-            .spawn(move || worker(language, req_rx, out_tx))
-            .expect("spawn highlight thread");
+        let (_, rx) = channel::<SyntaxAnalysis>();
         Self {
-            tx,
+            language,
+            tx: None,
             rx,
             busy: false,
             latest_version: 0,
         }
     }
 
+    /// Start the worker on first use. A spawn failure disables background
+    /// highlighting for this document instead of panicking the UI thread.
+    fn ensure_worker(&mut self) -> bool {
+        if self.tx.is_some() {
+            return true;
+        }
+        let (request_tx, request_rx): (Sender<Request>, Receiver<Request>) = channel();
+        let (analysis_tx, analysis_rx): (Sender<SyntaxAnalysis>, Receiver<SyntaxAnalysis>) =
+            channel();
+        let language = self.language;
+        match std::thread::Builder::new()
+            .name("kestrel-highlight".to_string())
+            .stack_size(WORKER_STACK_BYTES)
+            .spawn(move || worker(language, request_rx, analysis_tx))
+        {
+            Ok(_) => {
+                self.tx = Some(request_tx);
+                self.rx = analysis_rx;
+                true
+            }
+            Err(err) => {
+                eprintln!("kestrel: 语法高亮线程启动失败: {err}");
+                false
+            }
+        }
+    }
+
     pub fn apply_edit(&mut self, edit: SyntaxEdit) {
-        let _ = self.tx.send(Request::Edit(edit));
+        // Edits only feed the incremental parser state, which the first request
+        // rebuilds from scratch; drop them until a worker exists.
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Request::Edit(edit));
+        }
     }
 
     pub fn reset(&mut self, language: Language) {
         self.busy = false;
-        let _ = self.tx.send(Request::Reset(language));
+        self.language = language;
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Request::Reset(language));
+        }
     }
 
     pub fn is_busy(&self) -> bool {
@@ -68,18 +104,37 @@ impl SyntaxService {
         if self.busy {
             return;
         }
+        if !self.ensure_worker() {
+            return;
+        }
         self.busy = true;
         self.latest_version = version;
-        let _ = self.tx.send(Request::ComputeRope { version, rope });
+        let send_failed = match &self.tx {
+            Some(tx) => tx.send(Request::ComputeRope { version, rope }).is_err(),
+            None => false,
+        };
+        if send_failed {
+            self.busy = false;
+        }
     }
 
     /// Latest finished analysis, if ready.
     pub fn poll_analysis(&mut self) -> Option<SyntaxAnalysis> {
         let mut latest: Option<SyntaxAnalysis> = None;
-        while let Ok(analysis) = self.rx.try_recv() {
-            self.busy = false;
-            if latest.as_ref().is_none_or(|prev| analysis.version >= prev.version) {
-                latest = Some(analysis);
+        loop {
+            match self.rx.try_recv() {
+                Ok(analysis) => {
+                    self.busy = false;
+                    if latest.as_ref().is_none_or(|prev| analysis.version >= prev.version) {
+                        latest = Some(analysis);
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                // Worker is gone; never wedge the editor in "always busy".
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.busy = false;
+                    break;
+                }
             }
         }
         latest
@@ -88,7 +143,9 @@ impl SyntaxService {
 
 impl Drop for SyntaxService {
     fn drop(&mut self) {
-        let _ = self.tx.send(Request::Shutdown);
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Request::Shutdown);
+        }
     }
 }
 

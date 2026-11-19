@@ -6,6 +6,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
 use ropey::Rope;
@@ -104,18 +105,35 @@ pub struct Document {
     /// Set when the file was not valid UTF-8/UTF-16 and got lossy-decoded.
     pub lossy: bool,
     /// Snapshot of saved/HEAD text (capped at 512 KB) used for gutter line-diff markers.
-    pub baseline_text: Option<String>,
+    /// Shared so a loaded/saved buffer can hand its text over instead of cloning it.
+    pub baseline_text: Option<Arc<str>>,
+    /// Scratch buffers reused by `save`, so repeated autosaves do not allocate the
+    /// whole document (and its CRLF/encoding copy) again every time.
+    save_text_buf: String,
+    save_bytes_buf: Vec<u8>,
 }
 
 const MAX_UNDO_GROUPS: usize = 800;
 const COALESCE_WINDOW_MS: u128 = 600;
 const MAX_BASELINE_BYTES: usize = 512 * 1024;
 
+/// Append `text` with `\n` rewritten to `\r\n`, straight into `out`.
+/// Saves the second full-size string that `str::replace` would allocate.
+fn push_crlf(out: &mut Vec<u8>, text: &str) {
+    let mut rest = text;
+    while let Some(index) = rest.find('\n') {
+        out.extend_from_slice(&rest.as_bytes()[..index]);
+        out.extend_from_slice(b"\r\n");
+        rest = &rest[index + 1..];
+    }
+    out.extend_from_slice(rest.as_bytes());
+}
+
 impl Document {
     pub fn from_text(text: &str) -> Self {
         let rope = Rope::from_str(text);
         let baseline = if text.len() <= MAX_BASELINE_BYTES {
-            Some(text.to_string())
+            Some(Arc::from(text))
         } else {
             None
         };
@@ -135,6 +153,8 @@ impl Document {
             readonly: false,
             lossy: false,
             baseline_text: baseline,
+            save_text_buf: String::new(),
+            save_bytes_buf: Vec::new(),
         }
     }
 
@@ -205,12 +225,12 @@ impl Document {
         } else {
             text
         };
-        let baseline = if encoding != Encoding::Binary && normalized.len() <= MAX_BASELINE_BYTES {
-            Some(normalized.clone())
-        } else {
-            None
-        };
         let rope = Rope::from_str(&normalized);
+        // The rope owns its own copy, so hand the decoded string to the baseline
+        // instead of cloning the file a second time.
+        let baseline: Option<Arc<str>> =
+            (encoding != Encoding::Binary && normalized.len() <= MAX_BASELINE_BYTES)
+                .then(|| Arc::from(normalized));
         let saved_text_hash = hash_rope(&rope);
         Ok(Self {
             rope,
@@ -227,6 +247,8 @@ impl Document {
             readonly,
             lossy,
             baseline_text: baseline,
+            save_text_buf: String::new(),
+            save_bytes_buf: Vec::new(),
         })
     }
 
@@ -261,39 +283,67 @@ impl Document {
         if self.disk_changed() {
             return SaveOutcome::DiskChanged;
         }
-        let mut out = String::with_capacity(self.rope.len_bytes() + 2);
+        // Take the scratch buffers out of self so the rope can be walked while
+        // they are written; they go back at the end and are reused next save.
+        let mut text = std::mem::take(&mut self.save_text_buf);
+        text.clear();
+        text.reserve(self.rope.len_bytes() + 2);
         for chunk in self.rope.chunks() {
-            out.push_str(chunk);
+            text.push_str(chunk);
         }
-        if out.len() <= MAX_BASELINE_BYTES {
-            self.baseline_text = Some(out.clone());
+        if text.len() <= MAX_BASELINE_BYTES {
+            self.baseline_text = Some(Arc::from(text.as_str()));
         }
-        if self.eol == Eol::CrLf {
-            out = out.replace('\n', "\r\n");
-        }
-        let mut bytes = Vec::with_capacity(out.len() + 4);
+        let crlf = self.eol == Eol::CrLf;
+        let mut bytes = std::mem::take(&mut self.save_bytes_buf);
+        bytes.clear();
         match self.encoding {
-            Encoding::Utf16Le => {
-                bytes.extend_from_slice(&[0xFF, 0xFE]);
-                for u in out.encode_utf16() {
-                    bytes.extend_from_slice(&u.to_le_bytes());
-                }
-            }
-            Encoding::Utf16Be => {
-                bytes.extend_from_slice(&[0xFE, 0xFF]);
-                for u in out.encode_utf16() {
-                    bytes.extend_from_slice(&u.to_be_bytes());
+            Encoding::Utf16Le | Encoding::Utf16Be => {
+                let little_endian = self.encoding == Encoding::Utf16Le;
+                bytes.reserve(text.len() * 2 + 2);
+                bytes.extend_from_slice(if little_endian {
+                    &[0xFF, 0xFE]
+                } else {
+                    &[0xFE, 0xFF]
+                });
+                for unit in text.encode_utf16() {
+                    // Newlines are single UTF-16 units, so CRLF needs no second pass.
+                    if crlf && unit == u16::from(b'\n') {
+                        let cr: [u8; 2] = if little_endian {
+                            0x0Du16.to_le_bytes()
+                        } else {
+                            0x0Du16.to_be_bytes()
+                        };
+                        bytes.extend_from_slice(&cr);
+                    }
+                    let raw: [u8; 2] = if little_endian {
+                        unit.to_le_bytes()
+                    } else {
+                        unit.to_be_bytes()
+                    };
+                    bytes.extend_from_slice(&raw);
                 }
             }
             _ => {
                 if self.bom || self.encoding == Encoding::Utf8Bom {
                     bytes.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
                 }
-                bytes.extend_from_slice(out.as_bytes());
+                bytes.reserve(if crlf {
+                    text.len() + self.rope.len_lines()
+                } else {
+                    text.len()
+                });
+                if crlf {
+                    push_crlf(&mut bytes, &text);
+                } else {
+                    bytes.extend_from_slice(text.as_bytes());
+                }
             }
         }
         let tmp = temp_path(&path);
-        let written = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, &path));
+        let written = std::fs::write(&tmp, &bytes).and_then(|()| std::fs::rename(&tmp, &path));
+        self.save_text_buf = text;
+        self.save_bytes_buf = bytes;
         if let Err(err) = written {
             let _ = std::fs::remove_file(&tmp);
             return if err.kind() == io::ErrorKind::PermissionDenied {
@@ -834,6 +884,40 @@ mod tests {
         assert!(doc.readonly);
         assert!(doc.lossy);
         assert_eq!(doc.len_chars(), 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_reuses_buffers_and_refreshes_baseline() {
+        let path = temp_path("reuse.txt");
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let mut doc = Document::load(&path).unwrap();
+        assert_eq!(doc.baseline_text.as_deref(), Some("one\ntwo\n"));
+        doc.edit(0, 0, "x", EditKind::Other, (0, 0), (1, 1));
+        assert!(matches!(doc.save(), SaveOutcome::Saved));
+        let text_capacity = doc.save_text_buf.capacity();
+        let bytes_capacity = doc.save_bytes_buf.capacity();
+        assert_eq!(doc.baseline_text.as_deref(), Some("xone\ntwo\n"));
+        // Same-length edit: the next save must reuse the same scratch allocations.
+        doc.edit(0, 1, "y", EditKind::Other, (0, 0), (1, 1));
+        assert!(matches!(doc.save(), SaveOutcome::Saved));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "yone\ntwo\n");
+        // The scratch allocations survive the save instead of being rebuilt.
+        assert_eq!(doc.save_text_buf.capacity(), text_capacity);
+        assert_eq!(doc.save_bytes_buf.capacity(), bytes_capacity);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn crlf_save_rewrites_newlines_in_place() {
+        let path = temp_path("crlf_inplace.txt");
+        std::fs::write(&path, b"a\r\nb\r\n").unwrap();
+        let mut doc = Document::load(&path).unwrap();
+        assert_eq!(doc.eol, Eol::CrLf);
+        doc.edit(1, 1, "X", EditKind::Other, (1, 1), (2, 2));
+        assert!(matches!(doc.save(), SaveOutcome::Saved));
+        assert_eq!(std::fs::read(&path).unwrap(), b"aX\r\nb\r\n");
+        assert_eq!(doc.save_bytes_buf, b"aX\r\nb\r\n");
         let _ = std::fs::remove_file(&path);
     }
 }
