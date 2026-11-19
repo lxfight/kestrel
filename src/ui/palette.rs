@@ -1,16 +1,18 @@
 //! Command palette / quick open / goto line / symbol outline / branch switcher overlay.
 
+use egui::text::LayoutJob;
 use egui::{
     Align2, Area, CornerRadius, Frame, Key, Margin, Order, Pos2, Rect, Sense, Stroke, Ui, UiBuilder,
     Vec2,
 };
 
-use crate::app::{KestrelApp, PaletteItem, PaletteMode};
+use crate::app::{split_file_line, KestrelApp, PaletteItem, PaletteMode};
 use crate::icons::{self, Icon};
 use crate::ui::{widgets, UiStyle};
 
 const MAX_ROWS: usize = 12;
 const ROW_H: f32 = 30.0;
+const GROUP_H: f32 = 22.0;
 
 impl KestrelApp {
     pub fn palette_ui(&mut self, ctx: &egui::Context) {
@@ -76,7 +78,7 @@ impl KestrelApp {
                 if self.workspace.index.is_loading() {
                     "正在索引文件…"
                 } else {
-                    "按文件名搜索"
+                    "按文件名搜索，或输入 文件:行号 直接跳转"
                 }
             }
             PaletteMode::GotoLine => "输入行号…",
@@ -195,9 +197,19 @@ impl KestrelApp {
                     }
 
                     if count == 0 {
-                        ui.add_space(14.0);
+                        ui.add_space(18.0);
                         ui.horizontal(|ui| {
                             ui.add_space(16.0);
+                            let (icon_rect, _) =
+                                ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
+                            icons::paint(
+                                ui.painter(),
+                                icon_rect,
+                                Icon::Search,
+                                theme.text_faint,
+                                1.2,
+                            );
+                            ui.add_space(2.0);
                             let text = if self.palette.mode == PaletteMode::QuickOpen
                                 && self.workspace.index.is_loading()
                             {
@@ -211,14 +223,43 @@ impl KestrelApp {
                                     .color(theme.text_faint),
                             );
                         });
-                        ui.add_space(14.0);
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(40.0);
+                            let hint = match self.palette.mode {
+                                PaletteMode::QuickOpen => {
+                                    "换个关键词，或输入 文件:行号 直接跳转"
+                                }
+                                PaletteMode::Commands => "换个关键词试试，Esc 关闭",
+                                _ => "Esc 关闭",
+                            };
+                            ui.label(
+                                egui::RichText::new(hint)
+                                    .font(style.tiny())
+                                    .color(theme.text_faint),
+                            );
+                        });
+                        ui.add_space(16.0);
                         return;
                     }
 
-                    ui.add_space(4.0);
+                    ui.add_space(2.0);
                     let start = self.palette.window_start;
                     let end = (start + MAX_ROWS).min(count);
                     for index in start..end {
+                        if let Some(header) = self.palette_group_header(index) {
+                            let (header_rect, _) = ui.allocate_exact_size(
+                                Vec2::new(ui.available_width(), GROUP_H),
+                                Sense::hover(),
+                            );
+                            ui.painter().text(
+                                Pos2::new(header_rect.left() + 16.0, header_rect.bottom() - 5.0),
+                                Align2::LEFT_BOTTOM,
+                                header,
+                                style.font(10.5),
+                                theme.text_faint,
+                            );
+                        }
                         let selected = index == self.palette.selected;
                         let item = self
                             .palette
@@ -270,8 +311,14 @@ impl KestrelApp {
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         ui.add_space(14.0);
+                        let hint = match self.palette.mode {
+                            PaletteMode::QuickOpen => {
+                                "↑↓ 选择    Enter 打开    文件:行号 直接跳转    Esc 关闭"
+                            }
+                            _ => "↑↓ 选择    Enter 确认    Esc 关闭",
+                        };
                         ui.label(
-                            egui::RichText::new("↑↓ 选择    Enter 确认    Esc 关闭")
+                            egui::RichText::new(hint)
                                 .font(style.tiny())
                                 .color(theme.text_faint),
                         );
@@ -316,6 +363,53 @@ impl KestrelApp {
         }
     }
 
+    /// Group title shown above a palette row, or None when the row joins the
+    /// current group. Only the empty-query command list is grouped.
+    fn palette_group_header(&self, index: usize) -> Option<String> {
+        if self.palette.mode != PaletteMode::Commands || !self.palette.query.trim().is_empty() {
+            return None;
+        }
+        let item = self
+            .palette
+            .filtered
+            .get(index)
+            .and_then(|idx| self.palette.items.get(*idx))?;
+        let (is_recent, category) = self.palette_item_group(item);
+        if index == 0 {
+            return Some(if is_recent { "最近使用".to_string() } else { category.to_string() });
+        }
+        let previous = self
+            .palette
+            .filtered
+            .get(index - 1)
+            .and_then(|idx| self.palette.items.get(*idx))?;
+        let (previous_recent, previous_category) = self.palette_item_group(previous);
+        if is_recent && !previous_recent {
+            Some("最近使用".to_string())
+        } else if !is_recent && (previous_recent || previous_category != category) {
+            Some(category.to_string())
+        } else {
+            None
+        }
+    }
+
+    fn palette_item_group<'a>(&'a self, item: &'a PaletteItem) -> (bool, &'a str) {
+        match item {
+            PaletteItem::Command(command) => (
+                self.settings
+                    .recent_commands
+                    .iter()
+                    .any(|id| id == command.id()),
+                command.category(),
+            ),
+            PaletteItem::PluginCommand(id) => (
+                self.settings.recent_commands.iter().any(|entry| entry == id),
+                self.plugins.command_category_of(id).unwrap_or("插件"),
+            ),
+            _ => (false, ""),
+        }
+    }
+
     fn palette_row(
         &self,
         ui: &mut Ui,
@@ -325,23 +419,11 @@ impl KestrelApp {
         selected: bool,
     ) {
         let theme = style.theme;
-        let (primary, secondary) = self.palette_text(item);
-        let query = self.palette.query.trim().to_string();
-        let positions: Vec<usize> = match item {
-            PaletteItem::File(path) => {
-                let name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                crate::fuzzy::fuzzy_match(&query, &name)
-                    .map(|m| m.positions)
-                    .unwrap_or_default()
-            }
-            _ => crate::fuzzy::fuzzy_match(&query, &primary)
-                .map(|m| m.positions)
-                .unwrap_or_default(),
-        };
+        let raw_query = self.palette.query.trim().to_string();
+        let (query, _) = split_file_line(&raw_query);
+        let query = query.to_string();
         let mut x = rect.left() + 16.0;
+        let mut shortcut_text = String::new();
         match item {
             PaletteItem::File(path) => {
                 icons::paint_path_icon(
@@ -354,6 +436,57 @@ impl KestrelApp {
                     theme.kind.is_dark(),
                 );
                 x += 24.0;
+                let rel = self
+                    .workspace
+                    .root
+                    .as_ref()
+                    .and_then(|root| path.strip_prefix(root).ok())
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|| path.to_string_lossy().to_string());
+                let dir_chars = rel
+                    .rfind(['/', '\\'])
+                    .map(|index| index + 1)
+                    .unwrap_or(0);
+                let split: String = rel.chars().take(dir_chars).collect();
+                let name: String = rel.chars().skip(dir_chars).collect();
+                let dir_max = (rect.right() - x - 140.0).max(0.0);
+                if !split.is_empty() {
+                    let (galley, cut) =
+                        widgets::ellipsize(ui, &split, style.small(), theme.text_faint, dir_max);
+                    let width = galley.rect.width();
+                    ui.painter().galley(
+                        Pos2::new(x, rect.center().y - galley.rect.height() * 0.5),
+                        galley,
+                        theme.text_faint,
+                    );
+                    x += width;
+                    if cut {
+                        x -= 2.0;
+                    }
+                }
+                let positions: Vec<usize> = crate::fuzzy::fuzzy_match(&query, &rel)
+                    .map(|m| m.positions)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|index| *index >= dir_chars)
+                    .map(|index| index - dir_chars)
+                    .collect();
+                let name_color = if selected { theme.text } else { theme.text_dim };
+                let name_clip = Rect::from_min_max(
+                    Pos2::new(x, rect.top()),
+                    Pos2::new(rect.right() - 12.0, rect.bottom()),
+                );
+                paint_highlighted(
+                    ui,
+                    style,
+                    &name,
+                    &positions,
+                    x,
+                    rect.center().y,
+                    name_clip,
+                    name_color,
+                    theme.accent,
+                );
             }
             PaletteItem::Command(command) => {
                 icons::paint(
@@ -368,17 +501,41 @@ impl KestrelApp {
                     1.2,
                 );
                 x += 22.0;
-                let tag = command.category();
-                ui.painter().text(
-                    Pos2::new(x, rect.center().y),
-                    Align2::LEFT_CENTER,
-                    tag,
-                    style.tiny(),
-                    theme.text_faint,
+                // The empty-query list is grouped by category headers, so the inline
+                // tag would only repeat the header.
+                if !self.palette.query.trim().is_empty() {
+                    let tag = command.category();
+                    let tag_width =
+                        paint_tag(ui, style, tag, x, rect.center().y, theme.text_faint);
+                    x += tag_width + 8.0;
+                }
+                shortcut_text = self
+                    .custom_shortcuts
+                    .get(command)
+                    .map(|shortcut| shortcut.display())
+                    .or_else(|| command.shortcut_text())
+                    .unwrap_or_default();
+                let positions = crate::fuzzy::fuzzy_match(&query, command.label())
+                    .map(|m| m.positions)
+                    .unwrap_or_default();
+                let color = if selected { theme.text } else { theme.text_dim };
+                let clip = Rect::from_min_max(
+                    Pos2::new(x, rect.top()),
+                    Pos2::new(rect.right() - 12.0, rect.bottom()),
                 );
-                x += 44.0;
+                paint_highlighted(
+                    ui,
+                    style,
+                    command.label(),
+                    &positions,
+                    x,
+                    rect.center().y,
+                    clip,
+                    color,
+                    theme.accent,
+                );
             }
-            PaletteItem::PluginCommand(_) => {
+            PaletteItem::PluginCommand(id) => {
                 icons::paint(
                     ui.painter(),
                     Rect::from_center_size(Pos2::new(x + 7.0, rect.center().y), Vec2::splat(14.0)),
@@ -391,23 +548,37 @@ impl KestrelApp {
                     1.2,
                 );
                 x += 22.0;
-                let id = match item {
-                    PaletteItem::PluginCommand(id) => id.as_str(),
-                    _ => "",
-                };
-                let tag = self
-                    .plugins
-                    .command_category_of(id)
-                    .unwrap_or_default()
-                    .to_string();
-                ui.painter().text(
-                    Pos2::new(x, rect.center().y),
-                    Align2::LEFT_CENTER,
-                    tag,
-                    style.tiny(),
-                    theme.text_faint,
+                if !self.palette.query.trim().is_empty() {
+                    let tag = self
+                        .plugins
+                        .command_category_of(id)
+                        .unwrap_or_default()
+                        .to_string();
+                    let tag_width =
+                        paint_tag(ui, style, &tag, x, rect.center().y, theme.text_faint);
+                    x += tag_width + 8.0;
+                }
+                let (primary, secondary) = self.palette_text(item);
+                shortcut_text = secondary;
+                let positions = crate::fuzzy::fuzzy_match(&query, &primary)
+                    .map(|m| m.positions)
+                    .unwrap_or_default();
+                let color = if selected { theme.text } else { theme.text_dim };
+                let clip = Rect::from_min_max(
+                    Pos2::new(x, rect.top()),
+                    Pos2::new(rect.right() - 12.0, rect.bottom()),
                 );
-                x += 44.0;
+                paint_highlighted(
+                    ui,
+                    style,
+                    &primary,
+                    &positions,
+                    x,
+                    rect.center().y,
+                    clip,
+                    color,
+                    theme.accent,
+                );
             }
             PaletteItem::Language(_) => {
                 icons::paint(
@@ -418,6 +589,27 @@ impl KestrelApp {
                     1.3,
                 );
                 x += 22.0;
+                let (primary, secondary) = self.palette_text(item);
+                let positions = crate::fuzzy::fuzzy_match(&query, &primary)
+                    .map(|m| m.positions)
+                    .unwrap_or_default();
+                let color = if selected { theme.text } else { theme.text_dim };
+                let clip = Rect::from_min_max(
+                    Pos2::new(x, rect.top()),
+                    Pos2::new(rect.right() - 12.0, rect.bottom()),
+                );
+                paint_highlighted(
+                    ui,
+                    style,
+                    &primary,
+                    &positions,
+                    x,
+                    rect.center().y,
+                    clip,
+                    color,
+                    theme.accent,
+                );
+                shortcut_text = secondary;
             }
             PaletteItem::Symbol(sym) => {
                 icons::paint(
@@ -428,8 +620,28 @@ impl KestrelApp {
                     1.2,
                 );
                 x += 22.0;
+                let positions = crate::fuzzy::fuzzy_match(&query, &sym.name)
+                    .map(|m| m.positions)
+                    .unwrap_or_default();
+                let color = if selected { theme.text } else { theme.text_dim };
+                let clip = Rect::from_min_max(
+                    Pos2::new(x, rect.top()),
+                    Pos2::new(rect.right() - 12.0, rect.bottom()),
+                );
+                paint_highlighted(
+                    ui,
+                    style,
+                    &sym.name,
+                    &positions,
+                    x,
+                    rect.center().y,
+                    clip,
+                    color,
+                    theme.accent,
+                );
+                shortcut_text = format!("第 {} 行", sym.start_line + 1);
             }
-            PaletteItem::Branch(_) => {
+            PaletteItem::Branch(branch) => {
                 icons::paint(
                     ui.painter(),
                     Rect::from_center_size(Pos2::new(x + 7.0, rect.center().y), Vec2::splat(14.0)),
@@ -438,73 +650,139 @@ impl KestrelApp {
                     1.2,
                 );
                 x += 22.0;
+                let positions = crate::fuzzy::fuzzy_match(&query, branch)
+                    .map(|m| m.positions)
+                    .unwrap_or_default();
+                let color = if selected { theme.text } else { theme.text_dim };
+                let clip = Rect::from_min_max(
+                    Pos2::new(x, rect.top()),
+                    Pos2::new(rect.right() - 12.0, rect.bottom()),
+                );
+                paint_highlighted(
+                    ui,
+                    style,
+                    branch,
+                    &positions,
+                    x,
+                    rect.center().y,
+                    clip,
+                    color,
+                    theme.accent,
+                );
+                if *branch == self.git.snapshot.branch {
+                    shortcut_text = "当前分支".to_string();
+                }
             }
         }
 
-        let base_font = style.font(13.0);
-        let primary_clip = Rect::from_min_max(
-            Pos2::new(x, rect.top()),
-            Pos2::new(rect.right() - 120.0, rect.bottom()),
-        );
-        let painter = ui.painter().with_clip_rect(primary_clip);
-        let mut run_start = 0usize;
-        let chars: Vec<char> = primary.chars().collect();
-        let mut run_is_match = positions.contains(&0);
-        for i in 0..chars.len() {
-            let is_match = positions.contains(&i);
-            if is_match != run_is_match {
-                let text: String = chars[run_start..i].iter().collect();
-                let color = if run_is_match {
-                    theme.accent
-                } else if selected {
-                    theme.text
-                } else {
-                    theme.text_dim
-                };
-                painter.text(
-                    Pos2::new(x, rect.center().y),
-                    Align2::LEFT_CENTER,
-                    &text,
-                    base_font.clone(),
-                    color,
-                );
-                x += ui.ctx().fonts_mut(|fonts| {
-                    fonts
-                        .layout_job(egui::text::LayoutJob::simple_singleline(
-                            text,
-                            base_font.clone(),
-                            color,
-                        ))
-                        .rect
-                        .width()
-                });
-                run_start = i;
-                run_is_match = is_match;
-            }
-        }
-        let text: String = chars[run_start..].iter().collect();
-        let color = if run_is_match {
-            theme.accent
-        } else if selected {
-            theme.text
-        } else {
-            theme.text_dim
-        };
-        painter.text(
-            Pos2::new(x, rect.center().y),
-            Align2::LEFT_CENTER,
-            &text,
-            base_font.clone(),
-            color,
-        );
-        if !secondary.is_empty() {
-            ui.painter().text(
-                Pos2::new(rect.right() - 16.0, rect.center().y),
-                Align2::RIGHT_CENTER,
-                &secondary,
-                style.tiny(),
+        if !shortcut_text.is_empty() {
+            let galley = ui.ctx().fonts_mut(|fonts| {
+                fonts.layout_job(LayoutJob::simple_singleline(
+                    shortcut_text,
+                    style.tiny(),
+                    theme.text_faint,
+                ))
+            });
+            let width = galley.rect.width();
+            ui.painter().galley(
+                Pos2::new(
+                    rect.right() - 14.0 - width,
+                    rect.center().y - galley.rect.height() * 0.5,
+                ),
+                galley,
                 theme.text_faint,
             );
         }
     }
+}
+
+/// Paint a faint category tag and return its pixel width.
+fn paint_tag(
+    ui: &mut Ui,
+    style: &UiStyle,
+    text: &str,
+    x: f32,
+    center_y: f32,
+    color: egui::Color32,
+) -> f32 {
+    if text.is_empty() {
+        return 0.0;
+    }
+    let galley = ui.ctx().fonts_mut(|fonts| {
+        fonts.layout_job(LayoutJob::simple_singleline(
+            text.to_string(),
+            style.tiny(),
+            color,
+        ))
+    });
+    let width = galley.rect.width();
+    ui.painter().galley(
+        Pos2::new(x, center_y - galley.rect.height() * 0.5),
+        galley,
+        color,
+    );
+    width
+}
+
+/// Paint one string, tinting fuzzy-match characters with the accent colour.
+#[allow(clippy::too_many_arguments)]
+fn paint_highlighted(
+    ui: &Ui,
+    style: &UiStyle,
+    text: &str,
+    positions: &[usize],
+    start_x: f32,
+    center_y: f32,
+    clip: Rect,
+    base_color: egui::Color32,
+    match_color: egui::Color32,
+) {
+    let painter = ui.painter().with_clip_rect(clip);
+    let font = style.font(13.0);
+    let chars: Vec<char> = text.chars().collect();
+    let mut x = start_x;
+    let mut run_start = 0usize;
+    let mut run_is_match = positions.contains(&0);
+    for index in 0..chars.len() {
+        let is_match = positions.contains(&index);
+        if is_match != run_is_match {
+            let run: String = chars[run_start..index].iter().collect();
+            let color = if run_is_match { match_color } else { base_color };
+            let width = paint_run(ui, &painter, &run, &font, x, center_y, color);
+            x += width;
+            run_start = index;
+            run_is_match = is_match;
+        }
+    }
+    let run: String = chars[run_start..].iter().collect();
+    let color = if run_is_match { match_color } else { base_color };
+    let _ = paint_run(ui, &painter, &run, &font, x, center_y, color);
+}
+
+fn paint_run(
+    ui: &Ui,
+    painter: &egui::Painter,
+    text: &str,
+    font: &egui::FontId,
+    x: f32,
+    center_y: f32,
+    color: egui::Color32,
+) -> f32 {
+    if text.is_empty() {
+        return 0.0;
+    }
+    let galley = ui.ctx().fonts_mut(|fonts| {
+        fonts.layout_job(LayoutJob::simple_singleline(
+            text.to_string(),
+            font.clone(),
+            color,
+        ))
+    });
+    let width = galley.rect.width();
+    painter.galley(
+        Pos2::new(x, center_y - galley.rect.height() * 0.5),
+        galley,
+        color,
+    );
+    width
 }

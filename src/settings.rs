@@ -29,6 +29,14 @@ pub struct Settings {
     pub scroll_past_end: bool,
     pub show_hidden_files: bool,
     pub autosave: bool,
+    pub format_on_save: bool,
+    pub trim_trailing_whitespace: bool,
+    pub auto_close_pairs: bool,
+    pub detect_indentation: bool,
+    /// Recent project-search queries, newest first (capped at 10).
+    pub search_history: Vec<String>,
+    /// Recently run palette command ids, newest first (capped at 6).
+    pub recent_commands: Vec<String>,
     pub terminal_height: f32,
     pub sidebar_width: f32,
     pub outline_height: f32,
@@ -62,6 +70,12 @@ impl Default for Settings {
             scroll_past_end: true,
             show_hidden_files: false,
             autosave: true,
+            format_on_save: false,
+            trim_trailing_whitespace: false,
+            auto_close_pairs: true,
+            detect_indentation: true,
+            search_history: Vec::new(),
+            recent_commands: Vec::new(),
             terminal_height: 230.0,
             sidebar_width: 268.0,
             outline_height: 170.0,
@@ -176,6 +190,29 @@ impl Settings {
         self.save();
     }
 
+    /// Remember a project-search query; newest first, capped at 10.
+    pub fn push_search_history(&mut self, query: &str) {
+        let query = query.trim();
+        if query.is_empty() {
+            return;
+        }
+        self.search_history.retain(|entry| entry != query);
+        self.search_history.insert(0, query.to_string());
+        self.search_history.truncate(10);
+        self.save();
+    }
+
+    /// Remember a palette command; newest first, capped at 6.
+    pub fn push_recent_command(&mut self, id: &str) {
+        if self.recent_commands.first().is_some_and(|entry| entry == id) {
+            return;
+        }
+        self.recent_commands.retain(|entry| entry != id);
+        self.recent_commands.insert(0, id.to_string());
+        self.recent_commands.truncate(6);
+        self.save();
+    }
+
     pub fn line_px(&self) -> f32 {
         (self.font_size * self.line_height).round()
     }
@@ -202,9 +239,8 @@ fn write_settings(settings: &Settings) {
     if let Ok(text) = serde_json::to_string_pretty(settings) {
         let _ = std::fs::write(Settings::settings_path(), text);
     }
-    if !settings.keybindings.is_empty()
-        && let Ok(kb) = serde_json::to_string_pretty(&settings.keybindings)
-    {
+    // Always write the file: clearing every override must remove stale ones too.
+    if let Ok(kb) = serde_json::to_string_pretty(&settings.keybindings) {
         let _ = std::fs::write(Settings::keybindings_path(), kb);
     }
 }
@@ -323,6 +359,41 @@ mod tests {
     #[test]
     fn autosave_is_enabled_by_default() {
         assert!(Settings::default().autosave);
+    }
+
+    #[test]
+    fn new_preference_defaults_and_legacy_settings_parse() {
+        let defaults = Settings::default();
+        assert!(!defaults.format_on_save);
+        assert!(!defaults.trim_trailing_whitespace);
+        assert!(defaults.auto_close_pairs);
+        assert!(defaults.detect_indentation);
+        assert!(defaults.scroll_past_end);
+        assert!(defaults.search_history.is_empty());
+
+        let legacy = r#"{"theme":"light","font_size":15.0}"#;
+        let parsed: Settings = serde_json::from_str(legacy).unwrap();
+        assert_eq!(parsed.theme, "light");
+        assert!(parsed.auto_close_pairs);
+        assert!(parsed.search_history.is_empty());
+    }
+
+    #[test]
+    fn search_history_and_recent_commands_cap_and_dedupe() {
+        let mut settings = Settings::default();
+        for index in 0..14 {
+            settings.push_search_history(&format!("q{index}"));
+        }
+        settings.push_search_history("q13");
+        assert_eq!(settings.search_history.len(), 10);
+        assert_eq!(settings.search_history[0], "q13");
+        assert_eq!(settings.search_history.iter().filter(|q| *q == "q13").count(), 1);
+
+        for index in 0..9 {
+            settings.push_recent_command(&format!("cmd.{index}"));
+        }
+        assert_eq!(settings.recent_commands.len(), 6);
+        assert_eq!(settings.recent_commands[0], "cmd.8");
     }
 
     #[test]

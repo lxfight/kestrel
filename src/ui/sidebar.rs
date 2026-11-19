@@ -9,8 +9,12 @@ use egui::{
     Align2, CornerRadius, Pos2, Rect, ScrollArea, Sense, Stroke, StrokeKind, TextEdit, Ui, Vec2,
 };
 
-use crate::app::{KestrelApp, SidebarMode, ToastKind, TreeClipboard, TreeClipboardKind, TreeEditKind};
+use crate::app::{
+    KestrelApp, SidebarMode, ToastKind, TreeClipboard, TreeClipboardKind, TreeEditKind,
+};
 use crate::git::GitFileStatus;
+use crate::workspace::FileTree;
+use crate::workspace::search::{SearchQuery, replace_match_at};
 use crate::icons::{self, Icon};
 use crate::ui::widgets;
 use crate::ui::UiStyle;
@@ -39,6 +43,14 @@ impl KestrelApp {
 
     fn explorer_ui(&mut self, ui: &mut Ui, style: &UiStyle) {
         let theme = style.theme;
+        // Other panels update the single selection directly; fold it back into the
+        // multi-selection set so batch actions always see a consistent state.
+        if let Some(selected) = self.sidebar.selected.clone()
+            && !self.sidebar.selected_paths.contains(&selected)
+        {
+            self.sidebar.selected_paths.clear();
+            self.sidebar.selected_paths.insert(selected);
+        }
         let mut new_file = false;
         let mut new_folder = false;
         let mut refresh = false;
@@ -208,7 +220,6 @@ impl KestrelApp {
         let mut toggle: Option<PathBuf> = None;
         let mut open_preview: Option<PathBuf> = None;
         let mut open_pinned: Option<PathBuf> = None;
-        let mut select: Option<PathBuf> = None;
         let mut context_action: Option<TreeContext> = None;
         let mut drag_start_path: Option<PathBuf> = None;
         let mut move_tree: Option<(PathBuf, PathBuf)> = None;
@@ -249,9 +260,14 @@ impl KestrelApp {
             && let Some(selected_path) = self.sidebar.selected.clone()
         {
             if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F2)) {
-                context_action = Some(TreeContext::Rename(selected_path.clone()));
+                context_action = Some(TreeContext::Rename(selected_path));
             } else if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Delete)) {
-                context_action = Some(TreeContext::Delete(selected_path));
+                let selection = self.explorer_selection();
+                context_action = Some(if selection.len() > 1 {
+                    TreeContext::DeletePaths(selection)
+                } else {
+                    TreeContext::Delete(selected_path)
+                });
             }
         }
 
@@ -289,8 +305,9 @@ impl KestrelApp {
                 }
                 let mut edit_drawn = false;
                 let mut editing_active = editing;
-                for row in &rows {
-                    let is_selected = self.sidebar.selected.as_ref() == Some(&row.path);
+                for (row_index, row) in rows.iter().enumerate() {
+                    let is_selected = self.sidebar.selected_paths.contains(&row.path);
+                    let is_primary = self.sidebar.selected.as_ref() == Some(&row.path);
                     let is_cut = self.sidebar.clipboard.as_ref().is_some_and(|c| {
                         c.kind == TreeClipboardKind::Cut && c.path == row.path
                     });
@@ -335,7 +352,7 @@ impl KestrelApp {
                             move_tree = Some((src.clone(), row.path.clone()));
                         }
                     }
-                    if is_selected {
+                    if is_primary {
                         ui.painter().rect_filled(
                             Rect::from_min_size(
                                 Pos2::new(rect.left(), rect.top() + 3.0),
@@ -407,7 +424,7 @@ impl KestrelApp {
                         *kind == TreeEditKind::Rename && original.as_ref() == Some(&row.path)
                     });
                     if is_edit_row {
-                        if let Some((_, _, _, name, focus)) = edit.as_ref() {
+                        if let Some((kind, edit_parent, original, name, focus)) = edit.as_ref() {
                             let mut name = name.clone();
                             let te_rect = Rect::from_min_max(
                                 Pos2::new(rect.left() + indent + 33.0, rect.top() + 2.0),
@@ -430,13 +447,32 @@ impl KestrelApp {
                             {
                                 edit.name = name.clone();
                             }
+                            let error = Self::tree_edit_error(
+                                *kind,
+                                edit_parent,
+                                original.as_deref(),
+                                &name,
+                            );
+                            if error.is_some() {
+                                ui.painter().rect_stroke(
+                                    te_rect,
+                                    CornerRadius::same(3),
+                                    Stroke::new(1.0, theme.error),
+                                    StrokeKind::Inside,
+                                );
+                            }
                             let enter = te_resp.lost_focus()
                                 && ui.input(|i| i.key_pressed(egui::Key::Enter));
                             let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
-                            if enter {
+                            if enter && error.is_none() {
                                 commit_edit = true;
+                            } else if enter {
+                                te_resp.request_focus();
                             } else if escape || (!*focus && te_resp.lost_focus()) {
                                 cancel_edit = true;
+                            }
+                            if let Some(error) = error {
+                                Self::tree_edit_hint(ui, style, indent + 34.0, &error);
                             }
                             edit_drawn = true;
                         }
@@ -482,17 +518,58 @@ impl KestrelApp {
                             drag_start_path = Some(row.path.clone());
                         }
                         if resp.double_clicked() && !row.is_dir {
-                            select = Some(row.path.clone());
+                            self.select_explorer_path(&row.path);
                             open_pinned = Some(row.path.clone());
                         } else if resp.clicked() {
-                            select = Some(row.path.clone());
-                            if row.is_dir {
-                                toggle = Some(row.path.clone());
+                            let mods = ui.input(|i| i.modifiers);
+                            let shift = mods.shift;
+                            let additive = mods.command || mods.ctrl;
+                            if shift {
+                                let anchor_index = self
+                                    .sidebar
+                                    .selection_anchor
+                                    .as_ref()
+                                    .and_then(|anchor| {
+                                        rows.iter().position(|candidate| &candidate.path == anchor)
+                                    });
+                                if let Some(anchor_index) = anchor_index {
+                                    let (low, high) = if anchor_index <= row_index {
+                                        (anchor_index, row_index)
+                                    } else {
+                                        (row_index, anchor_index)
+                                    };
+                                    self.sidebar.selected_paths = rows[low..=high]
+                                        .iter()
+                                        .map(|candidate| candidate.path.clone())
+                                        .collect();
+                                    self.sidebar.selected = Some(row.path.clone());
+                                } else {
+                                    self.select_explorer_path(&row.path);
+                                }
+                            } else if additive {
+                                if self.sidebar.selected_paths.contains(&row.path)
+                                    && self.sidebar.selected_paths.len() > 1
+                                {
+                                    self.sidebar.selected_paths.remove(&row.path);
+                                    self.sidebar.selected =
+                                        self.sidebar.selected_paths.iter().next().cloned();
+                                } else {
+                                    self.sidebar.selected_paths.insert(row.path.clone());
+                                    self.sidebar.selected = Some(row.path.clone());
+                                    self.sidebar.selection_anchor = Some(row.path.clone());
+                                }
                             } else {
-                                open_preview = Some(row.path.clone());
+                                self.select_explorer_path(&row.path);
+                                if row.is_dir {
+                                    toggle = Some(row.path.clone());
+                                } else {
+                                    open_preview = Some(row.path.clone());
+                                }
                             }
-                        } else if resp.secondary_clicked() {
-                            select = Some(row.path.clone());
+                        } else if resp.secondary_clicked()
+                            && !self.sidebar.selected_paths.contains(&row.path)
+                        {
+                            self.select_explorer_path(&row.path);
                         }
                     }
 
@@ -507,6 +584,33 @@ impl KestrelApp {
                     } else {
                         parent_dir.clone()
                     };
+                    let batch = self.explorer_selection();
+                    let batch_mode = batch.len() > 1 && batch.contains(&row_path);
+                    if batch_mode {
+                        resp.context_menu(|ui| {
+                            ui.set_width(228.0);
+                            if Self::context_item(
+                                ui,
+                                style,
+                                Icon::Trash,
+                                &format!("删除选中的 {} 个项目…", batch.len()),
+                                Some("Delete"),
+                            ) {
+                                context_action = Some(TreeContext::DeletePaths(batch.clone()));
+                                ui.close();
+                            }
+                            if Self::context_item(ui, style, Icon::Copy, "复制路径", None) {
+                                context_action =
+                                    Some(TreeContext::CopyPaths(batch.clone(), false));
+                                ui.close();
+                            }
+                            if Self::context_item(ui, style, Icon::Copy, "复制相对路径", None) {
+                                context_action =
+                                    Some(TreeContext::CopyPaths(batch.clone(), true));
+                                ui.close();
+                            }
+                        });
+                    } else {
                     resp.context_menu(|ui| {
                         ui.set_width(212.0);
                         if !is_dir {
@@ -588,7 +692,7 @@ impl KestrelApp {
                             ui.close();
                         }
                         ui.separator();
-                        if Self::context_item(ui, style, Icon::Copy, "复制路径", None) {
+                        if Self::context_item(ui, style, Icon::Copy, "复制绝对路径", None) {
                             context_action = Some(TreeContext::CopyPath(row_path.clone()));
                             ui.close();
                         }
@@ -606,7 +710,21 @@ impl KestrelApp {
                             context_action = Some(TreeContext::Reveal(row_path.clone()));
                             ui.close();
                         }
+                        ui.separator();
+                        if Self::context_item(ui, style, Icon::CollapseAll, "全部折叠", None) {
+                            context_action = Some(TreeContext::CollapseAll);
+                            ui.close();
+                        }
+                        if Self::context_item(ui, style, Icon::ExpandAll, "全部展开", None) {
+                            context_action = Some(TreeContext::ExpandAll);
+                            ui.close();
+                        }
+                        if Self::context_item(ui, style, Icon::Refresh, "刷新资源管理器", None) {
+                            context_action = Some(TreeContext::Refresh);
+                            ui.close();
+                        }
                     });
+                    }
 
                     // Inline new file/folder input row
                     if let Some((kind, parent, original, name, focus)) = edit.as_ref()
@@ -648,10 +766,25 @@ impl KestrelApp {
                         let enter =
                             te_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                         let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
-                        if enter {
+                        let error =
+                            Self::tree_edit_error(*kind, parent, None, &name);
+                        if error.is_some() {
+                            ui.painter().rect_stroke(
+                                te_rect,
+                                CornerRadius::same(3),
+                                Stroke::new(1.0, theme.error),
+                                StrokeKind::Inside,
+                            );
+                        }
+                        if enter && error.is_none() {
                             commit_edit = true;
+                        } else if enter {
+                            te_resp.request_focus();
                         } else if escape || (!*focus && te_resp.lost_focus()) {
                             cancel_edit = true;
+                        }
+                        if let Some(error) = error {
+                            Self::tree_edit_hint(ui, style, indent + 34.0, &error);
                         }
                         edit_drawn = true;
                     }
@@ -680,15 +813,29 @@ impl KestrelApp {
                     if te_resp.changed()
                         && let Some(edit) = self.sidebar.editing.as_mut()
                     {
-                        edit.name = name;
+                        edit.name = name.clone();
                     }
                     let enter =
                         te_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
-                    if enter {
+                    let error = Self::tree_edit_error(kind, &parent, None, &name);
+                    if error.is_some() {
+                        ui.painter().rect_stroke(
+                            te_rect,
+                            CornerRadius::same(3),
+                            Stroke::new(1.0, theme.error),
+                            StrokeKind::Inside,
+                        );
+                    }
+                    if enter && error.is_none() {
                         commit_edit = true;
+                    } else if enter {
+                        te_resp.request_focus();
                     } else if escape || (!focus && te_resp.lost_focus()) {
                         cancel_edit = true;
+                    }
+                    if let Some(error) = error {
+                        Self::tree_edit_hint(ui, style, 20.0, &error);
                     }
                 }
 
@@ -779,9 +926,6 @@ impl KestrelApp {
         } else if let Some(path) = open_preview {
             self.open_file_preview(path);
         }
-        if let Some(path) = select {
-            self.sidebar.selected = Some(path);
-        }
         match context_action {
             Some(TreeContext::OpenPinned(path)) => {
                 self.open_file(path);
@@ -857,6 +1001,9 @@ impl KestrelApp {
             Some(TreeContext::Delete(path)) => {
                 self.dialog = Some(crate::app::Dialog::ConfirmDelete(path));
             }
+            Some(TreeContext::DeletePaths(paths)) => {
+                self.dialog = Some(crate::app::Dialog::ConfirmDeleteBatch(paths));
+            }
             Some(TreeContext::CopyPath(path)) => {
                 ui.ctx().copy_text(path.to_string_lossy().to_string());
                 self.toast("已复制路径", ToastKind::Info);
@@ -868,6 +1015,26 @@ impl KestrelApp {
                     .unwrap_or_else(|_| path.to_string_lossy().to_string());
                 ui.ctx().copy_text(rel);
                 self.toast("已复制相对路径", ToastKind::Info);
+            }
+            Some(TreeContext::CopyPaths(paths, relative)) => {
+                let mut lines: Vec<String> = Vec::new();
+                for path in &paths {
+                    let text = if relative {
+                        path.strip_prefix(&root_path)
+                            .map(|p| p.to_string_lossy().to_string())
+                            .unwrap_or_else(|_| path.to_string_lossy().to_string())
+                    } else {
+                        path.to_string_lossy().to_string()
+                    };
+                    lines.push(text);
+                }
+                ui.ctx().copy_text(lines.join("
+"));
+                self.toast(format!("已复制 {} 个路径", paths.len()), ToastKind::Info);
+            }
+            Some(TreeContext::ExpandAll) => {
+                let show_hidden = self.workspace.tree.show_hidden;
+                Self::expand_all_dirs(&mut self.workspace.tree, &root_path, show_hidden);
             }
             Some(TreeContext::Reveal(path)) => {
                 crate::workspace::tree::reveal_in_explorer(&path);
@@ -888,6 +1055,81 @@ impl KestrelApp {
         }
         if cancel_edit {
             self.sidebar.editing = None;
+        }
+    }
+
+    fn select_explorer_path(&mut self, path: &Path) {
+        self.sidebar.selected = Some(path.to_path_buf());
+        self.sidebar.selected_paths.clear();
+        self.sidebar.selected_paths.insert(path.to_path_buf());
+        self.sidebar.selection_anchor = Some(path.to_path_buf());
+    }
+
+    /// Fast path for the common single-selection click, keeping the set in sync.
+    fn explorer_selection(&self) -> Vec<PathBuf> {
+        if self.sidebar.selected_paths.len() > 1 {
+            let mut paths: Vec<PathBuf> = self.sidebar.selected_paths.iter().cloned().collect();
+            paths.sort();
+            return paths;
+        }
+        self.sidebar.selected.iter().cloned().collect()
+    }
+
+    /// Inline validation for the new-file / rename inputs.
+    fn tree_edit_error(
+        kind: TreeEditKind,
+        parent: &Path,
+        original: Option<&Path>,
+        name: &str,
+    ) -> Option<String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Some("名称不能为空".to_string());
+        }
+        if name
+            .chars()
+            .any(|c| matches!(c, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|'))
+        {
+            return Some("名称包含非法字符 \\ / : * ? \" < > |".to_string());
+        }
+        if name.ends_with(' ') || name.ends_with('.') {
+            return Some("名称不能以空格或点结尾".to_string());
+        }
+        let target = parent.join(name);
+        let exists = match (kind, original) {
+            (TreeEditKind::Rename, Some(original)) => target != original && target.exists(),
+            _ => target.exists(),
+        };
+        exists.then(|| "已存在同名文件或文件夹".to_string())
+    }
+
+    fn tree_edit_hint(ui: &mut Ui, style: &UiStyle, indent: f32, error: &str) {
+        let (rect, _) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), 16.0), Sense::hover());
+        ui.painter().text(
+            Pos2::new(rect.left() + indent, rect.center().y),
+            Align2::LEFT_CENTER,
+            error,
+            style.tiny(),
+            style.theme.error,
+        );
+    }
+
+    /// Expand every directory under the workspace root.
+    fn expand_all_dirs(tree: &mut FileTree, root: &Path, show_hidden: bool) {
+        tree.expand(root);
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !show_hidden && name.starts_with('.') {
+                continue;
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                Self::expand_all_dirs(tree, &path, show_hidden);
+            }
         }
     }
 
@@ -922,6 +1164,10 @@ impl KestrelApp {
         }
         if Self::context_item(ui, style, Icon::CollapseAll, "全部折叠", None) {
             *context_action = Some(TreeContext::CollapseAll);
+            ui.close();
+        }
+        if Self::context_item(ui, style, Icon::ExpandAll, "全部展开", None) {
+            *context_action = Some(TreeContext::ExpandAll);
             ui.close();
         }
         ui.separator();
@@ -1352,9 +1598,11 @@ impl KestrelApp {
             theme.text_dim,
         );
 
+        let history_id = egui::Id::unique("kestrel_search_history_open");
         let mut start_search = false;
         let mut do_replace_all = false;
         let mut query_changed = false;
+        let mut apply_history: Option<String> = None;
 
         ui.horizontal(|ui| {
             ui.add_space(8.0);
@@ -1374,7 +1622,7 @@ impl KestrelApp {
                     !self.workspace.search_panel.show_replace;
             }
             let query_resp = ui.add_sized(
-                Vec2::new(ui.available_width() - 12.0, 26.0),
+                Vec2::new((ui.available_width() - 32.0).max(80.0), 26.0),
                 TextEdit::singleline(&mut self.workspace.search_panel.query)
                     .hint_text("在工作区中搜索…")
                     .font(style.small())
@@ -1392,7 +1640,113 @@ impl KestrelApp {
             if query_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                 start_search = true;
             }
+            let (history_rect, history_resp) =
+                ui.allocate_exact_size(Vec2::new(24.0, 24.0), Sense::click());
+            if history_resp.hovered() {
+                ui.painter()
+                    .rect_filled(history_rect, CornerRadius::same(4), theme.hover);
+            }
+            icons::paint(
+                ui.painter(),
+                history_rect.shrink(6.0),
+                Icon::ChevronDown,
+                if history_resp.hovered() {
+                    theme.text
+                } else {
+                    theme.text_dim
+                },
+                1.2,
+            );
+            if history_resp.on_hover_text("搜索历史").clicked() {
+                let open = ui
+                    .ctx()
+                    .data(|data| data.get_temp::<bool>(history_id).unwrap_or(false));
+                ui.ctx()
+                    .data_mut(|data| data.insert_temp(history_id, !open));
+            }
         });
+
+        let history_open = ui
+            .ctx()
+            .data(|data| data.get_temp::<bool>(history_id).unwrap_or(false));
+        if history_open {
+            let entries = self.settings.search_history.clone();
+            let mut clear_history = false;
+            ui.add_space(2.0);
+            if entries.is_empty() {
+                ui.horizontal(|ui| {
+                    ui.add_space(14.0);
+                    ui.label(
+                        egui::RichText::new("暂无搜索历史")
+                            .font(style.tiny())
+                            .color(theme.text_faint),
+                    );
+                });
+            }
+            for entry in &entries {
+                let (rect, resp) =
+                    ui.allocate_exact_size(Vec2::new(ui.available_width(), 22.0), Sense::click());
+                if resp.hovered() {
+                    ui.painter()
+                        .rect_filled(rect, CornerRadius::same(4), theme.hover);
+                }
+                icons::paint(
+                    ui.painter(),
+                    Rect::from_center_size(
+                        Pos2::new(rect.left() + 18.0, rect.center().y),
+                        Vec2::splat(12.0),
+                    ),
+                    Icon::Search,
+                    theme.text_faint,
+                    1.1,
+                );
+                let (galley, _) = widgets::ellipsize(
+                    ui,
+                    entry,
+                    style.small(),
+                    theme.text_dim,
+                    (rect.width() - 44.0).max(0.0),
+                );
+                ui.painter().galley(
+                    Pos2::new(
+                        rect.left() + 32.0,
+                        rect.center().y - galley.rect.height() * 0.5,
+                    ),
+                    galley,
+                    theme.text_dim,
+                );
+                if resp.clicked() {
+                    apply_history = Some(entry.clone());
+                }
+            }
+            if !entries.is_empty() {
+                let (rect, resp) =
+                    ui.allocate_exact_size(Vec2::new(ui.available_width(), 22.0), Sense::click());
+                if resp.hovered() {
+                    ui.painter()
+                        .rect_filled(rect, CornerRadius::same(4), theme.hover);
+                }
+                ui.painter().text(
+                    Pos2::new(rect.left() + 14.0, rect.center().y),
+                    Align2::LEFT_CENTER,
+                    "清除搜索历史",
+                    style.tiny(),
+                    theme.text_faint,
+                );
+                clear_history = resp.clicked();
+            }
+            if let Some(query) = apply_history {
+                self.workspace.search_panel.query = query;
+                self.workspace.search_panel.last_query.clear();
+                ui.ctx().data_mut(|data| data.insert_temp(history_id, false));
+                start_search = true;
+            }
+            if clear_history {
+                self.settings.search_history.clear();
+                self.settings.save();
+                ui.ctx().data_mut(|data| data.insert_temp(history_id, false));
+            }
+        }
 
         if self.workspace.search_panel.show_replace {
             ui.add_space(2.0);
@@ -1422,99 +1776,172 @@ impl KestrelApp {
             self.workspace.search_panel.last_query = String::new();
         }
 
+        // Advanced options live behind one "…" row: globs, case, word, regex.
+        let mut show_options = self.workspace.search_panel.show_options;
+        let mut advanced_toggled = false;
         ui.add_space(2.0);
         ui.horizontal(|ui| {
             ui.add_space(34.0);
-            ui.spacing_mut().item_spacing.x = 4.0;
-            let mut changed = false;
-            if sidebar_icon_toggle(
-                ui,
-                &theme,
-                Icon::CaseSensitive,
-                self.workspace.search_panel.case_sensitive,
-                "区分大小写 (Aa)",
-            ) {
-                self.workspace.search_panel.case_sensitive =
-                    !self.workspace.search_panel.case_sensitive;
-                changed = true;
+            let (rect, resp) = ui.allocate_exact_size(
+                Vec2::new((ui.available_width() - 34.0).max(80.0), 22.0),
+                Sense::click(),
+            );
+            if resp.hovered() || show_options {
+                ui.painter().rect_filled(
+                    rect,
+                    CornerRadius::same(4),
+                    if show_options { theme.active } else { theme.hover },
+                );
             }
-            if sidebar_icon_toggle(
-                ui,
-                &theme,
-                Icon::WholeWord,
-                self.workspace.search_panel.whole_word,
-                "全词匹配 (W)",
-            ) {
-                self.workspace.search_panel.whole_word = !self.workspace.search_panel.whole_word;
-                changed = true;
+            icons::paint(
+                ui.painter(),
+                Rect::from_center_size(
+                    Pos2::new(rect.left() + 11.0, rect.center().y),
+                    Vec2::splat(13.0),
+                ),
+                Icon::More,
+                theme.text_dim,
+                1.2,
+            );
+            let panel = &self.workspace.search_panel;
+            let mut flags: Vec<&str> = Vec::new();
+            if panel.case_sensitive {
+                flags.push("Aa");
             }
-            if sidebar_icon_toggle(
-                ui,
-                &theme,
-                Icon::Regex,
-                self.workspace.search_panel.regex,
-                "正则表达式 (.*)",
-            ) {
-                self.workspace.search_panel.regex = !self.workspace.search_panel.regex;
-                changed = true;
+            if panel.whole_word {
+                flags.push("W");
             }
-            if sidebar_icon_toggle(
-                ui,
-                &theme,
-                Icon::Filter,
-                self.workspace.search_panel.show_options,
-                "包含/排除文件过滤",
-            ) {
-                self.workspace.search_panel.show_options =
-                    !self.workspace.search_panel.show_options;
+            if panel.regex {
+                flags.push(".*");
             }
-            if changed {
-                self.workspace.search_panel.last_typed = Some(Instant::now());
-                self.workspace.search_panel.last_query = String::new();
+            if !panel.include.trim().is_empty() {
+                flags.push("包含");
+            }
+            if !panel.exclude.trim().is_empty() {
+                flags.push("排除");
+            }
+            let label = if flags.is_empty() {
+                "高级选项".to_string()
+            } else {
+                format!("高级选项 · {}", flags.join(" · "))
+            };
+            ui.painter().text(
+                Pos2::new(rect.left() + 22.0, rect.center().y),
+                Align2::LEFT_CENTER,
+                label,
+                style.tiny(),
+                theme.text_dim,
+            );
+            icons::paint(
+                ui.painter(),
+                Rect::from_center_size(
+                    Pos2::new(rect.right() - 12.0, rect.center().y),
+                    Vec2::splat(12.0),
+                ),
+                if show_options {
+                    Icon::ChevronUp
+                } else {
+                    Icon::ChevronDown
+                },
+                theme.text_faint,
+                1.1,
+            );
+            if resp.clicked() {
+                show_options = !show_options;
+                advanced_toggled = true;
             }
         });
-
-        if self.workspace.search_panel.show_options {
+        if advanced_toggled {
+            self.workspace.search_panel.show_options = show_options;
+        }
+        if show_options {
             ui.add_space(2.0);
             ui.horizontal(|ui| {
-                ui.add_space(12.0);
+                ui.add_space(34.0);
+                ui.spacing_mut().item_spacing.x = 4.0;
+                let mut changed = false;
+                if sidebar_icon_toggle(
+                    ui,
+                    &theme,
+                    Icon::CaseSensitive,
+                    self.workspace.search_panel.case_sensitive,
+                    "区分大小写 (Aa)",
+                ) {
+                    self.workspace.search_panel.case_sensitive =
+                        !self.workspace.search_panel.case_sensitive;
+                    changed = true;
+                }
+                if sidebar_icon_toggle(
+                    ui,
+                    &theme,
+                    Icon::WholeWord,
+                    self.workspace.search_panel.whole_word,
+                    "全词匹配 (W)",
+                ) {
+                    self.workspace.search_panel.whole_word =
+                        !self.workspace.search_panel.whole_word;
+                    changed = true;
+                }
+                if sidebar_icon_toggle(
+                    ui,
+                    &theme,
+                    Icon::Regex,
+                    self.workspace.search_panel.regex,
+                    "正则表达式 (.*)",
+                ) {
+                    self.workspace.search_panel.regex = !self.workspace.search_panel.regex;
+                    changed = true;
+                }
+                if changed {
+                    self.workspace.search_panel.last_typed = Some(Instant::now());
+                    self.workspace.search_panel.last_query = String::new();
+                }
+            });
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                ui.add_space(34.0);
+                ui.spacing_mut().item_spacing.x = 6.0;
                 ui.add_sized(
-                    Vec2::new((ui.available_width() - 20.0) / 2.0, 24.0),
+                    Vec2::new(((ui.available_width() - 42.0) / 2.0).max(60.0), 24.0),
                     TextEdit::singleline(&mut self.workspace.search_panel.include)
-                        .hint_text("包含: *.rs")
+                        .hint_text("包含: *.rs, *.toml")
                         .font(style.tiny()),
                 );
                 ui.add_sized(
-                    Vec2::new((ui.available_width() - 10.0).max(80.0), 24.0),
+                    Vec2::new((ui.available_width() - 8.0).max(60.0), 24.0),
                     TextEdit::singleline(&mut self.workspace.search_panel.exclude)
-                        .hint_text("排除: *test*")
+                        .hint_text("排除: *test*, target/*")
                         .font(style.tiny()),
                 );
             });
         }
 
         if start_search {
-            self.start_project_search();
+            self.submit_project_search();
         }
         if do_replace_all {
             self.replace_all_in_project();
         }
 
         let panel = &self.workspace.search_panel;
+        let total_matches: usize = panel.results.iter().map(|r| r.matches.len()).sum();
         let status = if let Some(err) = &panel.error {
             err.clone()
         } else if panel.scanning || self.workspace.search.is_running() {
             format!(
                 "正在搜索… 已扫描 {} 个文件，{} 处结果",
-                panel.scanned,
-                panel.results.iter().map(|r| r.matches.len()).sum::<usize>()
+                panel.scanned, total_matches
             )
         } else if !panel.last_query.is_empty() {
-            format!(
+            let mut text = format!(
                 "{} 个文件，共 {} 处匹配",
                 panel.matched_files.max(panel.results.len()),
-                panel.results.iter().map(|r| r.matches.len()).sum::<usize>()
-            )
+                total_matches
+            );
+            if total_matches >= 2000 {
+                text.push_str("（已达 2000 条上限，仅显示部分结果）");
+            }
+            text
         } else {
             String::new()
         };
@@ -1537,21 +1964,26 @@ impl KestrelApp {
 
         let mut open_at: Option<(PathBuf, usize)> = None;
         let mut toggle_file: Option<PathBuf> = None;
+        let mut replace_one: Option<(PathBuf, usize)> = None;
         let root = self.workspace.root.clone();
         let needle = self.workspace.search_panel.query.trim().to_string();
         let case_sensitive = self.workspace.search_panel.case_sensitive;
+        let can_replace = self.workspace.search_panel.show_replace
+            && !self.workspace.search_panel.replacement.is_empty();
 
         ScrollArea::vertical()
             .auto_shrink(false)
             .id_salt("search_results")
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
+                let mut shown_files = 0usize;
                 for (rendered, result) in
                     self.workspace.search_panel.results.iter().enumerate()
                 {
                     if rendered > 400 {
                         break;
                     }
+                    shown_files += 1;
                     let rel = root
                         .as_ref()
                         .and_then(|r| result.path.strip_prefix(r).ok())
@@ -1593,13 +2025,19 @@ impl KestrelApp {
                         theme.text_dim,
                         theme.kind.is_dark(),
                     );
-                    let pill_space = (result.matches.len() as f32 * 6.5 + 40.0).max(40.0);
+                    let count = result.matches.len();
+                    let count_label = if result.truncated {
+                        format!("{count}+")
+                    } else {
+                        count.to_string()
+                    };
+                    let pill_w = (count_label.chars().count() as f32 * 6.5 + 10.0).max(20.0);
                     let (rel_galley, rel_cut) = widgets::ellipsize(
                         ui,
                         &rel,
                         style.small(),
                         theme.text,
-                        (rect.width() - 60.0 - pill_space).max(0.0),
+                        (rect.width() - 60.0 - pill_w - 10.0).max(0.0),
                     );
                     ui.painter().galley(
                         Pos2::new(
@@ -1612,13 +2050,6 @@ impl KestrelApp {
                     if rel_cut {
                         resp.clone().on_hover_text(&rel);
                     }
-                    let count = result.matches.len();
-                    let count_label = if result.truncated {
-                        format!("{count}+")
-                    } else {
-                        count.to_string()
-                    };
-                    let pill_w = (count_label.len() as f32 * 6.5 + 10.0).max(20.0);
                     let pill_rect = Rect::from_center_size(
                         Pos2::new(rect.right() - 16.0, rect.center().y),
                         Vec2::new(pill_w, 16.0),
@@ -1643,7 +2074,8 @@ impl KestrelApp {
                             Vec2::new(ui.available_width(), 22.0),
                             Sense::hover(),
                         );
-                        let mresp = widgets::paint_row(ui, mrect, &theme, widgets::RowState::idle());
+                        let mresp =
+                            widgets::paint_row(ui, mrect, &theme, widgets::RowState::idle());
                         ui.painter().text(
                             Pos2::new(mrect.left() + 32.0, mrect.center().y),
                             Align2::RIGHT_CENTER,
@@ -1660,20 +2092,123 @@ impl KestrelApp {
                             &needle,
                             case_sensitive,
                         );
-                        let mresp =
-                            mresp.on_hover_text(format!("第 {} 行，第 {} 列", m.line, m.column));
-                        if mresp.clicked() {
+                        let mut replaced = false;
+                        if can_replace {
+                            let replace_rect = Rect::from_center_size(
+                                Pos2::new(mrect.right() - 14.0, mrect.center().y),
+                                Vec2::splat(20.0),
+                            );
+                            if widgets::icon_button(
+                                ui,
+                                replace_rect,
+                                &theme,
+                                Icon::Replace,
+                                true,
+                            )
+                            .on_hover_text("替换此条")
+                            .clicked()
+                            {
+                                replace_one = Some((result.path.clone(), m.byte_offset));
+                                replaced = true;
+                            }
+                        }
+                        let mresp = mresp.on_hover_text(format!(
+                            "第 {} 行，第 {} 列",
+                            m.line, m.column
+                        ));
+                        if !replaced && mresp.clicked() {
                             open_at = Some((result.path.clone(), m.byte_offset));
                         }
                     }
+                    if result.matches.len() > 40 || result.truncated {
+                        let (note, _) = ui.allocate_exact_size(
+                            Vec2::new(ui.available_width(), 18.0),
+                            Sense::hover(),
+                        );
+                        let text = if result.truncated {
+                            "该文件匹配过多，仅显示前 200 处".to_string()
+                        } else {
+                            format!("仅显示前 40 处匹配，共 {} 处", result.matches.len())
+                        };
+                        ui.painter().text(
+                            Pos2::new(note.left() + 32.0, note.center().y),
+                            Align2::LEFT_CENTER,
+                            text,
+                            style.tiny(),
+                            theme.text_faint,
+                        );
+                    }
+                }
+                if shown_files > 0
+                    && self.workspace.search_panel.results.len() > shown_files
+                {
+                    let (note, _) = ui.allocate_exact_size(
+                        Vec2::new(ui.available_width(), 20.0),
+                        Sense::hover(),
+                    );
+                    ui.painter().text(
+                        Pos2::new(note.left() + 14.0, note.center().y),
+                        Align2::LEFT_CENTER,
+                        format!(
+                            "仅显示前 {} 个文件，共 {} 个文件命中",
+                            shown_files,
+                            self.workspace.search_panel.results.len()
+                        ),
+                        style.tiny(),
+                        theme.text_faint,
+                    );
                 }
             });
         if let Some(path) = toggle_file
-            && !self.workspace.search_panel.collapsed.remove(&path) {
-                self.workspace.search_panel.collapsed.insert(path);
-            }
+            && !self.workspace.search_panel.collapsed.remove(&path)
+        {
+            self.workspace.search_panel.collapsed.insert(path);
+        }
         if let Some((path, offset)) = open_at {
             self.open_file_at(path, offset);
+        }
+        if let Some((path, offset)) = replace_one {
+            self.replace_one_match(path, offset);
+        }
+    }
+
+    /// Replace a single search hit on disk and refresh the results.
+    fn replace_one_match(&mut self, path: PathBuf, byte_offset: usize) {
+        let query = SearchQuery {
+            pattern: self.workspace.search_panel.query.clone(),
+            regex: self.workspace.search_panel.regex,
+            case_sensitive: self.workspace.search_panel.case_sensitive,
+            whole_word: self.workspace.search_panel.whole_word,
+            include: self.workspace.search_panel.include.clone(),
+            exclude: self.workspace.search_panel.exclude.clone(),
+            max_results: 0,
+        };
+        let replacement = self.workspace.search_panel.replacement.clone();
+        let open_dirty = self.tabs.iter().any(|tab| {
+            tab.doc.path.as_deref() == Some(path.as_path()) && tab.is_dirty()
+        });
+        if open_dirty {
+            self.toast("该文件有未保存修改，已跳过替换", ToastKind::Warning);
+            return;
+        }
+        match replace_match_at(&path, &query, &replacement, byte_offset) {
+            Ok(true) => {
+                if let Some(tab) = self
+                    .tabs
+                    .iter_mut()
+                    .find(|tab| tab.doc.path.as_deref() == Some(path.as_path()))
+                {
+                    let _ = tab.doc.reload();
+                    tab.invalidate_layout();
+                }
+                self.toast("已替换该处匹配", ToastKind::Success);
+                self.start_project_search();
+                if let Some(root) = self.workspace.root.clone() {
+                    self.git.refresh(&root);
+                }
+            }
+            Ok(false) => self.toast("文件已变化，请重新搜索后再替换", ToastKind::Warning),
+            Err(err) => self.toast(err, ToastKind::Error),
         }
     }
 
@@ -3454,14 +3989,50 @@ enum TreeContext {
     CopyPath(PathBuf),
     CopyRelativePath(PathBuf),
     Reveal(PathBuf),
+    CopyPaths(Vec<PathBuf>, bool),
+    DeletePaths(Vec<PathBuf>),
     Refresh,
     CollapseAll,
+    ExpandAll,
 }
 
 #[cfg(test)]
 mod tests {
+    use super::KestrelApp;
     use super::outline_child_end;
+    use crate::app::TreeEditKind;
     use crate::lsp::{OutlineSymbol, SymbolKind};
+
+    #[test]
+    fn tree_edit_name_validation_rejects_empty_illegal_and_existing_names() {
+        let dir = std::env::temp_dir().join(format!("kestrel_tree_edit_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("exists.rs"), "").unwrap();
+        let parent = dir.as_path();
+        assert!(KestrelApp::tree_edit_error(TreeEditKind::NewFile, parent, None, "").is_some());
+        assert!(
+            KestrelApp::tree_edit_error(TreeEditKind::NewFile, parent, None, "a/b").is_some()
+        );
+        assert!(
+            KestrelApp::tree_edit_error(TreeEditKind::NewFile, parent, None, "exists.rs")
+                .is_some()
+        );
+        assert!(
+            KestrelApp::tree_edit_error(TreeEditKind::NewFile, parent, None, "fresh.rs").is_none()
+        );
+        let existing = parent.join("exists.rs");
+        assert!(
+            KestrelApp::tree_edit_error(
+                TreeEditKind::Rename,
+                parent,
+                Some(&existing),
+                "exists.rs"
+            )
+            .is_none()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn sym(name: &str, line: usize, depth: usize) -> OutlineSymbol {
         OutlineSymbol {

@@ -390,12 +390,59 @@ pub fn replace_in_file(path: &Path, query: &SearchQuery, replacement: &str) -> R
     Ok(count)
 }
 
+/// Replace only the match that starts at `byte_offset` in `path`.
+///
+/// The file is re-read and the regex re-run so a stale search result cannot
+/// splice the wrong span; a moved/missing match returns `Ok(false)`.
+pub fn replace_match_at(
+    path: &Path,
+    query: &SearchQuery,
+    replacement: &str,
+    byte_offset: usize,
+) -> Result<bool, String> {
+    let regex = query.build()?;
+    let Some(content) = crate::workspace::index::read_searchable(path) else {
+        return Ok(false);
+    };
+    let Some(found) = regex
+        .find_iter(&content)
+        .find(|m| m.start() == byte_offset && m.start() != m.end())
+    else {
+        return Ok(false);
+    };
+    let mut out = String::with_capacity(content.len() + replacement.len());
+    out.push_str(&content[..found.start()]);
+    if query.regex {
+        out.push_str(&regex.replace(&content[found.start()..found.end()], replacement));
+    } else {
+        out.push_str(replacement);
+    }
+    out.push_str(&content[found.end()..]);
+    std::fs::write(path, out.as_bytes())
+        .map_err(|e| format!("写入 {} 失败: {e}", path.display()))?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::workspace::index::walk_project;
     use std::fs;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn replace_match_at_replaces_only_the_target_hit() {
+        let path =
+            std::env::temp_dir().join(format!("kestrel_replace_one_{}.txt", std::process::id()));
+        fs::write(&path, "needle one\nneedle two\n").unwrap();
+        let query = query("needle");
+        assert!(replace_match_at(&path, &query, "X", 11).unwrap());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "needle one\nX two\n");
+        // A stale offset no longer matches and must not touch the file.
+        assert!(!replace_match_at(&path, &query, "X", 999).unwrap());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "needle one\nX two\n");
+        let _ = fs::remove_file(&path);
+    }
 
     fn project_root() -> PathBuf {
         let base = std::env::temp_dir().join(format!("kestrel_search_test_{}", std::process::id()));
