@@ -199,6 +199,7 @@ impl Editor {
                 self.ime_active_range = None;
                 self.ime_interrupt = true;
             }
+            self.selection_history.clear();
             let in_text = pos.y >= view_top;
             let row = self.row_at_y(pos.y, view_top, line_h, row_count);
             let clicked_line = self.line_of_row(row);
@@ -211,15 +212,31 @@ impl Editor {
                 self.toggle_fold_at(clicked_line);
             } else if in_text && pos.x >= text_left {
                 let ch = self.pos_to_char(ui, style, rect, pos, text_left, text_width);
-                if alt_held && !shift_held && !ctrl_held {
-                    self.toggle_cursor_at(ch);
-                } else if ctrl_held && !shift_held {
+                let selection = self.selection();
+                if ctrl_held && !shift_held {
                     self.caret = ch;
                     self.anchor = ch;
                     let ident = self.identifier_at(ch);
                     if !ident.is_empty() {
                         event = Some(EditorEvent::GotoDefinition(ident));
                     }
+                } else if alt_held && !shift_held {
+                    // Arm an Alt+drag rectangle; a click without a drag resolves to
+                    // the classic Alt+click cursor toggle on release.
+                    self.box_anchor = Some(ch);
+                    self.box_base = self.extra_cursors.clone();
+                    self.box_moved = false;
+                } else if !shift_held
+                    && selection.is_some_and(|(start, end)| start < ch && ch < end)
+                {
+                    // Pressing inside the selection arms an in-editor text drag; the
+                    // plain-click fallback collapses the selection on release.
+                    self.text_drag = Some(super::TextDrag {
+                        press_char: ch,
+                        press: pos,
+                        drop: Some(ch),
+                        moved: false,
+                    });
                 } else {
                     if !shift_held {
                         self.extra_cursors.clear();
@@ -232,6 +249,40 @@ impl Editor {
                 self.blink_base = ui.input(|i| i.time);
             }
         }
+        if let Some(anchor) = self.box_anchor {
+            if ui.input(|i| i.pointer.primary_down()) {
+                if let Some(pos) = response.interact_pointer_pos()
+                    && pos.y >= view_top
+                {
+                    let current = self.pos_to_char(ui, style, rect, pos, text_left, text_width);
+                    // Only rebuild once the pointer actually left the anchor char, so
+                    // a plain Alt+click keeps its pre-press caret for the toggle below.
+                    if current != anchor || self.box_moved {
+                        self.update_box_selection(anchor, current);
+                    }
+                }
+            } else {
+                self.box_anchor = None;
+                if !self.box_moved {
+                    self.toggle_cursor_at(anchor);
+                }
+            }
+        }
+        let text_drag = self.text_drag.as_ref().map(|drag| (drag.moved, drag.press));
+        if let Some((moved, press)) = text_drag
+            && ui.input(|i| i.pointer.primary_down())
+            && let Some(pos) = response.interact_pointer_pos()
+        {
+            let moved = moved || pos.distance(press) > 4.0;
+            let drop = (moved && pos.y >= view_top)
+                .then(|| self.pos_to_char(ui, style, rect, pos, text_left, text_width));
+            if let Some(drag) = &mut self.text_drag {
+                drag.moved = moved;
+                if let Some(drop) = drop {
+                    drag.drop = Some(drop);
+                }
+            }
+        }
         if self.dragging_selection
             && response.is_pointer_button_down_on()
             && let Some(pos) = response.interact_pointer_pos()
@@ -242,6 +293,24 @@ impl Editor {
         }
         if !ui.input(|i| i.pointer.primary_down()) {
             self.dragging_selection = false;
+            if let Some(drag) = self.text_drag.take() {
+                if drag.moved {
+                    if let Some(drop) = drag.drop {
+                        let copy = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
+                        if copy {
+                            self.duplicate_selection_at(drop);
+                        } else {
+                            self.move_selection_to(drop);
+                        }
+                    }
+                } else {
+                    // Plain click on the selection collapses it to the click point.
+                    self.extra_cursors.clear();
+                    self.caret = drag.press_char;
+                    self.anchor = drag.press_char;
+                    self.ensure_visible = true;
+                }
+            }
         }
         if response.double_clicked()
             && let Some(pos) = response.interact_pointer_pos()
@@ -1024,9 +1093,9 @@ impl Editor {
             }
         }
 
-        // Bracket match
+        // Bracket match (memoized: the pair scan no longer runs on every frame)
         if self.has_focus
-            && let Some((open, close)) = self.matching_brackets()
+            && let Some((open, close)) = self.cached_matching_brackets()
         {
             for ch_pos in [open, close] {
                 let line = self.doc.char_to_line(ch_pos);
@@ -1085,6 +1154,28 @@ impl Editor {
                         );
                     }
                 }
+            }
+        }
+
+        // Drop caret while dragging selected text inside the canvas.
+        if let Some(drag) = &self.text_drag
+            && drag.moved
+            && let Some(drop) = drag.drop
+        {
+            let line = self.doc.char_to_line(drop);
+            let col = self.doc.char_to_line_col(drop).1;
+            if let Some(row) = self.line_map.row_of(line)
+                && row >= first_row
+                && row < last_row
+                && let Some(cached) = self.galleys.get(&line)
+            {
+                let x = origin.x + self.x_of_col_in(cached, col) - self.scroll_x;
+                let y = row_y(row);
+                painter.rect_filled(
+                    Rect::from_min_size(Pos2::new(x - 1.0, y), Vec2::new(2.0, line_h)),
+                    1.0,
+                    theme.accent,
+                );
             }
         }
 
@@ -1365,67 +1456,59 @@ impl Editor {
         base.gamma_multiply(0.62)
     }
 
-    fn matching_brackets(&self) -> Option<(usize, usize)> {
-        let candidates = [self.caret.checked_sub(1), Some(self.caret)];
-        for pos in candidates.into_iter().flatten() {
-            let Some(ch) = self.doc.char_at(pos) else {
-                continue;
-            };
-            let (open, close, forward) = match ch {
-                '(' => ('(', ')', true),
-                '[' => ('[', ']', true),
-                '{' => ('{', '}', true),
-                ')' => ('(', ')', false),
-                ']' => ('[', ']', false),
-                '}' => ('{', '}', false),
-                _ => continue,
-            };
-            let other = if forward { close } else { open };
-            let mut depth = 0i32;
-            let mut p = pos;
-            let steps = 20_000;
-            for _ in 0..steps {
-                if forward {
-                    p += 1;
-                    if p >= self.doc.len_chars() {
-                        break;
-                    }
-                } else {
-                    if p == 0 {
-                        break;
-                    }
-                    p -= 1;
-                }
-                let Some(c) = self.doc.char_at(p) else {
-                    break;
-                };
-                if c == ch {
-                    depth += 1;
-                } else if c == other {
-                    if depth == 0 {
-                        if !self.is_in_string_or_comment(p) {
-                            return if forward {
-                                Some((pos, p))
-                            } else {
-                                Some((p, pos))
-                            };
-                        }
-                        break;
-                    }
-                    depth -= 1;
-                }
-            }
+    /// Memoized bracket pair for the paint pass: the caret rarely moves between
+    /// frames, so scanning up to 20k chars per repaint was pure overhead.
+    fn cached_matching_brackets(&mut self) -> Option<(usize, usize)> {
+        if let Some(cache) = self.bracket_cache
+            && cache.version == self.doc.version
+            && cache.caret == self.caret
+        {
+            return cache.pair;
         }
-        None
+        let pair = self.matching_brackets();
+        self.bracket_cache = Some(super::BracketCache {
+            version: self.doc.version,
+            caret: self.caret,
+            pair,
+        });
+        pair
     }
 
-    fn is_in_string_or_comment(&self, ch_pos: usize) -> bool {
-        let byte = self.doc.char_to_byte(ch_pos);
-        let idx = self.spans.partition_point(|s| s.end <= byte);
-        matches!(
-            self.spans.get(idx).map(|s| s.kind),
-            Some(TokenKind::String) | Some(TokenKind::Comment)
-        )
+    /// Build the rectangular cursor set for an Alt+drag from `anchor` to `current`.
+    /// Zero-width drags become one caret per line, wider drags one selection per line.
+    fn update_box_selection(&mut self, anchor: usize, current: usize) {
+        if current != anchor {
+            self.box_moved = true;
+        }
+        let (anchor_line, anchor_col) = self.doc.char_to_line_col(anchor);
+        let (current_line, current_col) = self.doc.char_to_line_col(current);
+        let (first, last) = (
+            anchor_line.min(current_line),
+            anchor_line.max(current_line),
+        );
+        // A runaway gesture must not allocate a cursor per document line.
+        if last - first > 2_000 {
+            return;
+        }
+        let (col_start, col_end) = (anchor_col.min(current_col), anchor_col.max(current_col));
+        let mut extras = self.box_base.clone();
+        for line in first..=last {
+            let len = self.doc.line_char_len(line);
+            let start = self.doc.line_col_to_char(line, col_start.min(len));
+            let end = self.doc.line_col_to_char(line, col_end.min(len));
+            if line == current_line {
+                self.anchor = start;
+                self.caret = if col_start == col_end { start } else { end };
+            } else if col_start == col_end {
+                extras.push((start, start));
+            } else {
+                extras.push((end, start));
+            }
+        }
+        self.extra_cursors = extras;
+        self.ensure_visible = true;
+        self.desired_col = None;
+        self.selection_history.clear();
     }
 
     fn paint_completion_popup(
@@ -1588,11 +1671,40 @@ impl Editor {
                                 self.find.focus_query = false;
                             }
                             if query_resp.changed() {
+                                self.find.history_pos = None;
                                 self.recompute_find();
+                            }
+                            if self.find.error.is_some() {
+                                // Invalid regex gets a red ring instead of a silent no-op.
+                                ui.painter().rect_stroke(
+                                    query_resp.rect.expand(1.0),
+                                    CornerRadius::same(4),
+                                    Stroke::new(1.0, theme.error),
+                                    StrokeKind::Inside,
+                                );
+                            }
+                            // `has_focus` mutates egui state; calling it inside
+                            // `ui.input` would take the context lock twice and deadlock.
+                            let query_focused = query_resp.has_focus();
+                            let history_step = ui.input(|i| {
+                                if !i.modifiers.alt && !query_focused {
+                                    return None;
+                                }
+                                if i.key_pressed(Key::ArrowUp) {
+                                    Some(false)
+                                } else if i.key_pressed(Key::ArrowDown) {
+                                    Some(true)
+                                } else {
+                                    None
+                                }
+                            });
+                            if let Some(newer) = history_step {
+                                self.find_history_step(newer);
                             }
                             let enter =
                                 query_resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
                             if enter {
+                                self.remember_find_query();
                                 let back = ui.input(|i| i.modifiers.shift);
                                 self.find_next(!back);
                                 // Hand the keyboard back to the canvas so F3 keeps working.
@@ -1627,6 +1739,21 @@ impl Editor {
                                 "使用正则表达式 (.*)",
                             ) {
                                 self.find.regex = !self.find.regex;
+                                self.recompute_find();
+                            }
+                            if find_icon_button(
+                                ui,
+                                &theme,
+                                Icon::Filter,
+                                self.find.in_selection,
+                                "仅在选区内查找",
+                            ) {
+                                self.find.in_selection = !self.find.in_selection;
+                                self.find.scope = if self.find.in_selection {
+                                    self.selection()
+                                } else {
+                                    None
+                                };
                                 self.recompute_find();
                             }
 
@@ -1681,9 +1808,11 @@ impl Editor {
                                     self.find.focus_replacement = false;
                                 }
                                 if find_icon_button(ui, &theme, Icon::Replace, false, "替换当前匹配") {
+                                    self.remember_find_query();
                                     self.replace_current();
                                 }
                                 if find_icon_button(ui, &theme, Icon::ReplaceAll, false, "全部替换") {
+                                    self.remember_find_query();
                                     self.replace_all();
                                 }
                                 if let Some(err) = &self.find.error {
@@ -1776,6 +1905,21 @@ fn paint_squiggly_line(painter: &egui::Painter, x1: f32, x2: f32, y: f32, color:
 #[cfg(test)]
 mod tests {
     use super::minimap_slider_span;
+
+    #[test]
+    fn box_selection_places_one_cursor_per_line() {
+        let mut ed = crate::editor::Editor::new(
+            crate::doc::Document::from_text("abc\ndef\nghi"),
+            1,
+            0,
+        );
+        // Drag from line 0 column 1 to line 2 column 1: one caret per line.
+        ed.update_box_selection(1, 9);
+        assert_eq!(ed.extra_cursors.len(), 2);
+        assert_eq!(ed.doc.char_to_line_col(ed.caret), (2, 1));
+        assert_eq!(ed.doc.char_to_line_col(ed.extra_cursors[0].0), (0, 1));
+        assert_eq!(ed.doc.char_to_line_col(ed.extra_cursors[1].0), (1, 1));
+    }
 
     #[test]
     fn minimap_slider_scales_to_rendered_content_height() {

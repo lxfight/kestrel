@@ -363,6 +363,53 @@ impl Document {
         self.save()
     }
 
+    /// Re-decode the file on disk with an explicitly chosen encoding.
+    pub fn reopen_with_encoding(&mut self, encoding: Encoding) -> io::Result<()> {
+        let Some(path) = self.path.clone() else {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "文件尚未命名"));
+        };
+        let bytes = std::fs::read(&path)?;
+        let text = decode_bytes(&bytes, encoding)?;
+        let crlf = text.contains("\r\n");
+        let normalized = if text.contains('\r') {
+            text.replace("\r\n", "\n").replace('\r', "\n")
+        } else {
+            text
+        };
+        let rope = Rope::from_str(&normalized);
+        let hash = hash_rope(&rope);
+        self.rope = rope;
+        self.eol = if crlf { Eol::CrLf } else { Eol::Lf };
+        self.encoding = encoding;
+        self.bom = encoding == Encoding::Utf8Bom;
+        self.lossy = encoding == Encoding::LossyUtf8;
+        self.readonly = false;
+        self.version += 1;
+        self.saved_text_hash = hash;
+        self.hash_cache.set((self.version, hash));
+        self.baseline_text = (normalized.len() <= MAX_BASELINE_BYTES).then(|| Arc::from(normalized));
+        self.disk_modified_at = disk_mtime(&path);
+        self.undo.clear();
+        self.redo.clear();
+        Ok(())
+    }
+
+    /// Write the buffer with a new line ending; the file itself changes on save.
+    pub fn set_eol(&mut self, eol: Eol) {
+        if self.eol != eol {
+            self.eol = eol;
+            self.mark_dirty();
+        }
+    }
+
+    /// Apply an explicit encoding and save under a new path.
+    pub fn save_as_with_encoding(&mut self, path: PathBuf, encoding: Encoding) -> SaveOutcome {
+        self.encoding = encoding;
+        self.bom = encoding == Encoding::Utf8Bom;
+        self.lossy = encoding == Encoding::LossyUtf8;
+        self.save_as(path)
+    }
+
     /// FNV-1a fingerprint of the whole buffer, cached by document version.
     pub fn content_hash(&self) -> u64 {
         let (version, hash) = self.hash_cache.get();
@@ -702,6 +749,64 @@ impl Document {
     }
 }
 
+/// Decode file bytes using an explicitly requested encoding.
+fn decode_bytes(bytes: &[u8], encoding: Encoding) -> io::Result<String> {
+    match encoding {
+        Encoding::Utf8 | Encoding::LossyUtf8 => match std::str::from_utf8(bytes) {
+            Ok(text) => Ok(text.to_string()),
+            Err(_) if encoding == Encoding::LossyUtf8 => {
+                Ok(String::from_utf8_lossy(bytes).into_owned())
+            }
+            Err(err) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("UTF-8 解码失败: {err}"),
+            )),
+        },
+        Encoding::Utf8Bom => {
+            let body = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+            std::str::from_utf8(body)
+                .map(str::to_string)
+                .map_err(|err| {
+                    io::Error::new(io::ErrorKind::InvalidData, format!("UTF-8 BOM 解码失败: {err}"))
+                })
+        }
+        Encoding::Utf16Le => decode_utf16(bytes, true),
+        Encoding::Utf16Be => decode_utf16(bytes, false),
+        Encoding::Binary => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "二进制文件不能按文本编码重新打开",
+        )),
+    }
+}
+
+fn decode_utf16(bytes: &[u8], little_endian: bool) -> io::Result<String> {
+    let body = if little_endian {
+        bytes.strip_prefix(&[0xFF, 0xFE]).unwrap_or(bytes)
+    } else {
+        bytes.strip_prefix(&[0xFE, 0xFF]).unwrap_or(bytes)
+    };
+    if body.len() % 2 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "UTF-16 字节长度不是偶数",
+        ));
+    }
+    let units: Vec<u16> = body
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| {
+            if little_endian {
+                u16::from_le_bytes(*pair)
+            } else {
+                u16::from_be_bytes(*pair)
+            }
+        })
+        .collect();
+    String::from_utf16(&units)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "UTF-16 包含无效代理项"))
+}
+
 const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
@@ -905,6 +1010,49 @@ mod tests {
         // The scratch allocations survive the save instead of being rebuilt.
         assert_eq!(doc.save_text_buf.capacity(), text_capacity);
         assert_eq!(doc.save_bytes_buf.capacity(), bytes_capacity);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn reopen_with_encoding_decodes_requested_utf16() {
+        let path = temp_path("reopen_utf16.txt");
+        let mut raw = vec![0xFF, 0xFE];
+        for unit in "第一行\r\n第二行".encode_utf16() {
+            raw.extend_from_slice(&unit.to_le_bytes());
+        }
+        std::fs::write(&path, &raw).unwrap();
+        let mut doc = Document::load(&path).unwrap();
+        assert_eq!(doc.encoding, Encoding::Utf16Le);
+        // Reopening as UTF-8 must fail instead of garbling the buffer.
+        assert!(doc.reopen_with_encoding(Encoding::Utf8).is_err());
+        assert!(doc.reopen_with_encoding(Encoding::Utf16Le).is_ok());
+        assert_eq!(doc.text(), "第一行\n第二行");
+        assert_eq!(doc.eol, Eol::CrLf);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_as_with_encoding_writes_utf16_and_sets_eol() {
+        let path = temp_path("save_utf16le.txt");
+        let mut doc = Document::from_text("one\ntwo\n");
+        doc.set_eol(Eol::CrLf);
+        assert!(doc.is_dirty());
+        assert!(matches!(
+            doc.save_as_with_encoding(path.clone(), Encoding::Utf16Le),
+            SaveOutcome::Saved
+        ));
+        assert_eq!(doc.encoding, Encoding::Utf16Le);
+        assert!(matches!(doc.save(), SaveOutcome::Saved));
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[..2], &[0xFF, 0xFE]);
+        let units: Vec<u16> = bytes[2..]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
+            .collect();
+        assert_eq!(String::from_utf16(&units).unwrap(), "one\r\ntwo\r\n");
+        assert!(!doc.is_dirty());
         let _ = std::fs::remove_file(&path);
     }
 

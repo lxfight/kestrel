@@ -17,6 +17,15 @@ pub enum Command {
     CloseTab,
     CloseAllTabs,
     ReloadFile,
+    ToggleEol,
+    ReopenUtf8,
+    ReopenUtf8Bom,
+    ReopenUtf16Le,
+    ReopenUtf16Be,
+    SaveAsUtf8,
+    SaveAsUtf8Bom,
+    SaveAsUtf16Le,
+    SaveAsUtf16Be,
     // Edit & Multi-cursor
     Undo,
     Redo,
@@ -47,6 +56,13 @@ pub enum Command {
     ToggleFold,
     FoldAll,
     UnfoldAll,
+    SelectExpand,
+    SelectShrink,
+    JumpToBracket,
+    TrimTrailingWhitespace,
+    ToggleAutoClose,
+    JumpBack,
+    JumpForward,
     // Navigation / view / workbench
     ShowPalette,
     QuickOpen,
@@ -317,6 +333,15 @@ impl Command {
             Command::CloseTab => "file.closeTab",
             Command::CloseAllTabs => "file.closeAllTabs",
             Command::ReloadFile => "file.reload",
+            Command::ToggleEol => "file.toggleEol",
+            Command::ReopenUtf8 => "file.reopenUtf8",
+            Command::ReopenUtf8Bom => "file.reopenUtf8Bom",
+            Command::ReopenUtf16Le => "file.reopenUtf16le",
+            Command::ReopenUtf16Be => "file.reopenUtf16be",
+            Command::SaveAsUtf8 => "file.saveAsUtf8",
+            Command::SaveAsUtf8Bom => "file.saveAsUtf8Bom",
+            Command::SaveAsUtf16Le => "file.saveAsUtf16le",
+            Command::SaveAsUtf16Be => "file.saveAsUtf16be",
             Command::Undo => "edit.undo",
             Command::Redo => "edit.redo",
             Command::Cut => "edit.cut",
@@ -346,6 +371,13 @@ impl Command {
             Command::ToggleFold => "edit.toggleFold",
             Command::FoldAll => "edit.foldAll",
             Command::UnfoldAll => "edit.unfoldAll",
+            Command::SelectExpand => "edit.selectExpand",
+            Command::SelectShrink => "edit.selectShrink",
+            Command::JumpToBracket => "edit.jumpToBracket",
+            Command::TrimTrailingWhitespace => "edit.trimTrailingWhitespace",
+            Command::ToggleAutoClose => "edit.toggleAutoClose",
+            Command::JumpBack => "edit.jumpBack",
+            Command::JumpForward => "edit.jumpForward",
             Command::ShowPalette => "view.commandPalette",
             Command::QuickOpen => "view.quickOpen",
             Command::ToggleSidebar => "view.toggleSidebar",
@@ -399,6 +431,15 @@ impl Command {
         Command::CloseTab,
         Command::CloseAllTabs,
         Command::ReloadFile,
+        Command::ToggleEol,
+        Command::ReopenUtf8,
+        Command::ReopenUtf8Bom,
+        Command::ReopenUtf16Le,
+        Command::ReopenUtf16Be,
+        Command::SaveAsUtf8,
+        Command::SaveAsUtf8Bom,
+        Command::SaveAsUtf16Le,
+        Command::SaveAsUtf16Be,
         Command::Undo,
         Command::Redo,
         Command::Cut,
@@ -428,6 +469,13 @@ impl Command {
         Command::ToggleFold,
         Command::FoldAll,
         Command::UnfoldAll,
+        Command::SelectExpand,
+        Command::SelectShrink,
+        Command::JumpToBracket,
+        Command::TrimTrailingWhitespace,
+        Command::ToggleAutoClose,
+        Command::JumpBack,
+        Command::JumpForward,
         Command::ShowPalette,
         Command::QuickOpen,
         Command::ToggleSidebar,
@@ -476,6 +524,15 @@ impl Command {
             Command::CloseTab => "关闭编辑器",
             Command::CloseAllTabs => "关闭所有编辑器",
             Command::ReloadFile => "从磁盘重新加载",
+            Command::ToggleEol => "切换行尾 (LF/CRLF)",
+            Command::ReopenUtf8 => "以 UTF-8 重新打开",
+            Command::ReopenUtf8Bom => "以 UTF-8 BOM 重新打开",
+            Command::ReopenUtf16Le => "以 UTF-16 LE 重新打开",
+            Command::ReopenUtf16Be => "以 UTF-16 BE 重新打开",
+            Command::SaveAsUtf8 => "另存为 UTF-8…",
+            Command::SaveAsUtf8Bom => "另存为 UTF-8 BOM…",
+            Command::SaveAsUtf16Le => "另存为 UTF-16 LE…",
+            Command::SaveAsUtf16Be => "另存为 UTF-16 BE…",
             Command::Undo => "撤销",
             Command::Redo => "重做",
             Command::Cut => "剪切",
@@ -505,6 +562,13 @@ impl Command {
             Command::ToggleFold => "切换代码折叠",
             Command::FoldAll => "全部折叠代码块",
             Command::UnfoldAll => "全部展开代码块",
+            Command::SelectExpand => "扩大选区",
+            Command::SelectShrink => "缩小选区",
+            Command::JumpToBracket => "跳转到匹配括号",
+            Command::TrimTrailingWhitespace => "清理行尾空白",
+            Command::ToggleAutoClose => "切换自动闭合括号",
+            Command::JumpBack => "后退（跳转历史）",
+            Command::JumpForward => "前进（跳转历史）",
             Command::ShowPalette => "显示所有命令",
             Command::QuickOpen => "快速打开文件",
             Command::ToggleSidebar => "切换侧边栏",
@@ -552,6 +616,11 @@ impl Command {
             Command::SaveAll => Icon::SaveAll,
             Command::CloseTab | Command::CloseAllTabs => Icon::Close,
             Command::ReloadFile | Command::RefreshExplorer => Icon::Refresh,
+            Command::ReopenUtf8
+            | Command::ReopenUtf8Bom
+            | Command::ReopenUtf16Le
+            | Command::ReopenUtf16Be => Icon::Refresh,
+            Command::JumpBack | Command::JumpForward | Command::JumpToBracket => Icon::Goforward,
             Command::Undo => Icon::Undo,
             Command::Redo => Icon::Redo,
             Command::Copy | Command::CopyPath => Icon::Copy,
@@ -594,7 +663,16 @@ impl Command {
             | Command::SaveAll
             | Command::CloseTab
             | Command::CloseAllTabs
-            | Command::ReloadFile => "文件",
+            | Command::ReloadFile
+            | Command::ToggleEol
+            | Command::ReopenUtf8
+            | Command::ReopenUtf8Bom
+            | Command::ReopenUtf16Le
+            | Command::ReopenUtf16Be
+            | Command::SaveAsUtf8
+            | Command::SaveAsUtf8Bom
+            | Command::SaveAsUtf16Le
+            | Command::SaveAsUtf16Be => "文件",
             Command::Undo
             | Command::Redo
             | Command::Cut
@@ -623,7 +701,14 @@ impl Command {
             | Command::Outdent
             | Command::ToggleFold
             | Command::FoldAll
-            | Command::UnfoldAll => "编辑",
+            | Command::UnfoldAll
+            | Command::SelectExpand
+            | Command::SelectShrink
+            | Command::JumpToBracket
+            | Command::TrimTrailingWhitespace
+            | Command::ToggleAutoClose
+            | Command::JumpBack
+            | Command::JumpForward => "编辑",
             Command::CopyPath | Command::RevealInExplorer | Command::RefreshExplorer => "工作区",
             Command::About | Command::Shortcuts => "帮助",
             Command::Plugins => "插件",
@@ -667,6 +752,11 @@ impl Command {
             Command::MoveLineUp => Shortcut::new(alt(), ArrowUp),
             Command::MoveLineDown => Shortcut::new(alt(), ArrowDown),
             Command::ToggleFold => Shortcut::new(ctrl_shift(), OpenBracket),
+            Command::JumpToBracket => Shortcut::new(ctrl_shift(), Backslash),
+            Command::SelectExpand => Shortcut::new(shift_alt(), ArrowRight),
+            Command::SelectShrink => Shortcut::new(shift_alt(), ArrowLeft),
+            Command::JumpBack => Shortcut::new(alt(), ArrowLeft),
+            Command::JumpForward => Shortcut::new(alt(), ArrowRight),
             Command::ShowPalette => Shortcut::new(ctrl_shift(), P),
             Command::QuickOpen => Shortcut::new(CTRL, P),
             Command::ToggleSidebar => Shortcut::new(CTRL, B),
@@ -726,6 +816,11 @@ impl Command {
                 | Command::Indent
                 | Command::Outdent
                 | Command::ToggleFold
+                | Command::SelectExpand
+                | Command::SelectShrink
+                | Command::JumpToBracket
+                | Command::JumpBack
+                | Command::JumpForward
         )
     }
 }

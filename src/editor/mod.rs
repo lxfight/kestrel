@@ -10,9 +10,9 @@ use std::time::Instant;
 
 use egui::FontFamily;
 
-use crate::doc::{Document, EditKind};
+use crate::doc::{Document, EditKind, Encoding, Eol, SaveOutcome};
 use crate::git::{LineDiffKind, compute_line_diff};
-use crate::highlight::{Language, Span};
+use crate::highlight::{Language, Span, TokenKind};
 use crate::lsp::{CompletionItem, Diagnostic, OutlineSymbol};
 use crate::theme::Theme;
 use syntax::SyntaxService;
@@ -70,6 +70,12 @@ pub struct FindState {
     pub focus_query: bool,
     pub focus_replacement: bool,
     pub last_version: u64,
+    /// When `in_selection` is set, matches outside this char range are dropped.
+    pub scope: Option<(usize, usize)>,
+    pub in_selection: bool,
+    /// Recently used queries, oldest first; `history_pos` walks them with ↑/↓.
+    pub history: Vec<String>,
+    pub history_pos: Option<usize>,
 }
 
 
@@ -120,6 +126,8 @@ pub struct Editor {
     pub tab_size: usize,
     pub insert_spaces: bool,
     pub autocomplete_enabled: bool,
+    /// Mirrors `Settings::auto_close_pairs`; off inserts brackets literally.
+    pub auto_close: bool,
 
     // Layout cache (invalidated on version/style change).
     galleys: std::collections::HashMap<usize, CachedLine>,
@@ -128,6 +136,18 @@ pub struct Editor {
     /// Font-atlas probe hash and fill ratio; an atlas rebuild invalidates every galley.
     atlas_key: u64,
     atlas_fill: f32,
+    /// Memo for bracket highlighting: the scan used to run on every painted frame,
+    /// it now runs only when the caret or text moves.
+    bracket_cache: Option<BracketCache>,
+    /// Alt+drag box selection: anchor char and the cursor list the gesture started from.
+    box_anchor: Option<usize>,
+    box_base: Vec<(usize, usize)>,
+    box_moved: bool,
+    /// In-editor drag of the selected text: move by default, copy while Ctrl is held.
+    pub text_drag: Option<TextDrag>,
+    /// Expanding selections remember their history; shrinking pops it.
+    selection_history: Vec<(usize, usize)>,
+    selection_history_version: u64,
     /// Visible-row mapping (folded lines removed) plus the sorted fold index.
     line_map: LineMap,
     fold_index: FoldIndex,
@@ -154,6 +174,24 @@ pub struct Editor {
     /// Set when the next IME output must abort the OS composition (click / Esc).
     ime_interrupt: bool,
     pub multimodal: Option<crate::viewer::MultimodalViewer>,
+}
+
+/// Key for the bracket-pair memo: document version plus caret char offset.
+#[derive(Clone, Copy)]
+struct BracketCache {
+    version: u64,
+    caret: usize,
+    pair: Option<(usize, usize)>,
+}
+
+/// Drag of the current selection inside the canvas.
+pub struct TextDrag {
+    /// Char under the press point, used to collapse a plain click.
+    pub press_char: usize,
+    pub press: egui::Pos2,
+    /// Caret position the text would be dropped at, `None` while outside the text.
+    pub drop: Option<usize>,
+    pub moved: bool,
 }
 
 struct CachedLine {
@@ -341,10 +379,18 @@ impl Editor {
             tab_size: 4,
             insert_spaces: true,
             autocomplete_enabled: true,
+            auto_close: true,
             galleys: std::collections::HashMap::new(),
             cache_key: (0, 0, 0, 0, 0, 0),
             atlas_key: 0,
             atlas_fill: 0.0,
+            bracket_cache: None,
+            box_anchor: None,
+            box_base: Vec::new(),
+            box_moved: false,
+            text_drag: None,
+            selection_history: Vec::new(),
+            selection_history_version: 0,
             line_map: LineMap::default(),
             fold_index: FoldIndex::default(),
             fold_rev: 0,
@@ -552,6 +598,7 @@ impl Editor {
         if !extend {
             self.anchor = caret;
         }
+        self.selection_history.clear();
         self.ensure_visible = true;
         self.completion.open = false;
     }
@@ -1169,6 +1216,7 @@ impl Editor {
     }
 
     fn after_edit(&mut self) {
+        self.selection_history.clear();
         self.preview = false;
         self.ensure_visible = true;
         self.desired_col = None;
@@ -1237,8 +1285,10 @@ impl Editor {
             return;
         }
         let ch = text.chars().next().unwrap();
-        let open = matches!(ch, '(' | '[' | '{' | '"' | '\'' | '`');
-        let close = matches!(ch, ')' | ']' | '}' | '"' | '\'' | '`');
+        // The settings toggle disables both pairing and the skip-over/backspace
+        // helpers, so brackets then behave as plain characters.
+        let open = self.auto_close && matches!(ch, '(' | '[' | '{' | '"' | '\'' | '`');
+        let close = self.auto_close && matches!(ch, ')' | ']' | '}' | '"' | '\'' | '`');
 
         // Surround an existing selection with a pair.
         if open && self.has_selection() {
@@ -1409,7 +1459,8 @@ impl Editor {
         // Delete auto-closed pair as one unit.
         let prev = self.doc.char_at(self.caret - 1);
         let next = self.doc.char_at(self.caret);
-        if let (Some(a), Some(b)) = (prev, next)
+        if self.auto_close
+            && let (Some(a), Some(b)) = (prev, next)
             && matches!(
                 (a, b),
                 ('(', ')') | ('[', ']') | ('{', '}') | ('"', '"') | ('\'', '\'') | ('`', '`')
@@ -1823,17 +1874,34 @@ impl Editor {
             }
         };
         let text = self.doc.text();
-        let replacement = self.find.replacement.clone();
+        let regex_mode = self.find.regex;
+        let (scope_start, scope_end) = self.find.scope.unwrap_or((0, usize::MAX));
         let mut edits: Vec<(usize, usize, String)> = Vec::new();
         let mut first_start = None;
-        for m in regex.find_iter(&text) {
-            if m.start() == m.end() {
+        let mut byte = 0usize;
+        let mut ch = 0usize;
+        for captures in regex.captures_iter(&text) {
+            let Some(whole) = captures.get(0) else {
+                continue;
+            };
+            if whole.start() == whole.end() {
                 continue;
             }
-            let start = self.doc.byte_to_char(m.start());
-            let end = self.doc.byte_to_char(m.end());
+            ch += text[byte..whole.start()].chars().count();
+            let start = ch;
+            ch += text[whole.start()..whole.end()].chars().count();
+            byte = whole.end();
+            if start < scope_start || ch > scope_end {
+                continue;
+            }
+            let mut replacement = String::new();
+            if regex_mode {
+                captures.expand(&self.find.replacement, &mut replacement);
+            } else {
+                replacement.push_str(&self.find.replacement);
+            }
             first_start.get_or_insert(start);
-            edits.push((start, end, replacement.clone()));
+            edits.push((start, ch, replacement));
             if edits.len() >= 50_000 {
                 break;
             }
@@ -1898,6 +1966,7 @@ impl Editor {
     }
 
     pub fn close_find(&mut self) {
+        self.remember_find_query();
         self.find.open = false;
         self.find.focus_query = false;
         self.find.focus_replacement = false;
@@ -1922,6 +1991,11 @@ impl Editor {
             self.find.active = None;
             return;
         }
+        // "仅在选区内查找" snapshots the selection when the toggle flips; if the
+        // selection vanished the search falls back to the whole document.
+        if self.find.in_selection && self.find.scope.is_none() {
+            self.find.scope = self.selection();
+        }
         let mut pattern = if self.find.regex {
             self.find.query.clone()
         } else {
@@ -1945,6 +2019,7 @@ impl Editor {
         };
         self.find.error = None;
         let text = self.doc.text();
+        let (scope_start, scope_end) = self.find.scope.unwrap_or((0, usize::MAX));
         let mut matches = Vec::new();
         let mut byte = 0usize;
         let mut ch = 0usize;
@@ -1956,6 +2031,9 @@ impl Editor {
             let start = ch;
             ch += text[m.start()..m.end()].chars().count();
             byte = m.end();
+            if start < scope_start || ch > scope_end {
+                continue;
+            }
             matches.push((start, ch));
         }
         self.find.matches = matches;
@@ -2016,7 +2094,7 @@ impl Editor {
         let Some((start, end)) = self.find.matches.get(index).copied() else {
             return;
         };
-        let replacement = self.find.replacement.clone();
+        let replacement = self.replacement_for(start, end);
         let before = (self.caret, self.anchor);
         let caret_after = start + replacement.chars().count();
         let sed = self.doc.edit(
@@ -2040,6 +2118,469 @@ impl Editor {
                 .min(self.find.matches.len() - 1);
             self.activate_match(next);
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // Bracket matching, selection expansion & navigation
+    // ---------------------------------------------------------------------
+
+    /// Bracket pair around the caret. The bracket right before the caret wins, so
+    /// typing after `(` immediately shows its mate.
+    pub fn matching_brackets(&self) -> Option<(usize, usize)> {
+        for pos in [self.caret.checked_sub(1), Some(self.caret)]
+            .into_iter()
+            .flatten()
+        {
+            if let Some(pair) = self.matching_pair_at(pos) {
+                return Some(pair);
+            }
+        }
+        None
+    }
+
+    /// Move the caret to the bracket matching the one next to it (Ctrl+Shift+\).
+    pub fn jump_to_matching_bracket(&mut self) -> bool {
+        let Some((open, close)) = self.matching_brackets() else {
+            return false;
+        };
+        let mut target = None;
+        for pos in [self.caret.checked_sub(1), Some(self.caret)]
+            .into_iter()
+            .flatten()
+        {
+            if pos == open {
+                target = Some(close);
+                break;
+            }
+            if pos == close {
+                target = Some(open);
+                break;
+            }
+        }
+        let Some(target) = target else {
+            return false;
+        };
+        self.set_caret(target, false);
+        self.desired_col = None;
+        true
+    }
+
+    fn matching_pair_at(&self, pos: usize) -> Option<(usize, usize)> {
+        let bracket = self.doc.char_at(pos)?;
+        let (open, close, forward) = match bracket {
+            '(' => ('(', ')', true),
+            '[' => ('[', ']', true),
+            '{' => ('{', '}', true),
+            ')' => ('(', ')', false),
+            ']' => ('[', ']', false),
+            '}' => ('{', '}', false),
+            _ => return None,
+        };
+        let other = if forward { close } else { open };
+        let mut depth = 0i32;
+        let mut p = pos;
+        // Bounded scan: a broken file must not stall the key handler.
+        for _ in 0..20_000 {
+            if forward {
+                p += 1;
+                if p >= self.doc.len_chars() {
+                    return None;
+                }
+            } else {
+                p = p.checked_sub(1)?;
+            }
+            let ch = self.doc.char_at(p)?;
+            if ch == bracket {
+                depth += 1;
+            } else if ch == other {
+                if depth == 0 {
+                    if self.is_in_string_or_comment(p) {
+                        return None;
+                    }
+                    return if forward { Some((pos, p)) } else { Some((p, pos)) };
+                }
+                depth -= 1;
+            }
+        }
+        None
+    }
+
+    /// True when the char sits inside a string literal or a comment span.
+    pub fn is_in_string_or_comment(&self, ch_pos: usize) -> bool {
+        let byte = self.doc.char_to_byte(ch_pos);
+        let idx = self.spans.partition_point(|s| s.end <= byte);
+        matches!(
+            self.spans.get(idx).map(|s| s.kind),
+            Some(TokenKind::String) | Some(TokenKind::Comment)
+        )
+    }
+
+    /// Grow the selection: word → bracket interior → bracket → line → enclosing block.
+    pub fn expand_selection(&mut self) -> bool {
+        let current = self.selection().unwrap_or((self.caret, self.caret));
+        let Some(next) = self.selection_candidates(current).into_iter().find(|candidate| {
+            *candidate != current && candidate.0 <= current.0 && candidate.1 >= current.1
+        }) else {
+            return false;
+        };
+        if current.0 != current.1 {
+            self.selection_history.push(current);
+            self.selection_history_version = self.doc.version;
+        }
+        self.anchor = next.0;
+        self.caret = next.1;
+        self.ensure_visible = true;
+        self.desired_col = None;
+        true
+    }
+
+    /// Shrink back through the ranges `expand_selection` produced.
+    pub fn shrink_selection(&mut self) -> bool {
+        if self.selection_history_version == self.doc.version
+            && let Some(previous) = self.selection_history.pop()
+        {
+            self.anchor = previous.0;
+            self.caret = previous.1;
+            self.ensure_visible = true;
+            self.desired_col = None;
+            return true;
+        }
+        let current = self.selection().unwrap_or((self.caret, self.caret));
+        if current.0 == current.1 {
+            return false;
+        }
+        let word = self.word_at(current.0);
+        if word.0 < word.1 && word.0 >= current.0 && word.1 <= current.1 && word != current {
+            self.anchor = word.0;
+            self.caret = word.1;
+            self.ensure_visible = true;
+            self.desired_col = None;
+            return true;
+        }
+        false
+    }
+
+    /// Selections containing `sel`, smallest first. Ranges nest, so length order is
+    /// dependency order; build it only when the user presses expand/shrink.
+    fn selection_candidates(&self, sel: (usize, usize)) -> Vec<(usize, usize)> {
+        let len = self.doc.len_chars();
+        let (start, end) = sel;
+        let mut candidates: Vec<(usize, usize)> = Vec::new();
+        if start == end {
+            let word = self.word_at(start.min(len.saturating_sub(1)));
+            if word.0 < word.1 {
+                candidates.push(word);
+            }
+        }
+        for (open, close) in self.enclosing_bracket_pairs(start, end) {
+            if open + 1 < close {
+                candidates.push((open + 1, close));
+            }
+            candidates.push((open, (close + 1).min(len)));
+        }
+        let first = self.doc.char_to_line(start);
+        let last = self.doc.char_to_line(end);
+        let line_start = self.doc.line_to_char(first);
+        let line_end = self.doc.line_to_char(last) + self.doc.line_char_len(last);
+        candidates.push((line_start, line_end));
+        if line_end < len {
+            candidates.push((line_start, line_end + 1));
+        }
+        candidates.push((0, len));
+        candidates
+            .retain(|candidate| candidate.0 <= start && candidate.1 >= end && candidate.0 < candidate.1);
+        candidates.sort_unstable_by_key(|candidate| (candidate.1 - candidate.0, candidate.0));
+        candidates.dedup();
+        candidates
+    }
+
+    /// Enclosing bracket pairs, innermost first. One bounded left scan collects the
+    /// ancestors, then each mate is found forward.
+    fn enclosing_bracket_pairs(&self, start: usize, end: usize) -> Vec<(usize, usize)> {
+        let len = self.doc.len_chars();
+        let mut ancestors: Vec<usize> = Vec::new();
+        let mut depth = 0i32;
+        let mut p = start.min(len);
+        let floor = start.saturating_sub(200_000);
+        while p > floor {
+            p -= 1;
+            match self.doc.char_at(p) {
+                Some(')' | ']' | '}') => depth += 1,
+                Some('(' | '[' | '{') => {
+                    if depth == 0 {
+                        if !self.is_in_string_or_comment(p) {
+                            ancestors.push(p);
+                        }
+                    } else {
+                        depth -= 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut pairs = Vec::new();
+        for open in ancestors {
+            let Some(open_ch) = self.doc.char_at(open) else {
+                break;
+            };
+            let close_ch = match open_ch {
+                '(' => ')',
+                '[' => ']',
+                _ => '}',
+            };
+            let mut depth = 0i32;
+            let mut mate = None;
+            let mut q = open;
+            while q + 1 < len {
+                q += 1;
+                match self.doc.char_at(q) {
+                    Some(ch) if ch == open_ch => depth += 1,
+                    Some(ch) if ch == close_ch => {
+                        if depth == 0 {
+                            mate = Some(q);
+                            break;
+                        }
+                        depth -= 1;
+                    }
+                    _ => {}
+                }
+            }
+            let Some(close) = mate else {
+                break;
+            };
+            if close < end {
+                break;
+            }
+            pairs.push((open, close));
+        }
+        pairs
+    }
+
+    // ---------------------------------------------------------------------
+    // Line endings, encoding & cleanup
+    // ---------------------------------------------------------------------
+
+    /// Switch the buffer between LF and CRLF; the toggle takes effect on the next save.
+    /// Read-only previews have no save path, so they report `None` instead.
+    pub fn toggle_eol(&mut self) -> Option<Eol> {
+        if self.doc.readonly {
+            return None;
+        }
+        let next = match self.doc.eol {
+            Eol::Lf => Eol::CrLf,
+            Eol::CrLf => Eol::Lf,
+        };
+        self.doc.set_eol(next);
+        Some(next)
+    }
+
+    /// Strip trailing spaces/tabs from every line as one undo step.
+    pub fn trim_trailing_whitespace(&mut self) -> usize {
+        if self.doc.readonly {
+            return 0;
+        }
+        let mut edits: Vec<(usize, usize, String)> = Vec::new();
+        for line in 0..self.doc.line_count() {
+            let content = self.doc.line_content(line);
+            let trimmed = content.trim_end_matches([' ', '\t']);
+            if trimmed.len() == content.len() {
+                continue;
+            }
+            let line_start = self.doc.line_to_char(line);
+            let end = line_start + content.chars().count();
+            let start = line_start + trimmed.chars().count();
+            edits.push((start, end, String::new()));
+            if edits.len() >= 100_000 {
+                break;
+            }
+        }
+        let count = edits.len();
+        if count == 0 {
+            return 0;
+        }
+        let (caret_line, caret_col) = self.doc.char_to_line_col(self.caret);
+        let before = (self.caret, self.anchor);
+        let syntax_edits = self.doc.edit_many(&edits, before, (self.caret, self.anchor));
+        for sed in syntax_edits {
+            self.syntax.apply_edit(sed);
+        }
+        let last_line = self.doc.line_count().saturating_sub(1);
+        let line_len = self.doc.line_char_len(caret_line.min(last_line));
+        self.caret = self.doc.line_col_to_char(caret_line, caret_col.min(line_len));
+        self.anchor = self.caret;
+        self.after_edit();
+        self.refresh_find_matches();
+        count
+    }
+
+    /// Re-decode the file on disk with an explicitly chosen encoding.
+    pub fn reopen_with_encoding(&mut self, encoding: Encoding) -> std::io::Result<()> {
+        if self.doc.is_dirty() {
+            return Err(std::io::Error::other("有未保存的修改，请先保存再重新解码"));
+        }
+        self.doc.reopen_with_encoding(encoding)?;
+        self.extra_cursors.clear();
+        self.caret = self.caret.min(self.doc.len_chars());
+        self.anchor = self.anchor.min(self.doc.len_chars());
+        self.syntax.reset(self.language);
+        self.spans.clear();
+        self.spans_version = 0;
+        self.diagnostics.clear();
+        self.folds.clear();
+        self.folded_lines.clear();
+        self.fold_rev += 1;
+        self.syntax_due = Some(Instant::now());
+        self.invalidate_layout();
+        self.ensure_visible = true;
+        self.refresh_find_matches();
+        Ok(())
+    }
+
+    /// Save to a new path, converting to the requested encoding.
+    pub fn save_as_with_encoding(
+        &mut self,
+        path: std::path::PathBuf,
+        encoding: Encoding,
+    ) -> SaveOutcome {
+        let language = Language::from_path(&path);
+        let outcome = self.doc.save_as_with_encoding(path, encoding);
+        if matches!(outcome, SaveOutcome::Saved) {
+            self.preview = false;
+            self.diff_version = 0;
+            self.set_language(language);
+        }
+        outcome
+    }
+
+    // ---------------------------------------------------------------------
+    // In-editor drag & drop of the selected text
+    // ---------------------------------------------------------------------
+
+    /// Move the selected text to `target` as one undo step (plain drag).
+    pub fn move_selection_to(&mut self, target: usize) -> bool {
+        let Some((start, end)) = self.selection() else {
+            return false;
+        };
+        if self.doc.readonly {
+            return false;
+        }
+        let target = target.min(self.doc.len_chars());
+        if target >= start && target <= end {
+            return false;
+        }
+        let selected = self.doc.text_range(start, end);
+        let insert_len = selected.chars().count();
+        let (edit_start, edit_end, insert, caret_after) = if target < start {
+            let between = self.doc.text_range(target, start);
+            (target, end, format!("{selected}{between}"), target + insert_len)
+        } else {
+            let between = self.doc.text_range(end, target);
+            (start, target, format!("{between}{selected}"), target)
+        };
+        let anchor_after = if target < start { target } else { target - insert_len };
+        let before = (self.caret, self.anchor);
+        let sed = self.doc.edit(
+            edit_start,
+            edit_end,
+            &insert,
+            EditKind::Other,
+            before,
+            (caret_after, anchor_after),
+        );
+        self.syntax.apply_edit(sed);
+        self.caret = caret_after.min(self.doc.len_chars());
+        self.anchor = anchor_after.min(self.doc.len_chars());
+        self.after_edit();
+        self.refresh_find_matches();
+        true
+    }
+
+    /// Copy the selected text to `target` as one undo step (Ctrl+drag).
+    pub fn duplicate_selection_at(&mut self, target: usize) -> bool {
+        let Some((start, end)) = self.selection() else {
+            return false;
+        };
+        if self.doc.readonly {
+            return false;
+        }
+        let selected = self.doc.text_range(start, end);
+        let insert_len = selected.chars().count();
+        let target = target.min(self.doc.len_chars());
+        let before = (self.caret, self.anchor);
+        let sed = self.doc.edit(
+            target,
+            target,
+            &selected,
+            EditKind::Other,
+            before,
+            (target + insert_len, target),
+        );
+        self.syntax.apply_edit(sed);
+        self.caret = target + insert_len;
+        self.anchor = target;
+        self.after_edit();
+        self.refresh_find_matches();
+        true
+    }
+
+    // ---------------------------------------------------------------------
+    // Find history & replacement expansion
+    // ---------------------------------------------------------------------
+
+    /// Record the current query for the ↑/↓ history walk.
+    pub fn remember_find_query(&mut self) {
+        let query = self.find.query.trim().to_string();
+        if query.is_empty() || self.find.history.last() == Some(&query) {
+            return;
+        }
+        self.find.history.push(query);
+        if self.find.history.len() > 50 {
+            self.find.history.remove(0);
+        }
+        self.find.history_pos = None;
+    }
+
+    /// Walk recorded queries; `newer` moves towards the most recent entry.
+    pub fn find_history_step(&mut self, newer: bool) -> bool {
+        if self.find.history.is_empty() {
+            return false;
+        }
+        let next = match self.find.history_pos {
+            Some(pos) if newer => (pos + 1).min(self.find.history.len() - 1),
+            Some(0) if !newer => return false,
+            Some(pos) => pos - 1,
+            None if !newer => self.find.history.len() - 1,
+            None => return false,
+        };
+        self.find.history_pos = Some(next);
+        self.find.query = self.find.history[next].clone();
+        self.recompute_find();
+        true
+    }
+
+    /// Replacement text for one match; `$1`/`${1}` expand only in regex mode.
+    fn replacement_for(&self, start: usize, end: usize) -> String {
+        if !self.find.regex {
+            return self.find.replacement.clone();
+        }
+        let Ok(regex) = self.build_find_regex() else {
+            return self.find.replacement.clone();
+        };
+        let text = self.doc.text();
+        let byte_start = self.doc.char_to_byte(start);
+        let byte_end = self.doc.char_to_byte(end);
+        let Some(captures) = regex.captures_at(&text, byte_start) else {
+            return self.find.replacement.clone();
+        };
+        let Some(whole) = captures.get(0) else {
+            return self.find.replacement.clone();
+        };
+        if whole.start() != byte_start || whole.end() != byte_end {
+            return self.find.replacement.clone();
+        }
+        let mut expanded = String::new();
+        captures.expand(&self.find.replacement, &mut expanded);
+        expanded
     }
 
     // ---------------------------------------------------------------------
@@ -2195,6 +2736,154 @@ cc
         assert_eq!(ed.caret, 1);
         ed.backspace();
         assert_eq!(ed.doc.text(), "");
+    }
+
+    #[test]
+    fn auto_close_toggle_disables_pairing() {
+        let mut ed = editor("");
+        assert!(ed.auto_close);
+        ed.insert_text("(");
+        assert_eq!(ed.doc.text(), "()");
+        ed.auto_close = false;
+        // With pairing off the closing char is inserted instead of skipping over.
+        ed.insert_text(")");
+        assert_eq!(ed.doc.text(), "())");
+        // Backspace deletes one char, not the whole pair.
+        ed.backspace();
+        assert_eq!(ed.doc.text(), "()");
+        ed.insert_text("]");
+        assert_eq!(ed.doc.text(), "(])");
+    }
+
+    #[test]
+    fn bracket_matching_and_jump() {
+        let mut ed = editor("fn main() { let x = (1 + 2); }");
+        let text = ed.doc.text();
+        let open = ed.doc.byte_to_char(text.find('{').unwrap());
+        let close = ed.doc.byte_to_char(text.rfind('}').unwrap());
+        ed.caret = open + 1;
+        ed.anchor = ed.caret;
+        assert_eq!(ed.matching_brackets(), Some((open, close)));
+        assert!(ed.jump_to_matching_bracket());
+        assert_eq!(ed.caret, close);
+        assert!(ed.jump_to_matching_bracket());
+        assert_eq!(ed.caret, open);
+        // Unbalanced input must not claim a pair.
+        let mut ed = editor("fn broken( {");
+        ed.caret = 4;
+        ed.anchor = 4;
+        assert_eq!(ed.matching_brackets(), None);
+    }
+
+    #[test]
+    fn selection_expands_and_shrinks() {
+        let mut ed = editor("fn run() {\n    let value = compute(arg);\n}");
+        let caret = ed.doc.byte_to_char(ed.doc.text().find("arg").unwrap()) + 1;
+        ed.caret = caret;
+        ed.anchor = caret;
+        assert!(ed.expand_selection());
+        assert_eq!(ed.selected_text(), "arg");
+        assert!(ed.expand_selection());
+        assert_eq!(ed.selected_text(), "(arg)");
+        assert!(ed.expand_selection());
+        assert_eq!(ed.selected_text(), "    let value = compute(arg);");
+        assert!(ed.shrink_selection());
+        assert_eq!(ed.selected_text(), "(arg)");
+        assert!(ed.shrink_selection());
+        assert_eq!(ed.selected_text(), "arg");
+    }
+
+    #[test]
+    fn regex_replace_expands_capture_groups() {
+        let mut ed = editor("key = value; other = thing;");
+        ed.open_find(true);
+        ed.find.regex = true;
+        ed.find.query = r"(\w+) = (\w+)".to_string();
+        ed.find.replacement = "$2 = $1".to_string();
+        ed.recompute_find();
+        assert_eq!(ed.find.matches.len(), 2);
+        assert_eq!(ed.replace_all(), 2);
+        assert_eq!(ed.doc.text(), "value = key; thing = other;");
+
+        // The single-match path expands the same groups.
+        let mut ed = editor("a1 b2");
+        ed.open_find(true);
+        ed.find.regex = true;
+        ed.find.query = r"(\w)(\d)".to_string();
+        ed.find.replacement = "$2$1".to_string();
+        ed.recompute_find();
+        ed.find.active = Some(0);
+        ed.replace_current();
+        assert_eq!(ed.doc.text(), "1a b2");
+    }
+
+    #[test]
+    fn find_in_selection_limits_matches() {
+        let mut ed = editor("foo bar foo");
+        ed.anchor = 4;
+        ed.caret = 7;
+        ed.open_find(false);
+        ed.find.in_selection = true;
+        ed.find.scope = ed.selection();
+        ed.find.query = "foo".to_string();
+        ed.recompute_find();
+        assert!(ed.find.matches.is_empty());
+        ed.find.in_selection = false;
+        ed.find.scope = None;
+        ed.recompute_find();
+        assert_eq!(ed.find.matches.len(), 2);
+    }
+
+    #[test]
+    fn find_history_walks_recent_queries() {
+        let mut ed = editor("foo bar foo");
+        ed.open_find(false);
+        ed.find.query = "foo".to_string();
+        ed.remember_find_query();
+        ed.find.query = "bar".to_string();
+        ed.remember_find_query();
+        assert!(ed.find_history_step(false));
+        assert_eq!(ed.find.query, "bar");
+        assert!(ed.find_history_step(false));
+        assert_eq!(ed.find.query, "foo");
+        assert!(!ed.find_history_step(false));
+        assert!(ed.find_history_step(true));
+        assert_eq!(ed.find.query, "bar");
+    }
+
+    #[test]
+    fn invalid_regex_reports_error_instead_of_matches() {
+        let mut ed = editor("abc");
+        ed.open_find(false);
+        ed.find.regex = true;
+        ed.find.query = "(".to_string();
+        ed.recompute_find();
+        assert!(ed.find.error.is_some());
+        assert!(ed.find.matches.is_empty());
+    }
+
+    #[test]
+    fn trim_trailing_whitespace_and_eol_toggle() {
+        let mut ed = editor("let a = 1;   \nlet b = 2;\t\n");
+        assert_eq!(ed.trim_trailing_whitespace(), 2);
+        assert_eq!(ed.doc.text(), "let a = 1;\nlet b = 2;\n");
+        assert_eq!(ed.toggle_eol(), Some(Eol::CrLf));
+        assert_eq!(ed.toggle_eol(), Some(Eol::Lf));
+    }
+
+    #[test]
+    fn drag_moves_and_copies_selection() {
+        let mut ed = editor("alpha beta");
+        ed.anchor = 0;
+        ed.caret = 5;
+        assert!(ed.move_selection_to(10));
+        assert_eq!(ed.doc.text(), " betaalpha");
+
+        let mut ed = editor("one two");
+        ed.anchor = 0;
+        ed.caret = 3;
+        assert!(ed.duplicate_selection_at(7));
+        assert_eq!(ed.doc.text(), "one twoone");
     }
 
     #[test]

@@ -233,20 +233,10 @@ impl Editor {
                     self.delete_forward();
                 }
             }
-            Key::ArrowLeft => {
-                if alt && shift {
-                    self.move_lines(true);
-                } else {
-                    self.move_horizontal(false, shift, ctrl);
-                }
-            }
-            Key::ArrowRight => {
-                if alt && shift {
-                    self.move_lines(false);
-                } else {
-                    self.move_horizontal(true, shift, ctrl);
-                }
-            }
+            // Alt+Shift+←/→ (shrink/expand selection) is dispatched by the app so
+            // the chord stays user-rebindable; the canvas only sees plain moves.
+            Key::ArrowLeft => self.move_horizontal(false, shift, ctrl),
+            Key::ArrowRight => self.move_horizontal(true, shift, ctrl),
             Key::ArrowUp => {
                 if ctrl && alt {
                     self.add_cursor_vertical(-1);
@@ -302,6 +292,9 @@ impl Editor {
             Key::K if ctrl && shift => self.delete_line(),
             Key::Slash if ctrl => self.toggle_comment(),
             Key::OpenBracket if ctrl && shift => self.toggle_fold_caret(),
+            Key::Backslash if ctrl && shift => {
+                self.jump_to_matching_bracket();
+            }
             Key::F if ctrl && !shift => {
                 self.open_find(false);
             }

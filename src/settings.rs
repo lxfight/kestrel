@@ -25,6 +25,8 @@ pub struct Settings {
     pub show_sticky_scroll: bool,
     pub show_git_gutter: bool,
     pub autocomplete: bool,
+    /// Automatically insert the matching bracket/quote and surround selections.
+    pub auto_close_pairs: bool,
     pub word_wrap: bool,
     pub scroll_past_end: bool,
     pub show_hidden_files: bool,
@@ -58,6 +60,7 @@ impl Default for Settings {
             show_sticky_scroll: true,
             show_git_gutter: true,
             autocomplete: true,
+            auto_close_pairs: true,
             word_wrap: false,
             scroll_past_end: true,
             show_hidden_files: false,
