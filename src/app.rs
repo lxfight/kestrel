@@ -24,6 +24,8 @@ use crate::workspace::{
 
 pub const APP_NAME: &str = "Kestrel";
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Watcher bursts wait this long before touching the file index.
+const INDEX_DEBOUNCE: Duration = Duration::from_millis(500);
 
 pub const LANGUAGES: &[Language] = &[
     Language::Rust,
@@ -145,6 +147,9 @@ pub struct WorkspaceState {
     pub watcher: Option<FsWatcher>,
     pub search_panel: SearchPanelState,
     pub pending_search: bool,
+    /// Watcher paths waiting for the 500 ms index debounce.
+    pub index_dirty: Vec<PathBuf>,
+    pub index_dirty_at: Option<Instant>,
 }
 
 impl WorkspaceState {
@@ -158,6 +163,8 @@ impl WorkspaceState {
             watcher: None,
             search_panel: SearchPanelState::default(),
             pending_search: false,
+            index_dirty: Vec::new(),
+            index_dirty_at: None,
         }
     }
 }
@@ -302,6 +309,16 @@ impl EditorGroup {
 pub const GROUP_GAP: f32 = 5.0;
 pub const TABBAR_H: f32 = 34.0;
 
+/// First line of a Git failure for a toast; the full text already went to the log.
+fn error_summary(error: &str) -> String {
+    let mut lines = error.lines().filter(|line| !line.trim().is_empty());
+    match (lines.next(), lines.next()) {
+        (Some(first), Some(_)) => format!("{} …", first.trim()),
+        (Some(first), None) => first.trim().to_string(),
+        (None, _) => "未知错误".to_string(),
+    }
+}
+
 fn with_alpha(color: egui::Color32, alpha: f32) -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(
         color.r(),
@@ -385,6 +402,8 @@ pub struct KestrelApp {
     pub frame: u64,
     pub shot_frame: u64,
     pub dev_ui: Option<String>,
+    /// Kept so background producers (watcher) can wake egui without a UI call site.
+    pub egui_ctx: egui::Context,
 }
 
 impl KestrelApp {
@@ -463,6 +482,7 @@ impl KestrelApp {
             frame: 0,
             shot_frame: 0,
             dev_ui: None,
+            egui_ctx: cc.egui_ctx.clone(),
         };
         app.apply_dev_env();
         if app.workspace.root.is_none() && app.tabs.is_empty() && app.dev_ui.is_none() {
@@ -2038,9 +2058,17 @@ impl KestrelApp {
         self.workspace.tree.reload();
         self.workspace.index.clear();
         self.workspace.index.scan(&path);
-        self.workspace.watcher = FsWatcher::new(&path).ok();
+        self.workspace.watcher = FsWatcher::new(&path, self.egui_ctx.clone()).ok();
         self.workspace.search_panel = SearchPanelState::default();
         self.workspace.search.cancel();
+        self.workspace.index_dirty.clear();
+        self.workspace.index_dirty_at = None;
+        // Terminals and the Git snapshot belong to the old project: drop them so
+        // the next shell spawns in the new root instead of the old directory.
+        self.bottom.terminals.clear();
+        self.bottom.active_terminal = 0;
+        self.bottom.terminal_focus = false;
+        self.git.clear();
         self.git.prime_fast(&path);
         self.git.log(format!("打开工作区: {}", path.display()));
         self.tabs.clear();
@@ -2048,6 +2076,10 @@ impl KestrelApp {
         self.reset_groups();
         self.sidebar.selected = None;
         self.sidebar.editing = None;
+        // An open terminal panel starts a fresh shell in the new root.
+        if self.bottom.visible {
+            self.new_terminal();
+        }
     }
 
     fn canonical(&self, path: PathBuf) -> PathBuf {
@@ -2394,8 +2426,10 @@ impl KestrelApp {
         }
     }
 
-    fn poll_search(&mut self) {
+    /// Drain search events; returns true when the panel needs a repaint.
+    fn poll_search(&mut self) -> bool {
         let events = self.workspace.search.poll();
+        let changed = !events.is_empty();
         for event in events {
             match event {
                 SearchEvent::Results(files) => {
@@ -2441,6 +2475,48 @@ impl KestrelApp {
                     self.workspace.search_panel.error = Some(err);
                 }
             }
+        }
+        changed
+    }
+
+    /// Watcher paths wait for the index debounce before touching the file index,
+    /// so a save burst costs one incremental update instead of one per event.
+    fn queue_index_changes(&mut self, paths: &[PathBuf]) {
+        self.workspace
+            .index_dirty
+            .extend(paths.iter().filter(|path| !is_save_temp(path)).cloned());
+        if !self.workspace.index_dirty.is_empty() {
+            self.workspace.index_dirty_at = Some(Instant::now() + INDEX_DEBOUNCE);
+        }
+    }
+
+    fn flush_index_changes(&mut self) {
+        self.workspace.index_dirty_at = None;
+        let Some(root) = self.workspace.root.clone() else {
+            self.workspace.index_dirty.clear();
+            return;
+        };
+        let paths = std::mem::take(&mut self.workspace.index_dirty);
+        if paths.is_empty() {
+            return;
+        }
+        if self.workspace.index.apply_changes(&root, &paths) {
+            self.on_index_changed();
+        }
+    }
+
+    /// Quick Open and Project Search read the index, so both follow it here.
+    fn on_index_changed(&mut self) {
+        self.workspace.index_version += 1;
+        self.palette.needs_filter = true;
+        if self.workspace.pending_search {
+            self.workspace.pending_search = false;
+            self.start_project_search();
+        }
+        if !self.workspace.search_panel.last_query.is_empty()
+            && self.workspace.search_panel.last_typed.is_some()
+        {
+            self.workspace.pending_search = true;
         }
     }
 
@@ -3113,6 +3189,10 @@ impl KestrelApp {
 
     pub fn toast(&mut self, text: impl Into<String>, kind: ToastKind) {
         let text = text.into();
+        // Background writes return an empty message when another toast covers the result.
+        if text.is_empty() {
+            return;
+        }
         if let Some(existing) = self.toasts.iter_mut().find(|t| t.text == text) {
             existing.created = Instant::now();
             return;
@@ -3283,55 +3363,88 @@ impl KestrelApp {
     }
 
     fn pump_background(&mut self, ctx: &egui::Context) {
+        // Settings edits only mark the file dirty; one write per quiet second.
+        if Settings::save_due() {
+            self.settings.flush();
+        }
+        // Poll returns are the only wake-up for background work: without these
+        // repaints a finished search or Git scan waited for the next input event.
+        let mut repaint = false;
         if self.workspace.index.poll() {
-            self.workspace.index_version += 1;
-            self.palette.needs_filter = true;
-            if self.workspace.pending_search {
-                self.workspace.pending_search = false;
-                self.start_project_search();
+            self.on_index_changed();
+            repaint = true;
+        }
+        if self.poll_search() {
+            repaint = true;
+        }
+        let updates = self.git.poll();
+        repaint |= updates.snapshot;
+        repaint |= !updates.ops.is_empty();
+        for op in updates.ops {
+            for path in &op.touched {
+                if let Some(tab) = self
+                    .tabs
+                    .iter_mut()
+                    .find(|tab| tab.doc.path.as_deref() == Some(path.as_path()))
+                {
+                    let _ = tab.doc.reload();
+                    tab.diff_version = 0;
+                }
             }
-            if !self.workspace.search_panel.last_query.is_empty()
-                && self.workspace.search_panel.last_typed.is_some()
-            {
-                self.workspace.pending_search = true;
+            match op.result {
+                Ok(message) => {
+                    if !message.is_empty() {
+                        self.toast(message, ToastKind::Success);
+                    }
+                }
+                Err(error) => self.toast(
+                    format!("{}失败: {}", op.label, error_summary(&error)),
+                    ToastKind::Error,
+                ),
             }
         }
-        self.poll_search();
-        self.git.poll();
 
-        if let Some(watcher) = &self.workspace.watcher {
-            let events = watcher.poll();
-            if !events.is_empty() {
-                for path in &events {
-                    if is_save_temp(path) {
-                        continue;
-                    }
-                    if let Some(parent) = path.parent() {
-                        self.workspace.tree.reload_dir(parent);
-                    }
+        if self
+            .workspace
+            .index_dirty_at
+            .is_some_and(|at| Instant::now() >= at)
+        {
+            self.flush_index_changes();
+        }
+
+        let events = self
+            .workspace
+            .watcher
+            .as_ref()
+            .map(|watcher| watcher.poll())
+            .unwrap_or_default();
+        if !events.is_empty() {
+            for path in &events {
+                if is_save_temp(path) {
+                    continue;
                 }
-                for path in events {
-                    if is_save_temp(&path) {
-                        continue;
-                    }
-                    self.handle_disk_change(&path);
-                    let diff_tabs: Vec<u64> = self
-                        .tabs
-                        .iter()
-                        .filter(|tab| {
-                            tab.diff
-                                .as_ref()
-                                .is_some_and(|diff| diff.path == path)
-                        })
-                        .map(|tab| tab.id)
-                        .collect();
-                    for id in diff_tabs {
-                        self.spawn_diff_load(id);
-                    }
+                if let Some(parent) = path.parent() {
+                    self.workspace.tree.reload_dir(parent);
                 }
-                if let Some(root) = self.workspace.root.clone() {
-                    self.git.refresh(&root);
+            }
+            self.queue_index_changes(&events);
+            for path in events {
+                if is_save_temp(&path) {
+                    continue;
                 }
+                self.handle_disk_change(&path);
+                let diff_tabs: Vec<u64> = self
+                    .tabs
+                    .iter()
+                    .filter(|tab| tab.diff.as_ref().is_some_and(|diff| diff.path == path))
+                    .map(|tab| tab.id)
+                    .collect();
+                for id in diff_tabs {
+                    self.spawn_diff_load(id);
+                }
+            }
+            if let Some(root) = self.workspace.root.clone() {
+                self.git.refresh(&root);
             }
         }
 
@@ -3419,6 +3532,33 @@ impl KestrelApp {
 
         self.toasts
             .retain(|toast| toast.created.elapsed() < Duration::from_millis(3600));
+
+        if repaint {
+            ctx.request_repaint();
+        }
+    }
+
+    /// Wake the frame loop for work still in flight. Runs at the end of the frame
+    /// so a refresh requested later in the same frame still gets its timer.
+    fn schedule_background_wakeup(&self, ctx: &egui::Context) {
+        if let Some(after) = self.git.repaint_after() {
+            ctx.request_repaint_after(after);
+        }
+        if self.workspace.index.is_loading() {
+            ctx.request_repaint_after(Duration::from_millis(120));
+        }
+        if let Some(at) = self.workspace.index_dirty_at {
+            ctx.request_repaint_after(
+                at.saturating_duration_since(Instant::now())
+                    .max(Duration::from_millis(1)),
+            );
+        }
+        if self.workspace.search.is_running() {
+            ctx.request_repaint_after(Duration::from_millis(60));
+        }
+        if let Some(delay) = Settings::save_delay() {
+            ctx.request_repaint_after(delay);
+        }
     }
 
     pub fn set_ui_zoom(&mut self, zoom: f32, ctx: &egui::Context) {
@@ -3562,6 +3702,7 @@ impl eframe::App for KestrelApp {
         self.dialogs_ui(&ctx);
         self.toasts_ui(&ctx);
         self.handle_window_resize(&ctx);
+        self.schedule_background_wakeup(&ctx);
     }
 
     fn on_exit(&mut self) {
@@ -3572,7 +3713,8 @@ impl eframe::App for KestrelApp {
         if std::env::var("KESTREL_SHOT").is_err() {
             self.settings.sidebar_width = self.sidebar.width;
             self.settings.terminal_height = self.bottom.height;
-            self.settings.save();
+            // Settings writes are debounced; exit must land them immediately.
+            self.settings.flush();
             self.save_session();
         }
     }

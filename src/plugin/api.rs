@@ -2,13 +2,18 @@
 //! document userdata handed to callbacks.
 
 use std::cell::RefCell;
+use std::io::Read;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use mlua::{Function, Lua, Table, UserData, UserDataMethods, Value};
 
 use super::actions::{DocSnapshot, HostAction};
-use super::{ExecDone, Event, PendingCommand, PluginShared};
+use super::{ExecDone, Event, MAX_CONCURRENT_EXEC, PendingCommand, PluginShared};
 use crate::commands::{Command, Shortcut};
 
 /// A single `doc:text()` call refuses documents above this size; use ranges instead.
@@ -201,6 +206,15 @@ fn run_command_fn(_lua: &Lua, shared: &Rc<RefCell<PluginShared>>) -> mlua::Resul
     })
 }
 
+/// Holds one of the [`MAX_CONCURRENT_EXEC`] slots; the exec thread releases it on exit.
+struct ExecSlot(Arc<AtomicUsize>);
+
+impl Drop for ExecSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 fn exec_fn(_lua: &Lua, shared: &Rc<RefCell<PluginShared>>) -> mlua::Result<Function> {
     let shared = shared.clone();
     _lua.create_function(move |lua, spec: Table| {
@@ -214,17 +228,34 @@ fn exec_fn(_lua: &Lua, shared: &Rc<RefCell<PluginShared>>) -> mlua::Result<Funct
         let stdin: Option<String> = spec.get("stdin")?;
         let on_done: Function = spec.get("on_done")?;
         let callback = lua.create_registry_value(on_done)?;
-        let (runtime, task, tx) = {
+        let (runtime, task, tx, running, cancel) = {
             let mut shared = shared.borrow_mut();
+            if shared.exec_running.fetch_add(1, Ordering::Relaxed) >= MAX_CONCURRENT_EXEC {
+                shared.exec_running.fetch_sub(1, Ordering::Relaxed);
+                return Err(mlua::Error::runtime(format!(
+                    "kestrel.exec 并发上限 {MAX_CONCURRENT_EXEC}，本次调用被拒绝"
+                )));
+            }
             let task = shared.next_task;
             shared.next_task += 1;
             shared.exec_callbacks.push((task, callback));
-            (shared.runtime, task, shared.exec_tx.clone())
+            (
+                shared.runtime,
+                task,
+                shared.exec_tx.clone(),
+                shared.exec_running.clone(),
+                shared.cancel_exec.clone(),
+            )
         };
-        std::thread::spawn(move || {
-            let done = run_process(runtime, task, &program, &args, stdin.as_deref());
-            let _ = tx.send(done);
-        });
+        let slot = ExecSlot(running);
+        std::thread::Builder::new()
+            .name("kestrel-plugin-exec".into())
+            .spawn(move || {
+                let _slot = slot;
+                let done = run_process(runtime, task, &program, &args, stdin.as_deref(), &cancel);
+                let _ = tx.send(done);
+            })
+            .ok();
         Ok(())
     })
 }
@@ -272,12 +303,45 @@ fn resolve_path(shared: &Rc<RefCell<PluginShared>>, path: &str) -> PathBuf {
     }
 }
 
+type PipeOutput = (Arc<Mutex<Vec<u8>>>, JoinHandle<()>);
+
+/// Drain one child pipe on its own thread, so a chatty program cannot stall on a
+/// full pipe while the exec thread watches the cancellation flag.
+fn drain_pipe(mut pipe: impl Read + Send + 'static) -> PipeOutput {
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let sink = buffer.clone();
+    let handle = std::thread::spawn(move || {
+        let mut chunk = [0u8; 8192];
+        while let Ok(read) = pipe.read(&mut chunk) {
+            if read == 0 {
+                break;
+            }
+            if let Ok(mut buffer) = sink.lock() {
+                buffer.extend_from_slice(&chunk[..read]);
+            }
+        }
+    });
+    (buffer, handle)
+}
+
+fn collect_pipe(pipe: Option<PipeOutput>) -> String {
+    let Some((buffer, handle)) = pipe else {
+        return String::new();
+    };
+    let _ = handle.join();
+    buffer
+        .lock()
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default()
+}
+
 fn run_process(
     runtime: u64,
     task: u64,
     program: &str,
     args: &[String],
     stdin: Option<&str>,
+    cancel: &AtomicBool,
 ) -> ExecDone {
     use std::io::Write;
     use std::process::{Command as Process, Stdio};
@@ -293,6 +357,16 @@ fn run_process(
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         command.creation_flags(CREATE_NO_WINDOW);
     }
+    if cancel.load(Ordering::Relaxed) {
+        return ExecDone {
+            runtime,
+            task,
+            code: -1,
+            stdout: String::new(),
+            stderr: String::new(),
+            error: Some("已取消".to_string()),
+        };
+    }
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(err) => {
@@ -306,27 +380,43 @@ fn run_process(
             };
         }
     };
+    let stdout = child.stdout.take().map(drain_pipe);
+    let stderr = child.stderr.take().map(drain_pipe);
     if let Some(mut pipe) = child.stdin.take()
         && let Some(input) = stdin {
             let _ = pipe.write_all(input.as_bytes());
         }
-    match child.wait_with_output() {
-        Ok(output) => ExecDone {
-            runtime,
-            task,
-            code: output.status.code().unwrap_or(-1),
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-            error: None,
-        },
-        Err(err) => ExecDone {
-            runtime,
-            task,
-            code: -1,
-            stdout: String::new(),
-            stderr: String::new(),
-            error: Some(err.to_string()),
-        },
+    let mut cancelled = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {}
+            Err(err) => {
+                let _ = child.kill();
+                return ExecDone {
+                    runtime,
+                    task,
+                    code: -1,
+                    stdout: collect_pipe(stdout),
+                    stderr: collect_pipe(stderr),
+                    error: Some(err.to_string()),
+                };
+            }
+        }
+        // Plugin disabled or reloaded: kill the process, report it as cancelled.
+        if !cancelled && cancel.load(Ordering::Relaxed) {
+            cancelled = true;
+            let _ = child.kill();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    ExecDone {
+        runtime,
+        task,
+        code: status.and_then(|status| status.code()).unwrap_or(-1),
+        stdout: collect_pipe(stdout),
+        stderr: collect_pipe(stderr),
+        error: cancelled.then(|| "已取消".to_string()),
     }
 }
 

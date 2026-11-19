@@ -13,11 +13,14 @@ pub struct FsWatcher {
 }
 
 impl FsWatcher {
-    pub fn new(root: &Path) -> notify::Result<Self> {
+    pub fn new(root: &Path, repaint: egui::Context) -> notify::Result<Self> {
         let (tx, rx) = channel();
         let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
             if let Ok(event) = res {
                 let _ = tx.send(event);
+                // Watcher events arrive on the notify thread; wake egui so the
+                // tree, Git badge and index follow without waiting for input.
+                repaint.request_repaint();
             }
         })?;
         watcher.watch(root, RecursiveMode::Recursive)?;

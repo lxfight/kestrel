@@ -3,13 +3,18 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::mpsc::{Receiver, TryRecvError, channel};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::time::{Duration, Instant};
 
 /// Number of commits the SCM history section loads.
 pub const COMMIT_HISTORY_LIMIT: usize = 20;
 const COMMIT_HISTORY_REFRESH: Duration = Duration::from_secs(5);
 const CONFIRM_WINDOW: Duration = Duration::from_secs(3);
+/// A status scan starts at most once per this window, so a burst of saves or
+/// watcher events costs one `git status` instead of one per event.
+const REFRESH_DEBOUNCE: Duration = Duration::from_millis(400);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GitFileStatus {
@@ -62,6 +67,57 @@ pub struct GitStash {
     pub message: String,
 }
 
+/// Which background write finished; drives the toast, history invalidation and
+/// the post-commit cleanup of the message box.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WriteKind {
+    Commit,
+    Checkout,
+    Branch,
+    Merge,
+    Stash,
+    Discard,
+    Undo,
+}
+
+impl WriteKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Commit => "提交",
+            Self::Checkout => "切换分支",
+            Self::Branch => "分支操作",
+            Self::Merge => "合并",
+            Self::Stash => "储藏",
+            Self::Discard => "丢弃更改",
+            Self::Undo => "撤销提交",
+        }
+    }
+
+    /// Every write except discarding can move HEAD or the index.
+    fn rewrites_history(self) -> bool {
+        self != Self::Discard
+    }
+}
+
+/// Result of one background Git write, surfaced by [`GitService::poll`].
+pub struct GitOpResult {
+    pub label: &'static str,
+    pub result: Result<String, String>,
+    /// Files the operation rewrote, so open tabs can reload after a discard.
+    pub touched: Vec<PathBuf>,
+    root: PathBuf,
+    kind: WriteKind,
+}
+
+/// Everything one [`GitService::poll`] call produced.
+#[derive(Default)]
+pub struct GitUpdates {
+    pub snapshot: bool,
+    pub ops: Vec<GitOpResult>,
+}
+
+type GitJob = Box<dyn FnOnce() -> GitOpResult + Send>;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CommitFileStatus {
     Added,
@@ -113,7 +169,15 @@ pub struct GitService {
     pub commit_message: String,
     pub logs: Vec<String>,
     rx: Option<Receiver<GitSnapshot>>,
-    last_refresh: Instant,
+    scan_cancel: Option<Arc<AtomicBool>>,
+    /// Latest requested scan root and the earliest time it may start.
+    pending_root: Option<PathBuf>,
+    refresh_at: Option<Instant>,
+    /// Writes run one at a time on a worker thread; results return through `write_rx`.
+    write_tx: Sender<GitJob>,
+    write_rx: Receiver<GitOpResult>,
+    write_pending: usize,
+    ready_ops: Vec<GitOpResult>,
 
     // SCM panel state lives here so `KestrelApp` needs no Git-specific fields.
     pub amend: bool,
@@ -138,12 +202,30 @@ pub struct GitService {
 
 impl GitService {
     pub fn new() -> Self {
+        let (write_tx, jobs) = channel::<GitJob>();
+        let (done_tx, write_rx) = channel::<GitOpResult>();
+        std::thread::Builder::new()
+            .name("kestrel-git-write".into())
+            .spawn(move || {
+                while let Ok(job) = jobs.recv() {
+                    if done_tx.send(job()).is_err() {
+                        break;
+                    }
+                }
+            })
+            .ok();
         Self {
             snapshot: GitSnapshot::default(),
             commit_message: String::new(),
             logs: Vec::new(),
             rx: None,
-            last_refresh: Instant::now() - Duration::from_secs(60),
+            scan_cancel: None,
+            pending_root: None,
+            refresh_at: None,
+            write_tx,
+            write_rx,
+            write_pending: 0,
+            ready_ops: Vec::new(),
             amend: false,
             branch_panel_open: false,
             branch_filter: String::new(),
@@ -165,10 +247,11 @@ impl GitService {
         }
     }
 
-    #[allow(dead_code)]
     pub fn clear(&mut self) {
+        self.cancel_scan();
+        self.pending_root = None;
+        self.refresh_at = None;
         self.snapshot = GitSnapshot::default();
-        self.rx = None;
         self.commits.clear();
         self.commit_files.clear();
         self.expanded_commit = None;
@@ -208,36 +291,161 @@ impl GitService {
         self.refresh(root);
     }
 
-    /// Trigger a background `git status` & branch scan.
+    /// Request a background `git status` scan. Every trigger (save, watcher
+    /// batch, refocus, finished write) shares the same 400 ms debounce, and at
+    /// most one scan is in flight; the scan starts from [`Self::poll`], which the
+    /// app calls once per frame.
     pub fn refresh(&mut self, root: &Path) {
-        let root = root.to_path_buf();
-        self.last_refresh = Instant::now();
+        self.pending_root = Some(root.to_path_buf());
+        self.refresh_at = Some(Instant::now() + REFRESH_DEBOUNCE);
+    }
+
+    /// How long the UI may sleep before this service needs another poll.
+    pub fn repaint_after(&self) -> Option<Duration> {
+        if self.rx.is_some() || self.write_pending > 0 {
+            return Some(Duration::from_millis(40));
+        }
+        self.refresh_at
+            .map(|at| at.saturating_duration_since(Instant::now()).max(Duration::from_millis(1)))
+    }
+
+    /// Poll finished scans and writes, then start the debounced scan when due.
+    pub fn poll(&mut self) -> GitUpdates {
+        let mut updates = GitUpdates::default();
+        if let Some(rx) = &self.rx {
+            let mut finished = false;
+            loop {
+                match rx.try_recv() {
+                    Ok(snapshot) => {
+                        self.snapshot = snapshot;
+                        updates.snapshot = true;
+                        finished = true;
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        finished = true;
+                        break;
+                    }
+                }
+            }
+            if finished {
+                self.rx = None;
+                self.scan_cancel = None;
+            }
+        }
+        while let Ok(done) = self.write_rx.try_recv() {
+            self.write_pending = self.write_pending.saturating_sub(1);
+            self.finish_write(done, &mut updates);
+        }
+        let ready = std::mem::take(&mut self.ready_ops);
+        for done in ready {
+            self.finish_write(done, &mut updates);
+        }
+        if self.rx.is_none()
+            && self.refresh_at.is_some_and(|at| Instant::now() >= at)
+            && let Some(root) = self.pending_root.clone()
+        {
+            self.refresh_at = None;
+            self.start_scan(&root);
+        }
+        updates
+    }
+
+    fn start_scan(&mut self, root: &Path) {
+        self.cancel_scan();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let token = cancel.clone();
+        let scan_root = root.to_path_buf();
+        let send_root = scan_root.clone();
         let (tx, rx) = channel();
         std::thread::Builder::new()
             .name("kestrel-git".into())
             .spawn(move || {
-                let snap = collect_git_snapshot(&root);
+                let snapshot = collect_git_snapshot(&scan_root, &token);
+                // A stale scan (workspace switched) drops its result instead of
+                // overwriting the current snapshot.
+                if token.load(Ordering::Relaxed) {
+                    return;
+                }
                 // A repo whose status scan failed (e.g. transient index lock) must not
                 // replace the live snapshot with an empty "not a repo" one.
-                if snap.is_repo || !root.join(".git").exists() {
-                    let _ = tx.send(snap);
+                if snapshot.is_repo || !send_root.join(".git").exists() {
+                    let _ = tx.send(snapshot);
                 }
             })
             .ok();
         self.rx = Some(rx);
+        self.scan_cancel = Some(cancel);
     }
 
-    /// Poll for finished background status snapshot.
-    pub fn poll(&mut self) -> bool {
-        let Some(rx) = &self.rx else {
-            return false;
-        };
-        let mut updated = false;
-        while let Ok(snap) = rx.try_recv() {
-            self.snapshot = snap;
-            updated = true;
+    /// Stop the in-flight scan: its thread exits before running the next Git call.
+    fn cancel_scan(&mut self) {
+        if let Some(cancel) = self.scan_cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
         }
-        updated
+        self.rx = None;
+    }
+
+    /// Queue one background write. The worker runs writes in submission order.
+    fn submit(
+        &mut self,
+        root: &Path,
+        kind: WriteKind,
+        job: impl FnOnce(&Path) -> Result<(String, Vec<PathBuf>), String> + Send + 'static,
+    ) {
+        let root = root.to_path_buf();
+        let work = move || {
+            let (result, touched) = match job(&root) {
+                Ok((message, touched)) => (Ok(message), touched),
+                Err(error) => (Err(error), Vec::new()),
+            };
+            GitOpResult {
+                label: kind.label(),
+                result,
+                touched,
+                root,
+                kind,
+            }
+        };
+        let job: GitJob = Box::new(work);
+        match self.write_tx.send(job) {
+            Ok(()) => self.write_pending += 1,
+            // Worker thread unavailable: run inline instead of losing the write.
+            Err(error) => self.ready_ops.push((error.0)()),
+        }
+    }
+
+    fn finish_write(&mut self, done: GitOpResult, updates: &mut GitUpdates) {
+        let summary = match &done.result {
+            Ok(message) if !message.is_empty() => message.clone(),
+            Ok(_) => String::new(),
+            Err(error) => error.clone(),
+        };
+        if summary.is_empty() {
+            self.log(done.label);
+        } else {
+            self.log(format!("{}: {summary}", done.label));
+        }
+        if done.result.is_ok() {
+            if done.kind == WriteKind::Commit {
+                self.commit_message.clear();
+                self.amend = false;
+            }
+            if done.kind.rewrites_history() {
+                self.invalidate_commits();
+            }
+        }
+        // A conflicted merge or a half-applied stash still changes the worktree.
+        // A write that finished for a workspace the user already left must not
+        // schedule a scan against that old root.
+        if self
+            .pending_root
+            .as_deref()
+            .is_none_or(|root| root == done.root)
+        {
+            self.refresh(&done.root);
+        }
+        updates.ops.push(done);
     }
 
     pub fn status_of(&self, path: &Path) -> Option<GitFileStatus> {
@@ -435,20 +643,30 @@ impl GitService {
         self.refresh(root);
     }
 
+    /// Queue discarding one file: tracked files are restored from the index,
+    /// untracked ones are deleted from disk.
     pub fn discard_file(&mut self, root: &Path, path: &Path) {
-        let rel = path.strip_prefix(root).unwrap_or(path);
-        let status = self.status_of(path);
-        if status == Some(GitFileStatus::Untracked) {
-            let _ = std::fs::remove_file(path);
-            self.log(format!("removed untracked {}", rel.display()));
-        } else if let Ok(out) = git_cmd(root).arg("checkout").arg("--").arg(rel).output() {
-            self.log(format!(
-                "git checkout -- {} -> {}",
-                rel.display(),
-                out.status
-            ));
-        }
-        self.refresh(root);
+        let rel = path.strip_prefix(root).unwrap_or(path).to_path_buf();
+        let untracked = self.status_of(path) == Some(GitFileStatus::Untracked);
+        let full = path.to_path_buf();
+        let touched = vec![path.to_path_buf()];
+        self.submit(root, WriteKind::Discard, move |root| {
+            if untracked {
+                std::fs::remove_file(&full)
+                    .map_err(|error| format!("删除 {} 失败: {error}", full.display()))?;
+                return Ok((format!("已删除未跟踪文件 {}", rel.display()), touched));
+            }
+            let out = git_cmd(root)
+                .arg("checkout")
+                .arg("--")
+                .arg(&rel)
+                .output()
+                .map_err(|error| format!("无法执行 git checkout: {error}"))?;
+            if !out.status.success() {
+                return Err(git_error(&out));
+            }
+            Ok((format!("已丢弃 {}", rel.display()), touched))
+        });
     }
 
     /// Discard every working-tree change: unstage, restore tracked files, delete the
@@ -464,210 +682,195 @@ impl GitService {
             })
             .map(|c| c.path.clone())
             .collect();
-        let _ = git_cmd(root).arg("reset").output();
-        let checkout = git_cmd(root)
-            .arg("checkout")
-            .arg("--")
-            .arg(".")
-            .output()
-            .map_err(|e| format!("无法执行 git checkout: {e}"))?;
-        let mut removed = 0usize;
-        for path in untracked {
-            if path.is_file() && std::fs::remove_file(&path).is_ok() {
-                removed += 1;
+        let touched: Vec<PathBuf> = self
+            .snapshot
+            .changes
+            .iter()
+            .map(|change| change.path.clone())
+            .collect();
+        self.submit(root, WriteKind::Discard, move |root| {
+            let _ = git_cmd(root).arg("reset").output();
+            let checkout = git_cmd(root)
+                .arg("checkout")
+                .arg("--")
+                .arg(".")
+                .output()
+                .map_err(|error| format!("无法执行 git checkout: {error}"))?;
+            let mut removed = 0usize;
+            for path in &untracked {
+                if path.is_file() && std::fs::remove_file(path).is_ok() {
+                    removed += 1;
+                }
             }
-        }
-        if !checkout.status.success() {
-            self.refresh(root);
-            return Err(git_error(&checkout));
-        }
-        self.log(format!("丢弃全部更改，删除 {removed} 个未跟踪文件"));
-        self.refresh(root);
+            if !checkout.status.success() {
+                return Err(git_error(&checkout));
+            }
+            Ok((format!("已丢弃全部更改，删除 {removed} 个未跟踪文件"), touched))
+        });
         Ok(())
     }
 
+    /// Queue `git commit`. Validation stays synchronous so bad input still
+    /// fails immediately; the commit itself runs on the Git worker.
     pub fn commit(&mut self, root: &Path) -> Result<String, String> {
-        let msg = self.commit_message.trim().to_string();
-        if msg.is_empty() && !self.amend {
+        let message = self.commit_message.trim().to_string();
+        let amend = self.amend;
+        if message.is_empty() && !amend {
             return Err("请输入提交说明 (Commit Message)".to_string());
         }
-        let amend = self.amend;
         // Plain commits keep the existing convenience: auto-stage when nothing is staged.
         // Amending must not silently pull in unrelated files.
-        if !amend && !self.snapshot.changes.iter().any(|c| c.staged) {
-            let _ = git_cmd(root).arg("add").arg("-A").output();
-        }
-        let mut cmd = git_cmd(root);
-        cmd.arg("commit");
-        if amend {
-            if msg.is_empty() {
-                cmd.arg("--amend").arg("--no-edit");
-            } else {
-                cmd.arg("--amend").arg("-m").arg(&msg);
-            }
-        } else {
-            cmd.arg("-m").arg(&msg);
-        }
-        let out = cmd
-            .output()
-            .map_err(|e| format!("无法执行 git commit: {e}"))?;
-        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        self.log(format!(
-            "git commit{} {:?}: {} {}",
-            if amend { " --amend" } else { " -m" },
-            msg,
-            stdout,
-            stderr
-        ));
-        if out.status.success() {
-            self.commit_message.clear();
-            self.amend = false;
-            self.invalidate_commits();
-            self.refresh(root);
-            Ok(stdout.lines().next().unwrap_or("提交成功").to_string())
-        } else {
-            Err(if stderr.is_empty() { stdout } else { stderr })
-        }
+        let auto_stage = !amend && !self.snapshot.changes.iter().any(|change| change.staged);
+        self.submit(root, WriteKind::Commit, move |root| {
+            run_commit(root, &message, amend, auto_stage)
+        });
+        Ok(String::new())
     }
 
     pub fn checkout_branch(&mut self, root: &Path, branch: &str) -> Result<(), String> {
-        let out = git_cmd(root)
-            .arg("checkout")
-            .arg(branch)
-            .output()
-            .map_err(|e| e.to_string())?;
-        if out.status.success() {
-            self.log(format!("git checkout {branch}"));
-            self.invalidate_commits();
-            self.refresh(root);
-            Ok(())
-        } else {
-            Err(git_error(&out))
-        }
+        let branch = branch.to_string();
+        self.submit(root, WriteKind::Checkout, move |root| {
+            let out = git_cmd(root)
+                .arg("checkout")
+                .arg(&branch)
+                .output()
+                .map_err(|error| error.to_string())?;
+            if !out.status.success() {
+                return Err(git_error(&out));
+            }
+            // Empty message: the caller already toasted the switch optimistically.
+            Ok((String::new(), Vec::new()))
+        });
+        Ok(())
     }
 
     pub fn create_branch(&mut self, root: &Path, name: &str) -> Result<String, String> {
-        let name = name.trim();
+        let name = name.trim().to_string();
         if name.is_empty() {
             return Err("请输入新分支名称".to_string());
         }
-        let out = git_cmd(root)
-            .arg("checkout")
-            .arg("-b")
-            .arg(name)
-            .output()
-            .map_err(|e| format!("无法执行 git checkout: {e}"))?;
-        if !out.status.success() {
-            return Err(git_error(&out));
-        }
-        self.log(format!("git checkout -b {name}"));
+        let branch = name.clone();
         self.new_branch.clear();
         self.branch_filter.clear();
-        self.invalidate_commits();
-        self.refresh(root);
-        Ok(format!("已创建并切换到分支 {name}"))
+        self.submit(root, WriteKind::Branch, move |root| {
+            let out = git_cmd(root)
+                .arg("checkout")
+                .arg("-b")
+                .arg(&branch)
+                .output()
+                .map_err(|error| format!("无法执行 git checkout: {error}"))?;
+            if !out.status.success() {
+                return Err(git_error(&out));
+            }
+            Ok((format!("已创建并切换到分支 {branch}"), Vec::new()))
+        });
+        Ok(String::new())
     }
 
     pub fn delete_branch(&mut self, root: &Path, branch: &str) -> Result<String, String> {
         if branch == self.snapshot.branch {
             return Err("不能删除当前分支".to_string());
         }
-        let out = git_cmd(root)
-            .arg("branch")
-            .arg("-d")
-            .arg(branch)
-            .output()
-            .map_err(|e| format!("无法执行 git branch: {e}"))?;
-        if !out.status.success() {
-            return Err(git_error(&out));
-        }
-        self.log(format!("git branch -d {branch}"));
-        self.refresh(root);
-        Ok(format!("已删除分支 {branch}"))
+        let branch = branch.to_string();
+        self.submit(root, WriteKind::Branch, move |root| {
+            let out = git_cmd(root)
+                .arg("branch")
+                .arg("-d")
+                .arg(&branch)
+                .output()
+                .map_err(|error| format!("无法执行 git branch: {error}"))?;
+            if !out.status.success() {
+                return Err(git_error(&out));
+            }
+            Ok((format!("已删除分支 {branch}"), Vec::new()))
+        });
+        Ok(String::new())
     }
 
     pub fn merge_branch(&mut self, root: &Path, branch: &str) -> Result<String, String> {
         if branch == self.snapshot.branch {
             return Err("不能合并当前分支".to_string());
         }
-        let out = git_cmd(root)
-            .arg("merge")
-            .arg("--no-edit")
-            .arg(branch)
-            .output()
-            .map_err(|e| format!("无法执行 git merge: {e}"))?;
-        // A conflicted merge still changed the working tree, so always refresh.
-        self.invalidate_commits();
-        self.refresh(root);
-        if out.status.success() {
-            self.log(format!("git merge {branch}"));
-            Ok(format!("已合并分支 {branch}"))
-        } else {
-            Err(git_error(&out))
-        }
+        let target = branch.to_string();
+        self.submit(root, WriteKind::Merge, move |root| {
+            let out = git_cmd(root)
+                .arg("merge")
+                .arg("--no-edit")
+                .arg(&target)
+                .output()
+                .map_err(|error| format!("无法执行 git merge: {error}"))?;
+            if !out.status.success() {
+                return Err(git_error(&out));
+            }
+            Ok((format!("已合并分支 {target}"), Vec::new()))
+        });
+        Ok(String::new())
     }
 
     /// `git reset --soft HEAD~1`: drop the last commit, keep its changes staged.
     pub fn undo_last_commit(&mut self, root: &Path) -> Result<String, String> {
-        let out = git_cmd(root)
-            .args(["reset", "--soft", "HEAD~1"])
-            .output()
-            .map_err(|e| format!("无法执行 git reset: {e}"))?;
-        if !out.status.success() {
-            return Err(git_error(&out));
-        }
-        self.log("git reset --soft HEAD~1");
-        self.invalidate_commits();
-        self.refresh(root);
-        Ok("已撤销上次提交，改动保留在暂存区".to_string())
+        self.submit(root, WriteKind::Undo, move |root| {
+            let out = git_cmd(root)
+                .args(["reset", "--soft", "HEAD~1"])
+                .output()
+                .map_err(|error| format!("无法执行 git reset: {error}"))?;
+            if !out.status.success() {
+                return Err(git_error(&out));
+            }
+            Ok(("已撤销上次提交，改动保留在暂存区".to_string(), Vec::new()))
+        });
+        Ok(String::new())
     }
 
     /// Stash the working tree (including untracked files). The commit message box
     /// doubles as the stash description when non-empty.
     pub fn stash_save(&mut self, root: &Path) -> Result<String, String> {
-        let draft = self.commit_message.trim();
+        let draft = self.commit_message.trim().to_string();
         let message = if draft.is_empty() {
             "Kestrel 自动储藏".to_string()
         } else {
-            draft.to_string()
+            draft
         };
-        let out = git_cmd(root)
-            .args(["stash", "push", "-u", "-m", &message])
-            .output()
-            .map_err(|e| format!("无法执行 git stash: {e}"))?;
-        if !out.status.success() {
-            return Err(git_error(&out));
-        }
-        self.log(format!("git stash push -u -m {message:?}"));
-        self.refresh(root);
-        Ok(format!("已储藏当前更改：{message}"))
+        let shown = message.clone();
+        self.submit(root, WriteKind::Stash, move |root| {
+            let out = git_cmd(root)
+                .args(["stash", "push", "-u", "-m", &message])
+                .output()
+                .map_err(|error| format!("无法执行 git stash: {error}"))?;
+            if !out.status.success() {
+                return Err(git_error(&out));
+            }
+            Ok((format!("已储藏当前更改：{shown}"), Vec::new()))
+        });
+        Ok(String::new())
     }
 
     pub fn stash_pop(&mut self, root: &Path, index: usize) -> Result<String, String> {
-        let out = git_cmd(root)
-            .args(["stash", "pop", &stash_ref(index)])
-            .output()
-            .map_err(|e| format!("无法执行 git stash: {e}"))?;
-        if !out.status.success() {
-            return Err(git_error(&out));
-        }
-        self.log(format!("git stash pop {}", stash_ref(index)));
-        self.refresh(root);
-        Ok(format!("已应用 stash@{{{index}}}"))
+        self.submit(root, WriteKind::Stash, move |root| {
+            let out = git_cmd(root)
+                .args(["stash", "pop", &stash_ref(index)])
+                .output()
+                .map_err(|error| format!("无法执行 git stash: {error}"))?;
+            if !out.status.success() {
+                return Err(git_error(&out));
+            }
+            Ok((format!("已应用 stash@{{{index}}}"), Vec::new()))
+        });
+        Ok(String::new())
     }
 
     pub fn stash_drop(&mut self, root: &Path, index: usize) -> Result<String, String> {
-        let out = git_cmd(root)
-            .args(["stash", "drop", &stash_ref(index)])
-            .output()
-            .map_err(|e| format!("无法执行 git stash: {e}"))?;
-        if !out.status.success() {
-            return Err(git_error(&out));
-        }
-        self.log(format!("git stash drop {}", stash_ref(index)));
-        self.refresh(root);
-        Ok(format!("已删除 stash@{{{index}}}"))
+        self.submit(root, WriteKind::Stash, move |root| {
+            let out = git_cmd(root)
+                .args(["stash", "drop", &stash_ref(index)])
+                .output()
+                .map_err(|error| format!("无法执行 git stash: {error}"))?;
+            if !out.status.success() {
+                return Err(git_error(&out));
+            }
+            Ok((format!("已删除 stash@{{{index}}}"), Vec::new()))
+        });
+        Ok(String::new())
     }
 }
 
@@ -703,6 +906,42 @@ fn git_error(out: &std::process::Output) -> String {
     } else {
         stdout
     }
+}
+
+/// Background `git commit`; returns the success summary line or the Git error text.
+fn run_commit(
+    root: &Path,
+    message: &str,
+    amend: bool,
+    auto_stage: bool,
+) -> Result<(String, Vec<PathBuf>), String> {
+    if auto_stage {
+        let _ = git_cmd(root).arg("add").arg("-A").output();
+    }
+    let mut cmd = git_cmd(root);
+    cmd.arg("commit");
+    if amend {
+        if message.is_empty() {
+            cmd.arg("--amend").arg("--no-edit");
+        } else {
+            cmd.arg("--amend").arg("-m").arg(message);
+        }
+    } else {
+        cmd.arg("-m").arg(message);
+    }
+    let out = cmd
+        .output()
+        .map_err(|error| format!("无法执行 git commit: {error}"))?;
+    if !out.status.success() {
+        return Err(git_error(&out));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let summary = stdout
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| line.trim().to_string())
+        .unwrap_or_else(|| "提交成功".to_string());
+    Ok((summary, Vec::new()))
 }
 
 /// Read `file_path` as it existed in `commit`.
@@ -752,7 +991,7 @@ pub fn read_head_blob(root: &Path, file_path: &Path) -> Option<String> {
     String::from_utf8(out.stdout).ok()
 }
 
-fn collect_git_snapshot(root: &Path) -> GitSnapshot {
+fn collect_git_snapshot(root: &Path, cancel: &AtomicBool) -> GitSnapshot {
     let mut snap = GitSnapshot::default();
     let Ok(out) = git_cmd(root)
         .args(["status", "--porcelain=v1", "-b", "-uall"])
@@ -766,6 +1005,9 @@ fn collect_git_snapshot(root: &Path) -> GitSnapshot {
     snap.is_repo = true;
     let text = String::from_utf8_lossy(&out.stdout);
     parse_porcelain_status(&text, root, &mut snap);
+    if cancel.load(Ordering::Relaxed) {
+        return snap;
+    }
 
     if let Ok(b_out) = git_cmd(root)
         .args(["branch", "--format=%(refname:short)"])
@@ -779,6 +1021,9 @@ fn collect_git_snapshot(root: &Path) -> GitSnapshot {
             .filter(|s| !s.is_empty())
             .map(str::to_string)
             .collect();
+    }
+    if cancel.load(Ordering::Relaxed) {
+        return snap;
     }
     if let Ok(s_out) = git_cmd(root)
         .args(["stash", "list", "--pretty=format:%gd%x1f%s"])
