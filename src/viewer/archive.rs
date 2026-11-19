@@ -31,6 +31,62 @@ pub struct ArchiveViewer {
     error: Option<String>,
 }
 
+/// 解压归档内部条目到临时目录，返回可直接交给打开流程的临时文件路径。
+/// 条目名先做安全清理：去掉盘符与前导 `/`、统一分隔符、拒绝 `..` 路径段。
+pub(crate) fn extract_entry(
+    archive: &ZipArchive,
+    entry: &str,
+    archive_path: &Path,
+) -> Result<PathBuf, String> {
+    let normalized = entry.replace('\\', "/");
+    if normalized.ends_with('/') {
+        return Err(format!("目录条目无法打开: {entry}"));
+    }
+    let mut body = normalized.as_str();
+    if body.len() > 2 && body.as_bytes()[1] == b':' && body.as_bytes()[0].is_ascii_alphabetic() {
+        body = &body[2..];
+    }
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in body.trim_start_matches('/').split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => return Err(format!("非法条目路径: {entry}")),
+            _ => segments.push(segment),
+        }
+    }
+    if segments.is_empty() {
+        return Err(format!("非法条目路径: {entry}"));
+    }
+    let mut temp = std::env::temp_dir()
+        .join("kestrel-archive")
+        .join(safe_archive_name(archive_path));
+    for segment in &segments {
+        temp.push(segment);
+    }
+    let bytes = archive.read_entry(entry)?;
+    if let Some(parent) = temp.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建临时目录失败: {e}"))?;
+    }
+    std::fs::write(&temp, bytes).map_err(|e| format!("写出临时文件失败: {e}"))?;
+    Ok(temp)
+}
+
+fn safe_archive_name(archive_path: &Path) -> String {
+    archive_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "archive".to_string())
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 impl ArchiveViewer {
     pub fn load(path: &Path) -> Self {
         let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
@@ -218,6 +274,7 @@ impl ArchiveViewer {
         };
 
         let mut clicked_entry: Option<String> = None;
+        let mut open_entry: Option<String> = None;
         let row_h = 24.0;
         let total = filtered.len();
         ScrollArea::vertical()
@@ -278,11 +335,33 @@ impl ArchiveViewer {
                     if resp.clicked() {
                         clicked_entry = Some(row.name.clone());
                     }
+                    if !row.is_dir {
+                        if resp.double_clicked() {
+                            open_entry = Some(row.name.clone());
+                        }
+                        resp.context_menu(|ui| {
+                            ui.set_width(180.0);
+                            if ui.button("打开内部文件").clicked() {
+                                open_entry = Some(row.name.clone());
+                                ui.close();
+                            }
+                        });
+                    }
                 }
             });
 
         if let Some(entry_name) = clicked_entry {
             self.select_entry(&entry_name);
+        }
+        if let Some(entry_name) = open_entry {
+            let extracted = match &self.archive {
+                Some(archive) => extract_entry(archive, &entry_name, &self.path),
+                None => Err("归档未加载".to_string()),
+            };
+            match extracted {
+                Ok(temp) => events.push(ViewerEvent::OpenPath(temp)),
+                Err(err) => self.preview_text = Some(format!("无法打开内部文件: {err}")),
+            }
         }
 
         if let Some(preview) = &self.preview_text {
@@ -333,5 +412,48 @@ impl ArchiveViewer {
         }
 
         events
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::viewer::zip_util::build_test_zip;
+
+    fn write_temp_zip(name: &str, bytes: &[u8]) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("kestrel-archive-test-{name}.zip"));
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn extract_entry_writes_nested_entry_to_temp_dir() {
+        let bytes = build_test_zip(&[
+            ("docs/notes/readme.txt", b"hello archive"),
+            ("top.txt", b"top"),
+        ]);
+        let archive = ZipArchive::from_bytes(bytes.clone()).unwrap();
+        let zip_path = write_temp_zip("nested", &bytes);
+
+        let extracted = extract_entry(&archive, "docs/notes/readme.txt", &zip_path).unwrap();
+        assert_eq!(std::fs::read(&extracted).unwrap(), b"hello archive");
+        assert!(extracted.starts_with(std::env::temp_dir().join("kestrel-archive")));
+        assert!(extracted.ends_with("docs/notes/readme.txt"));
+
+        let _ = std::fs::remove_file(&extracted);
+        let _ = std::fs::remove_file(&zip_path);
+    }
+
+    #[test]
+    fn extract_entry_rejects_escaping_entry_path() {
+        let bytes = build_test_zip(&[("..\\evil.txt", b"boom")]);
+        let archive = ZipArchive::from_bytes(bytes.clone()).unwrap();
+        let zip_path = write_temp_zip("traversal", &bytes);
+
+        let err = extract_entry(&archive, "..\\evil.txt", &zip_path).unwrap_err();
+        assert!(err.contains("非法"), "unexpected error: {err}");
+        assert!(!std::env::temp_dir().join("kestrel-archive").join("evil.txt").exists());
+
+        let _ = std::fs::remove_file(&zip_path);
     }
 }

@@ -12,6 +12,8 @@ pub struct SearchQuery {
     pub regex: bool,
     pub case_sensitive: bool,
     pub whole_word: bool,
+    /// Match file names only; file contents are never read or searched.
+    pub filename_only: bool,
     /// Glob filter applied to relative paths, e.g. `*.rs` (empty = no filter).
     pub include: String,
     /// Glob exclusion, e.g. `*test*` (empty = none).
@@ -113,6 +115,7 @@ impl ProjectSearch {
         let cancel_thread = cancel.clone();
         let include = query.include.trim().to_string();
         let exclude = query.exclude.trim().to_string();
+        let filename_only = query.filename_only;
         let max_results = if query.max_results == 0 {
             2000
         } else {
@@ -125,6 +128,7 @@ impl ProjectSearch {
                 &regex,
                 &include,
                 &exclude,
+                filename_only,
                 max_results,
                 &cancel_thread,
                 &tx,
@@ -174,6 +178,13 @@ const PREVIEW_CHARS: usize = 160;
 /// Cancellation is re-checked every this many matches inside a file.
 const CANCEL_CHECK_INTERVAL: usize = 200;
 
+/// One file's match set; content scanning is shared by the project search loop.
+struct ContentScan {
+    hits: Vec<SearchMatch>,
+    truncated: bool,
+    cancelled: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_search(
     root: &Path,
@@ -181,6 +192,7 @@ fn run_search(
     regex: &regex::Regex,
     include: &str,
     exclude: &str,
+    filename_only: bool,
     max_results: usize,
     cancel: &AtomicBool,
     tx: &Sender<SearchEvent>,
@@ -193,7 +205,6 @@ fn run_search(
     let mut batch: Vec<SearchResult> = Vec::new();
     let mut batch_matches = 0usize;
     let mut cancelled = false;
-    let mut limit_reached = false;
 
     for path in files {
         if cancel.load(Ordering::Relaxed) {
@@ -214,62 +225,48 @@ fn run_search(
                 matched_files,
             });
         }
-        let Some(content) = crate::workspace::index::read_searchable(path) else {
-            continue;
-        };
-
-        let mut hits: Vec<SearchMatch> = Vec::new();
-        let mut truncated = false;
-        let mut line = 1u32;
-        let mut line_start = 0usize;
-        let mut pos = 0usize;
-        for m in regex.find_iter(&content) {
-            if hits.len() >= PER_FILE_LIMIT {
-                truncated = true;
-                break;
+        // Name-only mode never opens the file: binary or oversized files still
+        // match by name.
+        let (hits, truncated) = if filename_only {
+            if !regex.is_match(&name) {
+                continue;
             }
-            if total_matches.is_multiple_of(CANCEL_CHECK_INTERVAL) && cancel.load(Ordering::Relaxed) {
+            (
+                vec![SearchMatch {
+                    line: 1,
+                    column: 1,
+                    byte_offset: 0,
+                    preview: rel,
+                }],
+                false,
+            )
+        } else {
+            let Some(content) = crate::workspace::index::read_searchable(path) else {
+                continue;
+            };
+            let scan = scan_content(&content, regex, max_results - total_matches, cancel);
+            if scan.cancelled {
                 cancelled = true;
                 break;
             }
-            let start = m.start();
-            for (i, byte) in content.as_bytes()[pos..start].iter().enumerate() {
-                if *byte == b'\n' {
-                    line += 1;
-                    line_start = pos + i + 1;
-                }
-            }
-            pos = start;
-            let column = content[line_start..start].chars().count() as u32 + 1;
-            hits.push(SearchMatch {
-                line,
-                column,
-                byte_offset: start,
-                preview: line_preview(&content, line_start),
-            });
-            total_matches += 1;
-            if total_matches >= max_results {
-                limit_reached = true;
-                break;
-            }
+            (scan.hits, scan.truncated)
+        };
+        if hits.is_empty() {
+            continue;
         }
-        if cancelled {
-            break;
+        matched_files += 1;
+        total_matches += hits.len();
+        batch_matches += hits.len();
+        batch.push(SearchResult {
+            path: path.clone(),
+            matches: hits,
+            truncated,
+        });
+        if batch.len() >= BATCH_FILES || batch_matches >= BATCH_MATCHES {
+            let _ = tx.send(SearchEvent::Results(std::mem::take(&mut batch)));
+            batch_matches = 0;
         }
-        if !hits.is_empty() {
-            matched_files += 1;
-            batch_matches += hits.len();
-            batch.push(SearchResult {
-                path: path.clone(),
-                matches: hits,
-                truncated,
-            });
-            if batch.len() >= BATCH_FILES || batch_matches >= BATCH_MATCHES {
-                let _ = tx.send(SearchEvent::Results(std::mem::take(&mut batch)));
-                batch_matches = 0;
-            }
-        }
-        if limit_reached {
+        if total_matches >= max_results {
             break;
         }
     }
@@ -282,6 +279,56 @@ fn run_search(
         matched_files,
         cancelled,
     });
+}
+
+/// Scan one file's text, capping at `cap` total hits and `PER_FILE_LIMIT` per file.
+fn scan_content(
+    content: &str,
+    regex: &regex::Regex,
+    cap: usize,
+    cancel: &AtomicBool,
+) -> ContentScan {
+    let mut hits: Vec<SearchMatch> = Vec::new();
+    let mut truncated = false;
+    let mut line = 1u32;
+    let mut line_start = 0usize;
+    let mut pos = 0usize;
+    for m in regex.find_iter(content) {
+        if hits.len() >= cap {
+            break;
+        }
+        if hits.len() >= PER_FILE_LIMIT {
+            truncated = true;
+            break;
+        }
+        if hits.len().is_multiple_of(CANCEL_CHECK_INTERVAL) && cancel.load(Ordering::Relaxed) {
+            return ContentScan {
+                hits,
+                truncated,
+                cancelled: true,
+            };
+        }
+        let start = m.start();
+        for (i, byte) in content.as_bytes()[pos..start].iter().enumerate() {
+            if *byte == b'\n' {
+                line += 1;
+                line_start = pos + i + 1;
+            }
+        }
+        pos = start;
+        let column = content[line_start..start].chars().count() as u32 + 1;
+        hits.push(SearchMatch {
+            line,
+            column,
+            byte_offset: start,
+            preview: line_preview(content, line_start),
+        });
+    }
+    ContentScan {
+        hits,
+        truncated,
+        cancelled: false,
+    }
 }
 
 /// Split a comma-separated glob list, dropping empty entries.
@@ -361,6 +408,9 @@ fn line_preview(content: &str, line_start: usize) -> String {
 
 /// Replace all matches of `query` in `path` on disk. Returns the number of replacements made.
 pub fn replace_in_file(path: &Path, query: &SearchQuery, replacement: &str) -> Result<usize, String> {
+    if query.filename_only {
+        return Ok(0);
+    }
     let regex = query.build()?;
     let Some(content) = crate::workspace::index::read_searchable(path) else {
         return Ok(0);
@@ -604,5 +654,45 @@ mod tests {
         } else {
             assert!(!wildcard_match("*.RS", "src/main.rs"));
         }
+    }
+
+    #[test]
+    fn filename_only_searches_names_without_reading_content() {
+        let root = std::env::temp_dir().join(format!("kestrel_search_names_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::write(root.join("needle_one.txt"), "nothing here").unwrap();
+        fs::write(root.join("contents.txt"), "needle in content").unwrap();
+        fs::write(root.join("sub/needle_two.rs"), "x").unwrap();
+        fs::write(root.join("blob.bin"), b"needle\x00binary").unwrap();
+
+        let mut name_only = query("needle");
+        name_only.filename_only = true;
+        let (results, scanned, matched_files) = run(&root, name_only);
+        assert_eq!(scanned, 4);
+        assert_eq!(matched_files, 2);
+        let names: Vec<String> = results
+            .iter()
+            .map(|r| r.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["needle_one.txt", "needle_two.rs"]);
+        assert_eq!(results[0].matches.len(), 1);
+        assert_eq!(results[0].matches[0].byte_offset, 0);
+        assert!(!results[0].truncated);
+
+        // Content mode still sees only the file body, proving the mode switch.
+        let (content_results, _, content_files) = run(&root, query("needle"));
+        assert_eq!(content_files, 1);
+        assert!(content_results[0].path.ends_with("contents.txt"));
+
+        // Include filters still constrain names.
+        let mut filtered = query("needle");
+        filtered.filename_only = true;
+        filtered.include = "*.txt".to_string();
+        let (results, _, matched_files) = run(&root, filtered);
+        assert_eq!(matched_files, 1);
+        assert!(results[0].path.ends_with("needle_one.txt"));
+
+        fs::remove_dir_all(&root).unwrap();
     }
 }
