@@ -121,6 +121,10 @@ pub struct SidebarUi {
     pub mode: SidebarMode,
     pub width: f32,
     pub selected: Option<PathBuf>,
+    /// Multi-selection for batch file operations; holds `selected` when non-empty.
+    pub selected_paths: std::collections::HashSet<PathBuf>,
+    /// Anchor row for Shift+click range selection.
+    pub selection_anchor: Option<PathBuf>,
     pub editing: Option<TreeEdit>,
     pub clipboard: Option<TreeClipboard>,
     pub open_editors_open: bool,
@@ -331,6 +335,7 @@ pub enum Dialog {
     ConfirmCloseAll,
     ConfirmCloseTab(usize, usize),
     ConfirmDelete(PathBuf),
+    ConfirmDeleteBatch(Vec<PathBuf>),
     ConfirmOpenFolder(PathBuf),
 }
 
@@ -688,6 +693,8 @@ impl KestrelApp {
                 mode: SidebarMode::Explorer,
                 width: settings.sidebar_width.max(180.0),
                 selected: None,
+                selected_paths: std::collections::HashSet::new(),
+                selection_anchor: None,
                 editing: None,
                 clipboard: None,
                 open_editors_open: true,
@@ -2957,6 +2964,49 @@ impl KestrelApp {
         }
     }
 
+    /// Batch delete for the Explorer multi-selection context menu.
+    pub fn delete_paths(&mut self, paths: &[PathBuf]) {
+        let mut deleted = 0usize;
+        let mut failed = 0usize;
+        let mut parents: Vec<PathBuf> = Vec::new();
+        for path in paths {
+            match crate::workspace::tree::delete(path) {
+                Ok(()) => {
+                    deleted += 1;
+                    if let Some(parent) = path.parent() {
+                        parents.push(parent.to_path_buf());
+                    }
+                    if let Some(index) = self
+                        .tabs
+                        .iter()
+                        .position(|t| t.doc.path.as_deref() == Some(path.as_path()))
+                    {
+                        self.tabs.remove(index);
+                    }
+                }
+                Err(_) => failed += 1,
+            }
+        }
+        self.active = self.active.min(self.tabs.len().saturating_sub(1));
+        for parent in &parents {
+            self.workspace.tree.reload_dir(parent);
+        }
+        self.sidebar.selected = None;
+        self.sidebar.selected_paths.clear();
+        if let Some(root) = self.workspace.root.clone() {
+            self.workspace.index.scan(&root);
+            self.git.refresh(&root);
+        }
+        if failed == 0 {
+            self.toast(format!("已删除 {deleted} 个项目"), ToastKind::Info);
+        } else {
+            self.toast(
+                format!("已删除 {deleted} 个项目，{failed} 个失败"),
+                ToastKind::Error,
+            );
+        }
+    }
+
     pub fn duplicate_tree_path(&mut self, path: PathBuf) {
         match crate::workspace::tree::duplicate_path(&path) {
             Ok(new_path) => {
@@ -3079,6 +3129,15 @@ impl KestrelApp {
         self.workspace.search_panel.last_query = query;
         self.workspace.search_panel.collapsed.clear();
         self.workspace.search.start(root, files, search_query);
+    }
+
+    /// Start a search the user explicitly submitted, remembering the query.
+    pub fn submit_project_search(&mut self) {
+        let query = self.workspace.search_panel.query.trim().to_string();
+        if !query.is_empty() {
+            self.settings.push_search_history(&query);
+        }
+        self.start_project_search();
     }
 
     pub fn replace_all_in_project(&mut self) {
@@ -3256,6 +3315,18 @@ impl KestrelApp {
     // Palette
     // ------------------------------------------------------------------
 
+    /// Move the caret to a 1-based line in the active editor.
+    fn goto_line(&mut self, line: usize) {
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        let line = line.max(1).min(tab.doc.line_count()) - 1;
+        tab.caret = tab.doc.line_to_char(line);
+        tab.anchor = tab.caret;
+        tab.ensure_visible = true;
+        tab.focus_requested = true;
+    }
+
     pub fn open_palette(&mut self, mode: PaletteMode) {
         self.palette.open = true;
         self.palette.mode = mode;
@@ -3376,8 +3447,48 @@ impl KestrelApp {
         }
     }
 
+    /// Empty-query command list: recent commands first, then grouped by category.
+    fn command_palette_order(&self) -> Vec<usize> {
+        let mut order: Vec<usize> = Vec::new();
+        for id in &self.settings.recent_commands {
+            if let Some(index) = self
+                .palette
+                .items
+                .iter()
+                .position(|item| palette_item_id(item) == Some(id.as_str()))
+            {
+                order.push(index);
+            }
+        }
+        for category in PALETTE_CATEGORIES {
+            for (index, item) in self.palette.items.iter().enumerate() {
+                if order.contains(&index) {
+                    continue;
+                }
+                let item_category = match item {
+                    PaletteItem::Command(command) => command.category(),
+                    PaletteItem::PluginCommand(id) => {
+                        self.plugins.command_category_of(id).unwrap_or_default()
+                    }
+                    _ => continue,
+                };
+                if item_category == *category {
+                    order.push(index);
+                }
+            }
+        }
+        for index in 0..self.palette.items.len() {
+            if !order.contains(&index) {
+                order.push(index);
+            }
+        }
+        order
+    }
+
     pub fn filter_palette(&mut self) {
-        let query = self.palette.query.trim().to_string();
+        let raw_query = self.palette.query.trim().to_string();
+        let (query_text, _) = split_file_line(&raw_query);
+        let query = query_text.to_string();
         let mut scored: Vec<(i32, usize)> = Vec::new();
         if self.palette.mode == PaletteMode::QuickOpen {
             let files = self.workspace.index.files().to_vec();
@@ -3413,6 +3524,8 @@ impl KestrelApp {
                 .map(|(_, idx)| PaletteItem::File(files[*idx].clone()))
                 .collect();
             self.palette.filtered = (0..self.palette.items.len()).collect();
+        } else if self.palette.mode == PaletteMode::Commands && query.is_empty() {
+            self.palette.filtered = self.command_palette_order();
         } else {
             let mut scored: Vec<(i32, usize, Vec<usize>)> = Vec::new();
             for (idx, item) in self.palette.items.iter().enumerate() {
@@ -3473,6 +3586,7 @@ impl KestrelApp {
             .cloned();
         match item {
             Some(PaletteItem::Command(command)) => {
+                self.settings.push_recent_command(command.id());
                 self.close_palette();
                 self.dispatch(command, ctx);
             }
@@ -3483,8 +3597,12 @@ impl KestrelApp {
                 }
             }
             Some(PaletteItem::File(path)) => {
+                let (_, line) = split_file_line(self.palette.query.trim());
                 self.close_palette();
                 self.open_file(path);
+                if let Some(line) = line {
+                    self.goto_line(line);
+                }
             }
             Some(PaletteItem::Language(language)) => {
                 if let Some(tab) = self.tabs.get_mut(self.active) {
@@ -3515,14 +3633,7 @@ impl KestrelApp {
             None => {
                 if self.palette.mode == PaletteMode::GotoLine {
                     self.record_jump_point();
-                    let line: usize = self.palette.query.trim().parse().unwrap_or(1);
-                    if let Some(tab) = self.tabs.get_mut(self.active) {
-                        let line = line.max(1).min(tab.doc.line_count()) - 1;
-                        tab.caret = tab.doc.line_to_char(line);
-                        tab.anchor = tab.caret;
-                        tab.ensure_visible = true;
-                        tab.focus_requested = true;
-                    }
+                    self.goto_line(self.palette.query.trim().parse().unwrap_or(1));
                 }
                 self.close_palette();
             }
@@ -4891,6 +5002,31 @@ impl KestrelApp {
 
 }
 
+/// Fixed category order used by the command palette's grouped list.
+const PALETTE_CATEGORIES: &[&str] = &["文件", "编辑", "视图", "工作区", "帮助", "插件"];
+
+/// Stable id of a palette entry that maps to a command.
+fn palette_item_id(item: &PaletteItem) -> Option<&str> {
+    match item {
+        PaletteItem::Command(command) => Some(command.id()),
+        PaletteItem::PluginCommand(id) => Some(id.as_str()),
+        _ => None,
+    }
+}
+
+/// Split a Quick Open query like src/app.rs:120 into the path part and line number.
+pub(crate) fn split_file_line(query: &str) -> (&str, Option<usize>) {
+    let trimmed = query.trim();
+    if let Some((head, tail)) = trimmed.rsplit_once(':')
+        && !head.is_empty()
+        && let Ok(line) = tail.trim().parse::<usize>()
+        && line > 0
+    {
+        return (head.trim_end(), Some(line));
+    }
+    (trimmed, None)
+}
+
 /// Parse user keybinding overrides from settings into command shortcuts.
 fn build_custom_shortcuts(settings: &Settings) -> std::collections::HashMap<Command, Shortcut> {
     let mut map = std::collections::HashMap::new();
@@ -4908,6 +5044,15 @@ fn build_custom_shortcuts(settings: &Settings) -> std::collections::HashMap<Comm
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_file_line_parses_trailing_line_number() {
+        assert_eq!(split_file_line("src/app.rs:120"), ("src/app.rs", Some(120)));
+        assert_eq!(split_file_line("  app.rs:7  "), ("app.rs", Some(7)));
+        assert_eq!(split_file_line("app.rs"), ("app.rs", None));
+        assert_eq!(split_file_line("C:/work/x:42"), ("C:/work/x", Some(42)));
+        assert_eq!(split_file_line("::"), ("::", None));
+    }
     use crate::doc::Document;
     use crate::editor::Editor;
     use crate::lsp::Diagnostic;
