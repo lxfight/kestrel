@@ -4,6 +4,7 @@ pub mod dialogs;
 pub mod palette;
 pub mod sidebar;
 pub mod terminal;
+pub mod widgets;
 
 use std::path::PathBuf;
 
@@ -18,7 +19,7 @@ use crate::commands::Command;
 use crate::git::GitFileStatus;
 use crate::icons::{self, Icon};
 use crate::lsp::DiagSeverity;
-use crate::theme::{Theme, ThemeKind};
+use crate::theme::{Theme, ThemeKind, R_MD, R_SM};
 
 #[derive(Clone)]
 pub struct UiStyle {
@@ -37,10 +38,14 @@ impl UiStyle {
         self.font(self.ui_size)
     }
     pub fn small(&self) -> FontId {
-        self.font(11.5)
+        self.font(crate::theme::T_SMALL)
     }
     pub fn tiny(&self) -> FontId {
-        self.font(10.5)
+        self.font(crate::theme::T_TINY)
+    }
+    /// Emphasis size, used by dialog and palette headline rows.
+    pub fn emph(&self) -> FontId {
+        self.font(crate::theme::T_EMPH)
     }
 }
 
@@ -48,9 +53,10 @@ impl KestrelApp {
     pub fn root_ui(&mut self, ui: &mut Ui) {
         let style = self.ui_style();
         let theme = style.theme;
+        let win_w = ui.max_rect().width();
 
         Panel::top("kestrel_topbar")
-            .exact_size(40.0)
+            .exact_size(crate::theme::H_TOPBAR)
             .frame(Frame::new().fill(theme.panel_bg))
             .show(ui, |ui| {
                 self.topbar_ui(ui, &style);
@@ -64,10 +70,13 @@ impl KestrelApp {
             });
 
         if self.sidebar.visible {
-            let width = self.sidebar.width;
+            // Never let the sidebar squeeze the editor below a usable width.
+            let max_w = (win_w - 48.0 - 320.0).clamp(180.0, 640.0);
+            let width = self.sidebar.width.clamp(180.0, max_w);
+            self.sidebar.width = width;
             let sb_resp = Panel::left("kestrel_sidebar")
                 .default_size(width)
-                .size_range(180.0..=640.0)
+                .size_range(180.0..=max_w)
                 .resizable(true)
                 .frame(
                     Frame::new()
@@ -84,7 +93,7 @@ impl KestrelApp {
         }
 
         Panel::bottom("kestrel_status")
-            .exact_size(26.0)
+            .exact_size(crate::theme::H_STATUS)
             .frame(
                 Frame::new()
                     .fill(theme.status_bg)
@@ -150,81 +159,132 @@ impl KestrelApp {
             theme.accent_text,
         );
 
-        // Menu bar
+        // The right cluster (window controls + workbench actions) has a fixed
+        // width; the menu and search pill share whatever is left of it.
+        let win_btn_w = 38.0;
+        let action_zone_w = 3.0 * 30.0 + crate::theme::SP2 + 6.0;
         let menu_rect = Rect::from_min_max(
-            Pos2::new(logo_rect.right() + 10.0, rect.top()),
-            Pos2::new(logo_rect.right() + 260.0, rect.bottom()),
+            Pos2::new(logo_rect.right() + crate::theme::SP2, rect.top()),
+            Pos2::new(
+                (rect.right() - win_btn_w * 3.0 - action_zone_w - crate::theme::SP2)
+                    .max(logo_rect.right() + 80.0),
+                rect.bottom(),
+            ),
         );
         let mut menu_end_x = logo_rect.right() + 10.0;
         ui.scope_builder(UiBuilder::new().max_rect(menu_rect), |ui| {
             ui.horizontal_centered(|ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
                 let mb = egui::MenuBar::new().ui(ui, |ui| {
-                    self.topbar_menus(ui, style);
+                    menu_end_x = self.topbar_menus(ui, style);
                 });
-                menu_end_x = mb.response.rect.right();
+                menu_end_x = menu_end_x.max(mb.response.rect.left()) + crate::theme::SP1;
             });
         });
 
-        // Command palette search pill (centered)
-        let pill_size = Vec2::new((rect.width() * 0.32).clamp(240.0, 440.0), 26.0);
-        let pill_rect =
-            Rect::from_center_size(Pos2::new(rect.center().x, rect.center().y), pill_size);
-        let pill_resp = ui.interact(
-            pill_rect,
-            ui.scope_id().with("command_pill"),
-            Sense::click(),
-        );
-        let hovered = pill_resp.hovered();
-        ui.painter().rect_filled(
-            pill_rect,
-            CornerRadius::same(7),
-            if hovered { theme.hover } else { theme.input_bg },
-        );
-        ui.painter().rect_stroke(
-            pill_rect,
-            CornerRadius::same(7),
-            Stroke::new(
-                1.0,
-                if hovered {
-                    theme.border_strong
-                } else {
-                    theme.border
-                },
-            ),
-            egui::StrokeKind::Inside,
-        );
-        let search_icon = Rect::from_center_size(
-            Pos2::new(pill_rect.left() + 15.0, pill_rect.center().y),
-            Vec2::splat(14.0),
-        );
-        icons::paint(
-            ui.painter(),
-            search_icon,
-            Icon::Search,
-            theme.text_dim,
-            1.3,
-        );
-        ui.painter().text(
-            Pos2::new(pill_rect.left() + 29.0, pill_rect.center().y),
-            Align2::LEFT_CENTER,
-            "搜索文件、符号或命令",
-            style.small(),
-            theme.text_dim,
-        );
-        ui.painter().text(
-            Pos2::new(pill_rect.right() - 10.0, pill_rect.center().y),
-            Align2::RIGHT_CENTER,
-            "Ctrl+P",
-            style.tiny(),
-            theme.text_faint,
-        );
-        if pill_resp.clicked() {
-            self.open_palette(PaletteMode::QuickOpen);
+        // Command palette entry: the full pill needs the gap between the menu and
+        // the right cluster, so narrow windows fall back to an icon-only button.
+        let pill_left = menu_end_x + crate::theme::SP2;
+        let pill_right = rect.right()
+            - win_btn_w * 3.0
+            - action_zone_w
+            - crate::theme::SP2;
+        let gap = (pill_right - pill_left).max(0.0);
+        let pill_compact = gap < 260.0;
+        let pill_rect = if pill_compact {
+            Rect::from_min_size(
+                Pos2::new(pill_right - 26.0, rect.center().y - 13.0),
+                Vec2::splat(26.0),
+            )
+        } else {
+            let width = (rect.width() * 0.32).clamp(200.0, 440.0).min(gap);
+            // Prefer the window centre; slide only as far as the gap requires.
+            let left = (rect.center().x - width * 0.5)
+                .clamp(pill_left, (pill_right - width).max(pill_left));
+            Rect::from_min_size(
+                Pos2::new(left, rect.center().y - 13.0),
+                Vec2::new(width, 26.0),
+            )
+        };
+        if pill_compact {
+            if widgets::icon_button(ui, pill_rect, &theme, Icon::Search, true)
+                .on_hover_text("快速打开 (Ctrl+P)")
+                .clicked()
+            {
+                self.open_palette(PaletteMode::QuickOpen);
+            }
+        } else {
+            let pill_resp = ui.interact(
+                pill_rect,
+                ui.scope_id().with("command_pill"),
+                Sense::click(),
+            );
+            let radius = CornerRadius::same(R_MD);
+            let fill = if pill_resp.is_pointer_button_down_on() {
+                theme.active
+            } else if pill_resp.hovered() {
+                theme.hover
+            } else {
+                theme.input_bg
+            };
+            ui.painter().rect_filled(pill_rect, radius, fill);
+            ui.painter().rect_stroke(
+                pill_rect,
+                radius,
+                Stroke::new(
+                    1.0,
+                    if pill_resp.hovered() {
+                        theme.border_strong
+                    } else {
+                        theme.border
+                    },
+                ),
+                egui::StrokeKind::Inside,
+            );
+            if pill_resp.has_focus() {
+                ui.painter().rect_stroke(
+                    pill_rect,
+                    radius,
+                    Stroke::new(1.0, theme.accent),
+                    egui::StrokeKind::Inside,
+                );
+            }
+            let search_icon = Rect::from_center_size(
+                Pos2::new(pill_rect.left() + 15.0, pill_rect.center().y),
+                Vec2::splat(14.0),
+            );
+            icons::paint(
+                ui.painter(),
+                search_icon,
+                Icon::Search,
+                theme.text_dim,
+                1.3,
+            );
+            let (hint, _) = widgets::ellipsize(
+                ui,
+                "搜索文件、符号或命令",
+                style.small(),
+                theme.text_dim,
+                (pill_rect.width() - 96.0).max(0.0),
+            );
+            ui.painter().galley(
+                Pos2::new(pill_rect.left() + 29.0, pill_rect.center().y - hint.rect.height() * 0.5),
+                hint,
+                theme.text_dim,
+            );
+            ui.painter().text(
+                Pos2::new(pill_rect.right() - 10.0, pill_rect.center().y),
+                Align2::RIGHT_CENTER,
+                "Ctrl+P",
+                style.tiny(),
+                theme.text_faint,
+            );
+            if pill_resp.clicked() {
+                self.open_palette(PaletteMode::QuickOpen);
+            }
         }
 
         // Window controls (Minimize, Maximize/Restore, Close) on far right
-        let win_btn_w = 38.0;
         let is_maximized = ui.input(|i| i.viewport().maximized.unwrap_or(false));
 
         let close_rect = Rect::from_min_size(
@@ -446,7 +506,9 @@ impl KestrelApp {
         }
     }
 
-    fn topbar_menus(&mut self, ui: &mut Ui, style: &UiStyle) {
+    /// Draws the menu buttons and returns the right edge actually used, so the
+    /// search pill can be placed from measurement instead of a guessed width.
+    fn topbar_menus(&mut self, ui: &mut Ui, style: &UiStyle) -> f32 {
         ui.spacing_mut().item_spacing.x = 2.0;
         ui.menu_button("文件", |ui| {
             self.menu_items(
@@ -551,7 +613,10 @@ impl KestrelApp {
         });
         ui.menu_button("帮助", |ui| {
             self.menu_items(ui, style, &[Command::Shortcuts, Command::About]);
-        });
+        })
+        .response
+        .rect
+        .right()
     }
 
     fn menu_items(&mut self, ui: &mut Ui, style: &UiStyle, commands: &[Command]) {
@@ -904,7 +969,7 @@ impl KestrelApp {
             |ui| {
             ui.spacing_mut().item_spacing = Vec2::ZERO;
             let (bar, _) = ui.allocate_exact_size(
-                Vec2::new(rect.width(), crate::app::TABBAR_H),
+                Vec2::new(rect.width(), crate::theme::H_TAB),
                 Sense::hover(),
             );
             self.group_tabbar_ui(ui, style, group_idx, bar);
@@ -1070,7 +1135,9 @@ impl KestrelApp {
 
             let active = active_id == Some(*id);
             let focused_tab = active && group_active;
-            let bg = if active {
+            let bg = if tab_resp.is_pointer_button_down_on() {
+                theme.active
+            } else if active {
                 theme.bg
             } else if tab_resp.hovered() {
                 theme.hover
@@ -1078,6 +1145,14 @@ impl KestrelApp {
                 theme.panel_bg
             };
             ui.painter().rect_filled(clip_rect, 0.0, bg);
+            if tab_resp.has_focus() && !active {
+                ui.painter().rect_stroke(
+                    clip_rect.shrink(1.0),
+                    0.0,
+                    Stroke::new(1.0, theme.accent),
+                    egui::StrokeKind::Inside,
+                );
+            }
             ui.painter().line_segment(
                 [
                     Pos2::new(tab_rect.right(), tab_rect.top() + 6.0),
@@ -1116,6 +1191,7 @@ impl KestrelApp {
                     false,
                     false,
                     theme.text_dim,
+                    theme.kind.is_dark(),
                 );
             } else {
                 icons::file_glyph(
@@ -1143,13 +1219,24 @@ impl KestrelApp {
                 Pos2::new(tab_rect.left() + 31.0, tab_rect.top()),
                 Pos2::new(tab_rect.right() - 26.0, tab_rect.bottom()),
             );
-            ui.painter().with_clip_rect(clip_rect).text(
-                Pos2::new(title_rect.left(), title_rect.center().y),
-                Align2::LEFT_CENTER,
+            let (title_galley, title_cut) = widgets::ellipsize(
+                ui,
                 &display_title,
                 style.small(),
                 title_color,
+                title_rect.width(),
             );
+            ui.painter().with_clip_rect(clip_rect).galley(
+                Pos2::new(
+                    title_rect.left(),
+                    title_rect.center().y - title_galley.rect.height() * 0.5,
+                ),
+                title_galley,
+                title_color,
+            );
+            if title_cut {
+                tab_resp.clone().on_hover_text(&display_title);
+            }
 
             let right_icon_center = Pos2::new(tab_rect.right() - 16.0, tab_rect.center().y);
             if tab_resp.hovered() && !pinned {
@@ -1531,7 +1618,15 @@ impl KestrelApp {
                     Vec2::splat(13.0),
                 );
                 if let Some(p) = &editor.doc.path {
-                    icons::paint_path_icon(ui.painter(), icon_rect, p, false, false, theme.text_dim);
+                    icons::paint_path_icon(
+                        ui.painter(),
+                        icon_rect,
+                        p,
+                        false,
+                        false,
+                        theme.text_dim,
+                        theme.kind.is_dark(),
+                    );
                 } else {
                     icons::file_glyph(ui.painter(), icon_rect, theme.text_dim, false, false);
                 }
@@ -1969,26 +2064,76 @@ impl KestrelApp {
             ],
             Stroke::new(1.0, theme.border),
         );
-        let mut x = rect.left() + 10.0;
-        let text = |ui: &Ui, x: &mut f32, s: &str, color: Color32, font: FontId| -> Rect {
-            let width = ui.ctx().fonts_mut(|fonts| {
+        // The right cluster owns a fixed slice (zoom, plugins, language, EOL,
+        // encoding, indent, line/col). Measuring it first keeps the left cluster
+        // from painting underneath it on narrow windows.
+        let measure = |s: &str, font: FontId| -> f32 {
+            ui.ctx().fonts_mut(|fonts| {
                 fonts
                     .layout_job(LayoutJob::simple_singleline(
                         s.to_string(),
-                        font.clone(),
-                        color,
+                        font,
+                        Color32::WHITE,
                     ))
                     .rect
                     .width()
-            });
-            let r = Rect::from_min_size(Pos2::new(*x, rect.center().y - 9.0), Vec2::new(width, 18.0));
-            ui.painter().text(
-                Pos2::new(*x, rect.center().y),
-                Align2::LEFT_CENTER,
-                s,
-                font,
+            })
+        };
+        let mut right_reserved = 12.0;
+        if (self.settings.ui_zoom - 1.0).abs() > 0.01 {
+            right_reserved += 74.0;
+        }
+        if let Some(editor) = self.tabs.get(self.active) {
+            if let Some(mm) = editor.multimodal.as_ref().filter(|m| !m.is_showing_source()) {
+                right_reserved += measure(mm.kind().label(), style.small()) + 16.0;
+            } else if editor.doc.encoding == crate::doc::Encoding::Binary {
+                right_reserved += 168.0;
+            } else if editor.diff.is_some() {
+                right_reserved += 72.0;
+            } else {
+                let indent = format!(
+                    "{}{}",
+                    self.settings.tab_size,
+                    if self.settings.insert_spaces {
+                        "空格"
+                    } else {
+                        "制表符"
+                    }
+                );
+                let (line, col) = editor.doc.char_to_line_col(editor.caret);
+                let pos = format!("行 {}, 列 {}", line + 1, col + 1);
+                for s in [
+                    editor.language.name(),
+                    editor.doc.eol.as_str(),
+                    editor.doc.encoding.as_str(),
+                    indent.as_str(),
+                    pos.as_str(),
+                ] {
+                    right_reserved += measure(s, style.small()) + 16.0;
+                }
+            }
+        }
+        for item in self.plugins.status_items() {
+            right_reserved += measure(&item.text, style.small()) + 16.0;
+        }
+        let left_limit = (rect.right() - right_reserved).max(rect.left() + 96.0);
+
+        let mut x = rect.left() + 10.0;
+        let text = |ui: &mut Ui, x: &mut f32, s: &str, color: Color32, font: FontId| -> Rect {
+            let avail = (left_limit - *x - 6.0).max(0.0);
+            let origin = Pos2::new(*x, rect.center().y - 9.0);
+            if avail < 12.0 {
+                return Rect::from_min_size(origin, Vec2::ZERO);
+            }
+            let (galley, clipped) = widgets::ellipsize(ui, s, font, color, avail);
+            let width = galley.rect.width();
+            ui.painter().galley(
+                Pos2::new(*x, rect.center().y - galley.rect.height() * 0.5),
+                galley,
                 color,
             );
+            let r = Rect::from_min_size(origin, Vec2::new(width, 18.0));
+            let _ = clipped;
             *x += width;
             r
         };
@@ -2303,6 +2448,8 @@ impl KestrelApp {
         ui.painter().rect_filled(rect, 0.0, theme.bg);
         let center_x = rect.center().x;
         let mut y = rect.top() + (rect.height() * 0.16).max(36.0);
+        // The footer sits at bottom - SP5; nothing may be laid out below it.
+        let bottom_limit = rect.bottom() - crate::theme::SP5 - crate::theme::SP4;
 
         let logo = Rect::from_center_size(Pos2::new(center_x, y + 30.0), Vec2::splat(60.0));
         ui.painter()
@@ -2319,7 +2466,7 @@ impl KestrelApp {
             Pos2::new(center_x, y),
             Align2::CENTER_CENTER,
             "Kestrel",
-            style.font(26.0),
+            style.font(crate::theme::T_TITLE),
             theme.text,
         );
         y += 28.0;
@@ -2327,7 +2474,7 @@ impl KestrelApp {
             Pos2::new(center_x, y),
             Align2::CENTER_CENTER,
             "轻量 · 极速 · 现代的 Rust 代码编辑器",
-            style.font(13.0),
+            style.font(crate::theme::T_BODY),
             theme.text_dim,
         );
         y += 42.0;
@@ -2363,18 +2510,29 @@ impl KestrelApp {
                 theme.text_faint,
             );
             y += 34.0;
-            let button =
-                Rect::from_center_size(Pos2::new(center_x - 102.0, y), Vec2::new(186.0, 32.0));
+            // Two side-by-side buttons: shrink to the pane instead of running past it.
+            let gap = crate::theme::SP3;
+            let btn_w =
+                ((rect.width() - crate::theme::SP6 * 2.0 - gap) * 0.5).clamp(150.0, 186.0);
+            let total = btn_w * 2.0 + gap;
+            let button = Rect::from_center_size(
+                Pos2::new(center_x - total * 0.5 + btn_w * 0.5, y),
+                Vec2::new(btn_w, 32.0),
+            );
             if self.primary_button(ui, button, "快速打开文件  Ctrl+P", style) {
                 self.open_palette(PaletteMode::QuickOpen);
             }
-            let button2 =
-                Rect::from_center_size(Pos2::new(center_x + 102.0, y), Vec2::new(186.0, 32.0));
+            let button2 = Rect::from_center_size(
+                Pos2::new(center_x + total * 0.5 - btn_w * 0.5, y),
+                Vec2::new(btn_w, 32.0),
+            );
             if self.secondary_button(ui, button2, "命令面板  Ctrl+Shift+P", style) {
                 self.open_palette(PaletteMode::Commands);
             }
             y += 46.0;
-            self.shortcut_hints(ui, style, center_x, y);
+            if y + 12.0 <= bottom_limit {
+                self.shortcut_hints(ui, style, center_x, y);
+            }
             footer(ui);
             return;
         }
@@ -2402,6 +2560,9 @@ impl KestrelApp {
             .take(6)
             .cloned()
             .collect();
+        // Only spend rows the window can actually show; 760x480 must not overlap the footer.
+        let room = ((bottom_limit - (y + 48.0 + 22.0)) / 28.0).floor().max(0.0) as usize;
+        let recents = &recents[..recents.len().min(room)];
         if !recents.is_empty() {
             y += 48.0;
             ui.painter().text(
@@ -2412,17 +2573,13 @@ impl KestrelApp {
                 theme.text_faint,
             );
             y += 22.0;
-            for recent in &recents {
+            for recent in recents {
                 let name = std::path::Path::new(recent)
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| recent.clone());
                 let row = Rect::from_center_size(Pos2::new(center_x, y), Vec2::new(330.0, 26.0));
-                let resp = ui.interact(row, ui.scope_id().with(("recent", recent)), Sense::click());
-                if resp.hovered() {
-                    ui.painter()
-                        .rect_filled(row, CornerRadius::same(5), theme.hover);
-                }
+                let resp = widgets::paint_row(ui, row, &theme, widgets::RowState::idle());
                 icons::paint_path_icon(
                     ui.painter(),
                     Rect::from_center_size(
@@ -2433,14 +2590,18 @@ impl KestrelApp {
                     true,
                     false,
                     theme.accent,
+                    theme.kind.is_dark(),
                 );
-                ui.painter().text(
-                    Pos2::new(row.left() + 28.0, row.center().y),
-                    Align2::LEFT_CENTER,
-                    &name,
-                    style.small(),
+                let (name_galley, name_cut) =
+                    widgets::ellipsize(ui, &name, style.small(), theme.text, 200.0);
+                ui.painter().galley(
+                    Pos2::new(row.left() + 28.0, row.center().y - name_galley.rect.height() * 0.5),
+                    name_galley,
                     theme.text,
                 );
+                if name_cut {
+                    resp.clone().on_hover_text(&name);
+                }
                 let path_label = elide_middle(recent, 42);
                 ui.painter().with_clip_rect(row).text(
                     Pos2::new(row.right() - 10.0, row.center().y),
@@ -2468,8 +2629,32 @@ impl KestrelApp {
             ("转到符号", "Ctrl+Shift+."),
             ("多光标选择", "Ctrl+D"),
         ];
-        let mut x = center_x - 260.0;
+        let measure = |s: &str| -> f32 {
+            ui.ctx().fonts_mut(|fonts| {
+                fonts
+                    .layout_job(LayoutJob::simple_singleline(
+                        s.to_string(),
+                        style.tiny(),
+                        theme.text_dim,
+                    ))
+                    .rect
+                    .width()
+            })
+        };
+        // Drop hints the pane cannot hold, then centre the survivors.
+        let avail = ui.max_rect().width() - crate::theme::SP6;
+        let mut widths = Vec::new();
+        let mut total = 0.0;
         for (label, key) in hints {
+            let w = measure(key) + 6.0 + measure(label) + crate::theme::SP4;
+            if total + w > avail {
+                break;
+            }
+            total += w;
+            widths.push(w);
+        }
+        let mut x = center_x - total * 0.5;
+        for ((label, key), w) in hints.into_iter().zip(widths) {
             ui.painter().text(
                 Pos2::new(x, y),
                 Align2::LEFT_CENTER,
@@ -2477,24 +2662,14 @@ impl KestrelApp {
                 style.tiny(),
                 theme.text_dim,
             );
-            let kw = ui.ctx().fonts_mut(|fonts| {
-                fonts
-                    .layout_job(LayoutJob::simple_singleline(
-                        key.to_string(),
-                        style.tiny(),
-                        theme.text_dim,
-                    ))
-                    .rect
-                    .width()
-            });
             ui.painter().text(
-                Pos2::new(x + kw + 6.0, y),
+                Pos2::new(x + measure(key) + 6.0, y),
                 Align2::LEFT_CENTER,
                 label,
                 style.tiny(),
                 theme.text_faint,
             );
-            x += 136.0;
+            x += w;
         }
     }
 
@@ -2607,15 +2782,23 @@ impl KestrelApp {
     ) -> bool {
         let theme = style.theme;
         let resp = ui.interact(rect, ui.scope_id().with(("primary", label)), Sense::click());
-        ui.painter().rect_filled(
-            rect,
-            CornerRadius::same(7),
-            if resp.hovered() {
-                theme.accent.gamma_multiply(0.92)
-            } else {
-                theme.accent
-            },
-        );
+        let fill = if resp.is_pointer_button_down_on() {
+            theme.accent.gamma_multiply(0.84)
+        } else if resp.hovered() {
+            theme.accent.gamma_multiply(0.92)
+        } else {
+            theme.accent
+        };
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(R_MD), fill);
+        if resp.has_focus() {
+            ui.painter().rect_stroke(
+                rect.shrink(1.5),
+                CornerRadius::same(R_SM),
+                Stroke::new(1.0, theme.accent_text),
+                egui::StrokeKind::Inside,
+            );
+        }
         ui.painter().text(
             rect.center(),
             Align2::CENTER_CENTER,
@@ -2639,19 +2822,25 @@ impl KestrelApp {
             ui.scope_id().with(("secondary", label)),
             Sense::click(),
         );
-        ui.painter().rect_filled(
-            rect,
-            CornerRadius::same(7),
-            if resp.hovered() {
-                theme.hover
-            } else {
-                theme.input_bg
-            },
-        );
+        let fill = if resp.is_pointer_button_down_on() {
+            theme.active
+        } else if resp.hovered() {
+            theme.hover
+        } else {
+            theme.input_bg
+        };
+        ui.painter().rect_filled(rect, CornerRadius::same(R_MD), fill);
         ui.painter().rect_stroke(
             rect,
-            CornerRadius::same(7),
-            Stroke::new(1.0, theme.border_strong),
+            CornerRadius::same(R_MD),
+            Stroke::new(
+                1.0,
+                if resp.has_focus() {
+                    theme.accent
+                } else {
+                    theme.border_strong
+                },
+            ),
             egui::StrokeKind::Inside,
         );
         ui.painter().text(

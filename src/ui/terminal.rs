@@ -12,14 +12,17 @@ use crate::app::{BottomTab, KestrelApp};
 use crate::icons::{self, Icon};
 use crate::lsp::DiagSeverity;
 use crate::terminal::ShellKind;
+use crate::ui::widgets;
 use crate::ui::UiStyle;
 
 impl KestrelApp {
     pub fn terminal_panel_ui(&mut self, ui: &mut Ui, style: &UiStyle) {
         let theme = style.theme;
         // Header with tabs: PROBLEMS | OUTPUT | TERMINAL
-        let (header, _) =
-            ui.allocate_exact_size(Vec2::new(ui.available_width(), 32.0), Sense::hover());
+        let (header, _) = ui.allocate_exact_size(
+            Vec2::new(ui.available_width(), crate::theme::SP6),
+            Sense::hover(),
+        );
         ui.painter().rect_filled(header, 0.0, theme.panel_bg);
         ui.painter().line_segment(
             [
@@ -32,19 +35,29 @@ impl KestrelApp {
         let total_problems: usize = self.tabs.iter().map(|t| t.diagnostics.len()).sum();
         let term_count = self.bottom.terminals.len();
 
-        let mut tab_x = header.left() + 12.0;
+        // Tabs keep out of the fixed right-hand action cluster.
+        let actions_left = header.right() - 168.0;
+        let mut tab_x = header.left() + crate::theme::SP3;
         let mut draw_tab = |ui: &mut Ui, tab: BottomTab, label: &str, badge: Option<usize>| {
             let active = self.bottom.tab == tab;
             let text_w = label.chars().count() as f32 * 11.0 + 16.0;
             let badge_w = if badge.is_some_and(|b| b > 0) { 22.0 } else { 0.0 };
             let w = text_w + badge_w;
+            if tab_x + w > actions_left {
+                return;
+            }
             let r = Rect::from_min_size(Pos2::new(tab_x, header.top()), Vec2::new(w, header.height()));
-            let resp = ui.interact(r, ui.scope_id().with(("btm_tab", label)), Sense::click());
+            let resp = widgets::paint_row(
+                ui,
+                r.shrink2(Vec2::new(0.0, crate::theme::SP1)),
+                &theme,
+                widgets::RowState::new(active, true),
+            );
             ui.painter().text(
                 Pos2::new(r.left() + 6.0, r.center().y),
                 Align2::LEFT_CENTER,
                 label,
-                style.font(11.5),
+                style.font(crate::theme::T_SMALL),
                 if active {
                     theme.text
                 } else if resp.hovered() {
@@ -91,7 +104,7 @@ impl KestrelApp {
                     theme.accent,
                 );
             }
-            tab_x += w + 8.0;
+            tab_x += w + crate::theme::SP2;
             if resp.clicked() {
                 self.bottom.tab = tab;
             }
@@ -104,42 +117,47 @@ impl KestrelApp {
         // Terminal instance selector pills when on Terminal tab
         let mut switch_term = None;
         if self.bottom.tab == BottomTab::Terminal && !self.bottom.terminals.is_empty() {
-            tab_x += 8.0;
+            tab_x += crate::theme::SP2;
             for (idx, term) in self.bottom.terminals.iter().enumerate() {
                 let active = idx == self.bottom.active_terminal;
                 let label = format!("{}: {}", idx + 1, term.title());
                 let w = (label.len() as f32 * 6.5 + 18.0).clamp(64.0, 130.0);
+                if tab_x + w > actions_left {
+                    break;
+                }
                 let pill = Rect::from_center_size(
                     Pos2::new(tab_x + w * 0.5, header.center().y),
                     Vec2::new(w, 20.0),
                 );
-                let resp = ui.interact(
+                let resp = widgets::paint_row(
+                    ui,
                     pill,
-                    ui.scope_id().with(("term_inst", idx)),
-                    Sense::click(),
+                    &theme,
+                    widgets::RowState::new(active, true),
                 );
-                ui.painter().rect_filled(
-                    pill,
-                    CornerRadius::same(4),
-                    if active {
-                        theme.active
-                    } else if resp.hovered() {
-                        theme.hover
-                    } else {
-                        Color32::TRANSPARENT
-                    },
-                );
-                ui.painter().text(
-                    pill.center(),
-                    Align2::CENTER_CENTER,
-                    label,
+                let (galley, cut) = widgets::ellipsize(
+                    ui,
+                    &label,
                     style.tiny(),
                     if active { theme.text } else { theme.text_dim },
+                    pill.width() - 8.0,
                 );
+                ui.painter().galley(
+                    Pos2::new(
+                        pill.center().x - galley.rect.width() * 0.5,
+                        pill.center().y - galley.rect.height() * 0.5,
+                    ),
+                    galley,
+                    theme.text,
+                );
+                if cut {
+                    resp.clone()
+                        .on_hover_text(format!("{} {}", idx + 1, term.title()));
+                }
                 if resp.clicked() {
                     switch_term = Some(idx);
                 }
-                tab_x += w + 4.0;
+                tab_x += w + crate::theme::SP1;
             }
         }
         if let Some(idx) = switch_term {
@@ -311,13 +329,11 @@ impl KestrelApp {
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
                 for (path, title, diag) in &entries {
-                    let (row, resp) = ui.allocate_exact_size(
-                        Vec2::new(ui.available_width(), 24.0),
-                        Sense::click(),
+                    let (row, _) = ui.allocate_exact_size(
+                        Vec2::new(ui.available_width(), crate::theme::H_ROW),
+                        Sense::hover(),
                     );
-                    if resp.hovered() {
-                        ui.painter().rect_filled(row, 0.0, theme.hover);
-                    }
+                    let resp = widgets::paint_row(ui, row, &theme, widgets::RowState::idle());
                     let (icon, color) = match diag.severity {
                         DiagSeverity::Error => (Icon::Error, theme.error),
                         DiagSeverity::Warning => (Icon::Warning, theme.warning),
@@ -754,13 +770,15 @@ fn color_to_ui(color: vt100::Color, theme: crate::theme::Theme, foreground: bool
     };
     match color {
         vt100::Color::Default => default,
-        vt100::Color::Idx(idx) => ansi_color(idx),
+        vt100::Color::Idx(idx) => ansi_color(idx, theme.kind.is_dark()),
         vt100::Color::Rgb(r, g, b) => Color32::from_rgb(r, g, b),
     }
 }
 
-fn ansi_color(idx: u8) -> Color32 {
-    const BASE: [Color32; 16] = [
+/// ANSI base 16. The light set is dark-on-light: reusing the dark pastels on a
+/// white terminal leaves red/green/blue at 1.1-1.8:1.
+fn ansi_color(idx: u8, dark: bool) -> Color32 {
+    const DARK: [Color32; 16] = [
         Color32::from_rgb(0x22, 0x24, 0x2B),
         Color32::from_rgb(0xE0, 0x6C, 0x75),
         Color32::from_rgb(0x98, 0xC3, 0x79),
@@ -778,8 +796,30 @@ fn ansi_color(idx: u8) -> Color32 {
         Color32::from_rgb(0x7A, 0xCF, 0xD8),
         Color32::from_rgb(0xEE, 0xEF, 0xF2),
     ];
+    const LIGHT: [Color32; 16] = [
+        Color32::from_rgb(0x24, 0x29, 0x2F),
+        Color32::from_rgb(0xB3, 0x26, 0x1E),
+        Color32::from_rgb(0x1F, 0x6E, 0x2E),
+        Color32::from_rgb(0x8A, 0x5A, 0x00),
+        Color32::from_rgb(0x1F, 0x5F, 0xBF),
+        Color32::from_rgb(0x82, 0x26, 0xA8),
+        Color32::from_rgb(0x0B, 0x6E, 0x80),
+        Color32::from_rgb(0x5A, 0x62, 0x72),
+        Color32::from_rgb(0x5A, 0x62, 0x72),
+        Color32::from_rgb(0xC6, 0x28, 0x28),
+        Color32::from_rgb(0x2E, 0x7D, 0x32),
+        Color32::from_rgb(0x9A, 0x54, 0x00),
+        Color32::from_rgb(0x19, 0x76, 0xD2),
+        Color32::from_rgb(0xAB, 0x47, 0xBC),
+        Color32::from_rgb(0x00, 0x83, 0x8F),
+        Color32::from_rgb(0x3E, 0x46, 0x52),
+    ];
     if idx < 16 {
-        return BASE[idx as usize];
+        return if dark {
+            DARK[idx as usize]
+        } else {
+            LIGHT[idx as usize]
+        };
     }
     if idx < 232 {
         let i = idx - 16;

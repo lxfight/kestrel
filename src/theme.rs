@@ -4,6 +4,32 @@ use egui::{Color32, CornerRadius, FontId, Stroke, TextStyle, Visuals};
 
 use crate::highlight::TokenKind;
 
+// Spacing scale: 4px grid, six steps.
+pub const SP1: f32 = 4.0;
+pub const SP2: f32 = 8.0;
+pub const SP3: f32 = 12.0;
+pub const SP4: f32 = 16.0;
+pub const SP5: f32 = 24.0;
+pub const SP6: f32 = 32.0;
+
+// Corner radii: rows/tabs/inputs, panels/popups, dialogs.
+pub const R_SM: u8 = 4;
+pub const R_MD: u8 = 6;
+pub const R_LG: u8 = 8;
+
+// Type scale: five steps.
+pub const T_TINY: f32 = 11.0;
+pub const T_SMALL: f32 = 12.0;
+pub const T_BODY: f32 = 13.0;
+pub const T_EMPH: f32 = 15.0;
+pub const T_TITLE: f32 = 20.0;
+
+// Fixed chrome heights, aligned to the spacing grid.
+pub const H_STATUS: f32 = 24.0;
+pub const H_TAB: f32 = 34.0;
+pub const H_TOPBAR: f32 = 40.0;
+pub const H_ROW: f32 = 24.0;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ThemeKind {
     Dark,
@@ -77,6 +103,8 @@ pub struct Theme {
     pub bracket_match: Color32,
     pub indent_guide: Color32,
     pub indent_guide_active: Color32,
+    /// Minimap viewport indicator; keep it on `border_strong` so both themes show it.
+    pub minimap_viewport: Color32,
 
     pub error: Color32,
     pub warning: Color32,
@@ -123,12 +151,12 @@ impl Theme {
             hover: Color32::from_rgb(0x23, 0x27, 0x30),
             active: Color32::from_rgb(0x2A, 0x2F, 0x3A),
             border: Color32::from_rgb(0x22, 0x25, 0x2D),
-            border_strong: Color32::from_rgb(0x2E, 0x33, 0x3E),
+            border_strong: Color32::from_rgb(0x3A, 0x40, 0x4D),
             input_bg: Color32::from_rgb(0x0F, 0x11, 0x15),
 
             text: Color32::from_rgb(0xCF, 0xD5, 0xE1),
             text_dim: Color32::from_rgb(0x84, 0x8D, 0xA0),
-            text_faint: Color32::from_rgb(0x5B, 0x63, 0x74),
+            text_faint: Color32::from_rgb(0x7A, 0x84, 0x96),
             accent: Color32::from_rgb(0x5A, 0xA3, 0xF2),
             accent_text: Color32::from_rgb(0x0D, 0x12, 0x1A),
 
@@ -140,6 +168,7 @@ impl Theme {
             bracket_match: Color32::from_rgba_premultiplied(0x2A, 0x44, 0x2E, 0xB0),
             indent_guide: Color32::from_rgb(0x25, 0x28, 0x31),
             indent_guide_active: Color32::from_rgb(0x3A, 0x40, 0x4E),
+            minimap_viewport: Color32::from_rgb(0x3A, 0x40, 0x4D),
 
             error: Color32::from_rgb(0xF2, 0x73, 0x6B),
             warning: Color32::from_rgb(0xE6, 0xB5, 0x5C),
@@ -155,7 +184,7 @@ impl Theme {
             syn_text: Color32::from_rgb(0xCD, 0xD3, 0xDF),
             syn_keyword: Color32::from_rgb(0xC8, 0x8A, 0xF0),
             syn_string: Color32::from_rgb(0x8F, 0xD3, 0xA0),
-            syn_comment: Color32::from_rgb(0x5F, 0x6A, 0x7D),
+            syn_comment: Color32::from_rgb(0x7C, 0x87, 0x98),
             syn_number: Color32::from_rgb(0xEF, 0xBF, 0x7D),
             syn_function: Color32::from_rgb(0x7B, 0xB6, 0xFF),
             syn_type: Color32::from_rgb(0x67, 0xD6, 0xC6),
@@ -184,12 +213,12 @@ impl Theme {
             hover: Color32::from_rgb(0xE6, 0xE9, 0xF0),
             active: Color32::from_rgb(0xDA, 0xDE, 0xE8),
             border: Color32::from_rgb(0xDC, 0xE0, 0xE8),
-            border_strong: Color32::from_rgb(0xC8, 0xCE, 0xDA),
+            border_strong: Color32::from_rgb(0xBF, 0xC6, 0xD2),
             input_bg: Color32::from_rgb(0xFF, 0xFF, 0xFF),
 
             text: Color32::from_rgb(0x23, 0x26, 0x2E),
-            text_dim: Color32::from_rgb(0x68, 0x70, 0x80),
-            text_faint: Color32::from_rgb(0x92, 0x99, 0xA8),
+            text_dim: Color32::from_rgb(0x5A, 0x62, 0x72),
+            text_faint: Color32::from_rgb(0x66, 0x6F, 0x7F),
             accent: Color32::from_rgb(0x2F, 0x6F, 0xDE),
             accent_text: Color32::from_rgb(0xFF, 0xFF, 0xFF),
 
@@ -201,6 +230,7 @@ impl Theme {
             bracket_match: Color32::from_rgb(0xC4, 0xE8, 0xCE),
             indent_guide: Color32::from_rgb(0xE3, 0xE6, 0xEC),
             indent_guide_active: Color32::from_rgb(0xBF, 0xC6, 0xD4),
+            minimap_viewport: Color32::from_rgb(0xBF, 0xC6, 0xD2),
 
             error: Color32::from_rgb(0xD1, 0x3A, 0x3A),
             warning: Color32::from_rgb(0xA8, 0x6A, 0x00),
@@ -216,8 +246,8 @@ impl Theme {
             syn_text: Color32::from_rgb(0x2A, 0x2E, 0x37),
             syn_keyword: Color32::from_rgb(0xA6, 0x2A, 0xA4),
             syn_string: Color32::from_rgb(0x2E, 0x7D, 0x32),
-            syn_comment: Color32::from_rgb(0x8C, 0x93, 0xA1),
-            syn_number: Color32::from_rgb(0xB5, 0x62, 0x00),
+            syn_comment: Color32::from_rgb(0x6A, 0x71, 0x80),
+            syn_number: Color32::from_rgb(0x9A, 0x54, 0x00),
             syn_function: Color32::from_rgb(0x2F, 0x6F, 0xDE),
             syn_type: Color32::from_rgb(0x0E, 0x74, 0x90),
             syn_variable: Color32::from_rgb(0x2A, 0x2E, 0x37),
@@ -255,7 +285,7 @@ impl Theme {
         v.faint_bg_color = self.hover;
         v.code_bg_color = self.input_bg;
         v.window_stroke = Stroke::new(1.0, self.border_strong);
-        v.window_corner_radius = CornerRadius::same(10);
+        v.window_corner_radius = CornerRadius::same(R_LG);
         v.window_shadow = egui::epaint::Shadow {
             offset: [0, 12],
             blur: 32,
@@ -279,31 +309,31 @@ impl Theme {
         v.widgets.noninteractive.weak_bg_fill = self.bg;
         v.widgets.noninteractive.bg_stroke = Stroke::NONE;
         v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, self.text);
-        v.widgets.noninteractive.corner_radius = CornerRadius::same(6);
+        v.widgets.noninteractive.corner_radius = CornerRadius::same(R_MD);
 
         v.widgets.inactive.bg_fill = Color32::TRANSPARENT;
         v.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
         v.widgets.inactive.bg_stroke = Stroke::new(1.0, self.border);
         v.widgets.inactive.fg_stroke = Stroke::new(1.0, self.text);
-        v.widgets.inactive.corner_radius = CornerRadius::same(6);
+        v.widgets.inactive.corner_radius = CornerRadius::same(R_MD);
 
         v.widgets.hovered.bg_fill = self.hover;
         v.widgets.hovered.weak_bg_fill = self.hover;
         v.widgets.hovered.bg_stroke = Stroke::new(1.0, self.border_strong);
         v.widgets.hovered.fg_stroke = Stroke::new(1.0, self.text);
-        v.widgets.hovered.corner_radius = CornerRadius::same(6);
+        v.widgets.hovered.corner_radius = CornerRadius::same(R_MD);
 
         v.widgets.active.bg_fill = self.active;
         v.widgets.active.weak_bg_fill = self.active;
         v.widgets.active.bg_stroke = Stroke::new(1.0, self.border_strong);
         v.widgets.active.fg_stroke = Stroke::new(1.0, self.text);
-        v.widgets.active.corner_radius = CornerRadius::same(6);
+        v.widgets.active.corner_radius = CornerRadius::same(R_MD);
 
         v.widgets.open.bg_fill = self.active;
         v.widgets.open.weak_bg_fill = self.active;
         v.widgets.open.bg_stroke = Stroke::new(1.0, self.border_strong);
         v.widgets.open.fg_stroke = Stroke::new(1.0, self.text);
-        v.widgets.open.corner_radius = CornerRadius::same(6);
+        v.widgets.open.corner_radius = CornerRadius::same(R_MD);
 
         style.visuals = v;
         style.animation_time = 0.10;
@@ -323,23 +353,23 @@ impl Theme {
 
         style.text_styles.insert(
             TextStyle::Body,
-            FontId::new(13.0, egui::FontFamily::Proportional),
+            FontId::new(T_BODY, egui::FontFamily::Proportional),
         );
         style.text_styles.insert(
             TextStyle::Button,
-            FontId::new(13.0, egui::FontFamily::Proportional),
+            FontId::new(T_BODY, egui::FontFamily::Proportional),
         );
         style.text_styles.insert(
             TextStyle::Small,
-            FontId::new(11.5, egui::FontFamily::Proportional),
+            FontId::new(T_SMALL, egui::FontFamily::Proportional),
         );
         style.text_styles.insert(
             TextStyle::Heading,
-            FontId::new(17.0, egui::FontFamily::Proportional),
+            FontId::new(T_EMPH, egui::FontFamily::Proportional),
         );
         style.text_styles.insert(
             TextStyle::Monospace,
-            FontId::new(13.0, egui::FontFamily::Monospace),
+            FontId::new(T_BODY, egui::FontFamily::Monospace),
         );
 
         let egui_theme = match self.kind {
@@ -372,5 +402,57 @@ impl Theme {
             TokenKind::Link => self.syn_link,
             TokenKind::Tag => self.syn_tag,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn channel_luminance(c: u8) -> f32 {
+        let s = c as f32 / 255.0;
+        if s <= 0.039_28 {
+            s / 12.92
+        } else {
+            ((s + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    /// WCAG 2.x relative luminance.
+    fn luminance(c: Color32) -> f32 {
+        0.2126 * channel_luminance(c.r())
+            + 0.7152 * channel_luminance(c.g())
+            + 0.0722 * channel_luminance(c.b())
+    }
+
+    fn contrast_ratio(a: Color32, b: Color32) -> f32 {
+        let (la, lb) = (luminance(a), luminance(b));
+        (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+    }
+
+    fn assert_text_contrast(theme: Theme) {
+        for (name, color) in [
+            ("text", theme.text),
+            ("text_dim", theme.text_dim),
+            ("text_faint", theme.text_faint),
+            ("syn_comment", theme.syn_comment),
+        ] {
+            let ratio = contrast_ratio(color, theme.bg);
+            assert!(
+                ratio >= 4.5,
+                "{:?} theme {name} contrast {ratio:.2}:1 is below the 4.5:1 WCAG AA floor",
+                theme.kind
+            );
+        }
+    }
+
+    #[test]
+    fn dark_theme_body_text_meets_wcag_aa() {
+        assert_text_contrast(Theme::dark());
+    }
+
+    #[test]
+    fn light_theme_body_text_meets_wcag_aa() {
+        assert_text_contrast(Theme::light());
     }
 }

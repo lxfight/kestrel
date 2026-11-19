@@ -12,6 +12,7 @@ use egui::{
 use crate::app::{KestrelApp, SidebarMode, ToastKind, TreeClipboard, TreeClipboardKind, TreeEditKind};
 use crate::git::GitFileStatus;
 use crate::icons::{self, Icon};
+use crate::ui::widgets;
 use crate::ui::UiStyle;
 
 impl KestrelApp {
@@ -303,8 +304,20 @@ impl KestrelApp {
                         .inner
                         .1;
                     let rect = resp.rect;
-                    if resp.hovered() {
+                    // Drag-capable row: pointer state stays on this response, so the
+                    // shared primitive's own interact would fight the drag handling.
+                    if is_selected || resp.is_pointer_button_down_on() {
+                        ui.painter().rect_filled(rect, 0.0, theme.active);
+                    } else if resp.hovered() {
                         ui.painter().rect_filled(rect, 0.0, theme.hover);
+                    }
+                    if resp.has_focus() {
+                        ui.painter().rect_stroke(
+                            rect.shrink(1.0),
+                            0.0,
+                            Stroke::new(1.0, theme.accent),
+                            egui::StrokeKind::Inside,
+                        );
                     }
                     if let Some(ref src) = dragging_tree_src
                         && row.is_dir
@@ -323,7 +336,6 @@ impl KestrelApp {
                         }
                     }
                     if is_selected {
-                        ui.painter().rect_filled(rect, 0.0, theme.active);
                         ui.painter().rect_filled(
                             Rect::from_min_size(
                                 Pos2::new(rect.left(), rect.top() + 3.0),
@@ -370,6 +382,7 @@ impl KestrelApp {
                         row.is_dir,
                         expanded,
                         theme.text_dim,
+                        theme.kind.is_dark(),
                     );
 
                     let git_status = if !row.is_dir {
@@ -428,13 +441,20 @@ impl KestrelApp {
                             edit_drawn = true;
                         }
                     } else {
-                        ui.painter().text(
-                            Pos2::new(rect.left() + indent + 34.0, rect.center().y),
-                            Align2::LEFT_CENTER,
-                            &row.name,
-                            style.small(),
+                        let name_max = (rect.right() - 22.0 - (rect.left() + indent + 34.0)).max(0.0);
+                        let (name_galley, name_cut) =
+                            widgets::ellipsize(ui, &row.name, style.small(), name_color, name_max);
+                        ui.painter().galley(
+                            Pos2::new(
+                                rect.left() + indent + 34.0,
+                                rect.center().y - name_galley.rect.height() * 0.5,
+                            ),
+                            name_galley,
                             name_color,
                         );
+                        if name_cut {
+                            resp.clone().on_hover_text(&row.name);
+                        }
                         // Dirty dot or Git status badge on the right
                         let is_dirty_tab = self
                             .tabs
@@ -1100,11 +1120,18 @@ impl KestrelApp {
                         }
                         let rect = resp.rect;
                         let is_active = *group_index == active_group && pos == *group_active;
-                        if resp.hovered() {
+                        if is_active || resp.is_pointer_button_down_on() {
+                            ui.painter().rect_filled(rect, 0.0, theme.active);
+                        } else if resp.hovered() {
                             ui.painter().rect_filled(rect, 0.0, theme.hover);
                         }
-                        if is_active {
-                            ui.painter().rect_filled(rect, 0.0, theme.active);
+                        if resp.has_focus() {
+                            ui.painter().rect_stroke(
+                                rect.shrink(1.0),
+                                0.0,
+                                Stroke::new(1.0, theme.accent),
+                                egui::StrokeKind::Inside,
+                            );
                         }
                         let icon_rect = Rect::from_center_size(
                             Pos2::new(rect.left() + 24.0, rect.center().y),
@@ -1126,6 +1153,7 @@ impl KestrelApp {
                                 false,
                                 false,
                                 theme.text_dim,
+                                theme.kind.is_dark(),
                             );
                         } else {
                             icons::file_glyph(
@@ -1141,13 +1169,25 @@ impl KestrelApp {
                         } else {
                             title
                         };
-                        ui.painter().text(
-                            Pos2::new(rect.left() + 38.0, rect.center().y),
-                            Align2::LEFT_CENTER,
+                        let label_color = if is_active { theme.text } else { theme.text_dim };
+                        let (label_galley, label_cut) = widgets::ellipsize(
+                            ui,
                             &label,
                             style.small(),
-                            if is_active { theme.text } else { theme.text_dim },
+                            label_color,
+                            (rect.width() - 74.0).max(0.0),
                         );
+                        ui.painter().galley(
+                            Pos2::new(
+                                rect.left() + 38.0,
+                                rect.center().y - label_galley.rect.height() * 0.5,
+                            ),
+                            label_galley,
+                            label_color,
+                        );
+                        if label_cut {
+                            resp.clone().on_hover_text(&label);
+                        }
                         if pinned {
                             icons::paint(
                                 ui.painter(),
@@ -1524,11 +1564,9 @@ impl KestrelApp {
                                 .unwrap_or_default()
                         });
                     let collapsed = self.workspace.search_panel.collapsed.contains(&result.path);
-                    let (rect, resp) = ui
-                        .allocate_exact_size(Vec2::new(ui.available_width(), 24.0), Sense::click());
-                    if resp.hovered() {
-                        ui.painter().rect_filled(rect, 0.0, theme.hover);
-                    }
+                    let (rect, _) = ui
+                        .allocate_exact_size(Vec2::new(ui.available_width(), 24.0), Sense::hover());
+                    let resp = widgets::paint_row(ui, rect, &theme, widgets::RowState::idle());
                     icons::paint(
                         ui.painter(),
                         Rect::from_center_size(
@@ -1553,14 +1591,27 @@ impl KestrelApp {
                         false,
                         false,
                         theme.text_dim,
+                        theme.kind.is_dark(),
                     );
-                    ui.painter().text(
-                        Pos2::new(rect.left() + 44.0, rect.center().y),
-                        Align2::LEFT_CENTER,
+                    let pill_space = (result.matches.len() as f32 * 6.5 + 40.0).max(40.0);
+                    let (rel_galley, rel_cut) = widgets::ellipsize(
+                        ui,
                         &rel,
                         style.small(),
                         theme.text,
+                        (rect.width() - 60.0 - pill_space).max(0.0),
                     );
+                    ui.painter().galley(
+                        Pos2::new(
+                            rect.left() + 44.0,
+                            rect.center().y - rel_galley.rect.height() * 0.5,
+                        ),
+                        rel_galley,
+                        theme.text,
+                    );
+                    if rel_cut {
+                        resp.clone().on_hover_text(&rel);
+                    }
                     let count = result.matches.len();
                     let count_label = if result.truncated {
                         format!("{count}+")
@@ -1588,13 +1639,11 @@ impl KestrelApp {
                         continue;
                     }
                     for m in result.matches.iter().take(40) {
-                        let (mrect, mresp) = ui.allocate_exact_size(
+                        let (mrect, _) = ui.allocate_exact_size(
                             Vec2::new(ui.available_width(), 22.0),
-                            Sense::click(),
+                            Sense::hover(),
                         );
-                        if mresp.hovered() {
-                            ui.painter().rect_filled(mrect, 0.0, theme.hover);
-                        }
+                        let mresp = widgets::paint_row(ui, mrect, &theme, widgets::RowState::idle());
                         ui.painter().text(
                             Pos2::new(mrect.left() + 32.0, mrect.center().y),
                             Align2::RIGHT_CENTER,
@@ -2258,6 +2307,7 @@ impl KestrelApp {
                                 false,
                                 false,
                                 theme.text_dim,
+                                theme.kind.is_dark(),
                             );
                             ui.painter().text(
                                 Pos2::new(row.left() + 34.0, row.center().y),
@@ -2383,6 +2433,7 @@ impl KestrelApp {
                             false,
                             false,
                             theme.text_dim,
+                            theme.kind.is_dark(),
                         );
                         let st_color = match item.status {
                             GitFileStatus::Modified => theme.git_modified,
