@@ -12,7 +12,7 @@ use egui::{
 use crate::app::{
     KestrelApp, SidebarMode, ToastKind, TreeClipboard, TreeClipboardKind, TreeEditKind,
 };
-use crate::git::GitFileStatus;
+use crate::git::{ConflictSide, GitFileStatus};
 use crate::workspace::FileTree;
 use crate::workspace::search::{SearchQuery, replace_match_at};
 use crate::icons::{self, Icon};
@@ -2228,45 +2228,78 @@ impl KestrelApp {
         let mut discard_all_now = false;
         let mut executed = false;
         let discard_armed = self.git.discard_confirm_armed();
+        // Remote sync state drives the header trio and the branch bar below.
+        let sync = self.git.sync_state();
+        let busy = sync.busy;
+        let publish = !busy && self.git.can_publish();
+        let mut fetch_now = false;
+        let mut pull_now = false;
+        let mut push_now = false;
+        let mut publish_now = false;
 
         {
             let (header, _) =
                 ui.allocate_exact_size(Vec2::new(ui.available_width(), 36.0), Sense::hover());
-            ui.painter().text(
-                Pos2::new(header.left() + 14.0, header.center().y),
-                Align2::LEFT_CENTER,
-                "源代码管理 (Git)",
-                style.font(11.5),
-                theme.text_dim,
-            );
+            // Right-aligned action cluster: 获取/拉取/推送（无上游时发布）, 丢弃, 暂存, 取消暂存, 刷新.
+            const PITCH: f32 = 20.0;
+            const ACTION_SLOTS: f32 = 7.0;
+            let actions_left = header.right() - 8.0 - PITCH * ACTION_SLOTS;
+            ui.painter()
+                .with_clip_rect(Rect::from_min_max(
+                    header.min,
+                    Pos2::new(actions_left - 6.0, header.max.y),
+                ))
+                .text(
+                    Pos2::new(header.left() + 14.0, header.center().y),
+                    Align2::LEFT_CENTER,
+                    "源代码管理 (Git)",
+                    style.font(11.5),
+                    theme.text_dim,
+                );
             let mut x = header.right() - 8.0;
-            let mut action = |ui: &mut Ui, icon: Icon, tip: &str, color: egui::Color32| -> bool {
-                x -= 24.0;
+            let mut action = |ui: &mut Ui,
+                              icon: Icon,
+                              tip: &str,
+                              color: egui::Color32,
+                              enabled: bool|
+             -> bool {
+                x -= PITCH;
                 let r = Rect::from_center_size(
-                    Pos2::new(x + 11.0, header.center().y),
-                    Vec2::splat(22.0),
+                    Pos2::new(x + PITCH * 0.5, header.center().y),
+                    Vec2::splat(18.0),
                 );
                 let resp = ui.interact(r, ui.scope_id().with(("git_act", tip)), Sense::click());
-                if resp.hovered() {
+                let hovered = enabled && resp.hovered();
+                if hovered {
                     ui.painter()
                         .rect_filled(r, CornerRadius::same(5), theme.hover);
                 }
                 icons::paint(
                     ui.painter(),
-                    r.shrink(4.0),
+                    r.shrink(3.0),
                     icon,
-                    if resp.hovered() { theme.text } else { color },
+                    if !enabled {
+                        theme.text_faint
+                    } else if hovered {
+                        theme.text
+                    } else {
+                        color
+                    },
                     1.2,
                 );
+                if !enabled {
+                    let _ = resp.on_hover_text(format!("{tip}（当前不可用）"));
+                    return false;
+                }
                 resp.on_hover_text(tip).clicked()
             };
-            if action(ui, Icon::Refresh, "刷新 Git 状态", theme.text_dim) {
+            if action(ui, Icon::Refresh, "刷新 Git 状态", theme.text_dim, true) {
                 refresh_git = true;
             }
-            if action(ui, Icon::Unstage, "取消暂存全部更改", theme.text_dim) {
+            if action(ui, Icon::Unstage, "取消暂存全部更改", theme.text_dim, true) {
                 unstage_all = true;
             }
-            if action(ui, Icon::Stage, "暂存全部更改 (git add -A)", theme.text_dim) {
+            if action(ui, Icon::Stage, "暂存全部更改 (git add -A)", theme.text_dim, true) {
                 stage_all = true;
             }
             let discard_tip = if discard_armed {
@@ -2279,13 +2312,58 @@ impl KestrelApp {
             } else {
                 theme.text_dim
             };
-            if action(ui, Icon::Discard, discard_tip, discard_color) {
+            if action(ui, Icon::Discard, discard_tip, discard_color, true) {
                 if discard_armed {
                     discard_all_now = true;
                 } else {
                     self.git.arm_discard_confirm();
                     ui.ctx()
                         .request_repaint_after(std::time::Duration::from_millis(3100));
+                }
+            }
+            if busy {
+                // A sync write is in flight: keep one dimmed glyph and say why.
+                let busy_x = header.right() - 8.0 - PITCH * 5.0;
+                let r = Rect::from_center_size(
+                    Pos2::new(busy_x + PITCH * 0.5, header.center().y),
+                    Vec2::splat(18.0),
+                );
+                let resp = ui
+                    .interact(r, ui.scope_id().with("git_sync_busy"), Sense::click())
+                    .on_hover_text("同步中…");
+                let _ = resp;
+                icons::paint(ui.painter(), r.shrink(3.0), Icon::Sync, theme.text_faint, 1.2);
+                ui.painter().text(
+                    Pos2::new(busy_x - 4.0, header.center().y),
+                    Align2::RIGHT_CENTER,
+                    "同步中…",
+                    style.tiny(),
+                    theme.warning,
+                );
+            } else {
+                let (push_tip, push_color, push_enabled) = if publish {
+                    ("发布当前分支到 origin", theme.accent, true)
+                } else {
+                    ("推送本地提交 (git push)", theme.text_dim, self.git.can_push())
+                };
+                if action(ui, Icon::ArrowUp, push_tip, push_color, push_enabled) {
+                    if publish {
+                        publish_now = true;
+                    } else {
+                        push_now = true;
+                    }
+                }
+                if action(
+                    ui,
+                    Icon::ArrowDown,
+                    "拉取远端更新 (git pull)",
+                    theme.text_dim,
+                    self.git.can_pull(),
+                ) {
+                    pull_now = true;
+                }
+                if action(ui, Icon::Sync, "获取远端更新 (git fetch)", theme.text_dim, true) {
+                    fetch_now = true;
                 }
             }
         }
@@ -2329,7 +2407,7 @@ impl KestrelApp {
 
         self.git.load_commits(&root);
 
-        // Branch bar: click toggles the inline branch panel.
+        // Branch bar: click toggles the inline branch panel; the right side mirrors sync_state().
         let branch_panel_open = self.git.branch_panel_open;
         {
             let (bar, resp) = ui.allocate_exact_size(
@@ -2349,31 +2427,49 @@ impl KestrelApp {
                 theme.accent,
                 1.2,
             );
+            let info = if busy {
+                "同步中…".to_string()
+            } else if !sync.upstream.is_empty() {
+                match (sync.ahead, sync.behind) {
+                    (0, 0) => sync.upstream.clone(),
+                    (ahead, 0) => format!("{} ↑{ahead}", sync.upstream),
+                    (0, behind) => format!("{} ↓{behind}", sync.upstream),
+                    (ahead, behind) => format!("{} ↑{ahead} ↓{behind}", sync.upstream),
+                }
+            } else if sync.ahead > 0 || sync.behind > 0 {
+                format!("↑{} ↓{}", sync.ahead, sync.behind)
+            } else if !sync.branch.is_empty() && sync.branch != "HEAD" {
+                "未关联远端".to_string()
+            } else {
+                String::new()
+            };
+            let info_color = if busy { theme.warning } else { theme.text_faint };
+            let info_width = if info.is_empty() {
+                0.0
+            } else {
+                ui.painter()
+                    .layout_no_wrap(info.clone(), style.tiny(), info_color)
+                    .size()
+                    .x
+            };
             let label_painter = ui.painter().with_clip_rect(Rect::from_min_max(
-                bar.min,
-                Pos2::new(bar.right() - 26.0, bar.max.y),
+                Pos2::new(bar.left() + 30.0, bar.top()),
+                Pos2::new(bar.right() - 30.0 - info_width, bar.bottom()),
             ));
-            let branch_galley = label_painter.layout_no_wrap(
-                self.git.snapshot.branch.clone(),
+            label_painter.text(
+                Pos2::new(bar.left() + 34.0, bar.center().y),
+                Align2::LEFT_CENTER,
+                sync.branch.as_str(),
                 style.small(),
                 theme.text,
             );
-            let branch_width = branch_galley.size().x;
-            label_painter.galley(
-                Pos2::new(bar.left() + 34.0, bar.center().y - branch_galley.size().y * 0.5),
-                branch_galley,
-                theme.text,
-            );
-            if self.git.snapshot.ahead > 0 || self.git.snapshot.behind > 0 {
+            if !info.is_empty() {
                 ui.painter().text(
-                    Pos2::new(bar.left() + 40.0 + branch_width, bar.center().y),
-                    Align2::LEFT_CENTER,
-                    format!(
-                        "↑{} ↓{}",
-                        self.git.snapshot.ahead, self.git.snapshot.behind
-                    ),
+                    Pos2::new(bar.right() - 28.0, bar.center().y),
+                    Align2::RIGHT_CENTER,
+                    info,
                     style.tiny(),
-                    theme.text_faint,
+                    info_color,
                 );
             }
             icons::paint(
@@ -2584,6 +2680,68 @@ impl KestrelApp {
             ui.add_space(4.0);
         }
 
+        // Conflict banner: resolve every unmerged path with one side.
+        let mut resolve_all: Option<ConflictSide> = None;
+        if !self.git.snapshot.conflicts.is_empty() {
+            let (banner, _) =
+                ui.allocate_exact_size(Vec2::new(ui.available_width(), 26.0), Sense::hover());
+            ui.painter()
+                .rect_filled(banner, 0.0, theme.git_deleted.gamma_multiply(0.16));
+            let mut x = banner.right() - 10.0;
+            let mut side_button =
+                |ui: &mut Ui, label: &str, side: ConflictSide| -> Option<ConflictSide> {
+                    let width = ui
+                        .painter()
+                        .layout_no_wrap(label.to_string(), style.tiny(), theme.text)
+                        .size()
+                        .x
+                        + 16.0;
+                    x -= width;
+                    let rect = Rect::from_center_size(
+                        Pos2::new(x + width * 0.5, banner.center().y),
+                        Vec2::new(width, 20.0),
+                    );
+                    let resp = ui.interact(
+                        rect,
+                        ui.scope_id().with(("git_resolve_all", label)),
+                        Sense::click(),
+                    );
+                    if resp.hovered() {
+                        ui.painter().rect_filled(
+                            rect,
+                            CornerRadius::same(4),
+                            theme.git_deleted.gamma_multiply(0.35),
+                        );
+                    }
+                    ui.painter().text(
+                        rect.center(),
+                        Align2::CENTER_CENTER,
+                        label,
+                        style.tiny(),
+                        theme.text,
+                    );
+                    resp.clicked().then_some(side)
+                };
+            if side_button(ui, "对方的", ConflictSide::Theirs).is_some() {
+                resolve_all = Some(ConflictSide::Theirs);
+            }
+            if side_button(ui, "我的", ConflictSide::Ours).is_some() {
+                resolve_all = Some(ConflictSide::Ours);
+            }
+            ui.painter()
+                .with_clip_rect(Rect::from_min_max(
+                    banner.min,
+                    Pos2::new(x - 8.0, banner.max.y),
+                ))
+                .text(
+                    Pos2::new(banner.left() + 12.0, banner.center().y),
+                    Align2::LEFT_CENTER,
+                    "解决全部冲突：",
+                    style.tiny(),
+                    theme.git_deleted,
+                );
+        }
+
         // Commit message + amend + commit button.
         let mut do_commit = false;
         let mut pick_message: Option<String> = None;
@@ -2782,6 +2940,8 @@ impl KestrelApp {
         let mut arm_group_discard = false;
         let mut toggle_commit: Option<String> = None;
         let mut open_commit_file: Option<(String, String)> = None;
+        let mut resolve_conflict_now: Option<(PathBuf, ConflictSide)> = None;
+        let mut load_more_now = false;
         let mut stash_save_now = false;
         let mut stash_pop: Option<usize> = None;
         let mut stash_drop: Option<usize> = None;
@@ -3044,14 +3204,57 @@ impl KestrelApp {
                                 ui.ctx().copy_text(item.rel_path.clone());
                                 ui.close();
                             }
+                            if item.conflict.is_some() {
+                                ui.separator();
+                                if Self::context_item(ui, style, Icon::Check, "使用我的版本", None) {
+                                    resolve_conflict_now =
+                                        Some((item.path.clone(), ConflictSide::Ours));
+                                    ui.close();
+                                }
+                                if Self::context_item(
+                                    ui,
+                                    style,
+                                    Icon::Check,
+                                    "使用对方的版本",
+                                    None,
+                                ) {
+                                    resolve_conflict_now =
+                                        Some((item.path.clone(), ConflictSide::Theirs));
+                                    ui.close();
+                                }
+                            }
                         });
-                        ui.painter().text(
-                            Pos2::new(row.right() - 10.0, row.center().y),
-                            Align2::RIGHT_CENTER,
-                            item.status.badge(),
-                            style.tiny(),
-                            st_color,
-                        );
+                        match item.conflict {
+                            Some(kind) => {
+                                let badge = Rect::from_center_size(
+                                    Pos2::new(row.right() - 13.0, row.center().y),
+                                    Vec2::splat(14.0),
+                                );
+                                icons::paint(
+                                    ui.painter(),
+                                    badge,
+                                    Icon::Warning,
+                                    theme.git_deleted,
+                                    1.2,
+                                );
+                                ui.interact(
+                                    badge,
+                                    ui.scope_id()
+                                        .with(("git_conflict_badge", item.rel_path.as_str())),
+                                    Sense::hover(),
+                                )
+                                .on_hover_text(format!("冲突：{}", kind.label()));
+                            }
+                            None => {
+                                ui.painter().text(
+                                    Pos2::new(row.right() - 10.0, row.center().y),
+                                    Align2::RIGHT_CENTER,
+                                    item.status.badge(),
+                                    style.tiny(),
+                                    st_color,
+                                );
+                            }
+                        }
                     }
                 }
 
@@ -3395,6 +3598,49 @@ impl KestrelApp {
                         }
                         ui.add_space(2.0);
                     }
+                    if self.git.commits_loading_more() {
+                        ui.horizontal(|ui| {
+                            ui.add_space(24.0);
+                            ui.label(
+                                egui::RichText::new("加载中…")
+                                    .font(style.tiny())
+                                    .color(theme.text_faint),
+                            );
+                        });
+                        ui.add_space(4.0);
+                    } else if !commits.is_empty() && self.git.has_more_commits() {
+                        let (row, row_resp) = ui.allocate_exact_size(
+                            Vec2::new(ui.available_width(), 24.0),
+                            Sense::click(),
+                        );
+                        if row_resp.hovered() {
+                            ui.painter().rect_filled(row, 0.0, theme.hover);
+                        }
+                        icons::paint(
+                            ui.painter(),
+                            Rect::from_center_size(
+                                Pos2::new(row.left() + 14.0, row.center().y),
+                                Vec2::splat(10.0),
+                            ),
+                            Icon::ChevronDown,
+                            theme.text_faint,
+                            1.2,
+                        );
+                        ui.painter().text(
+                            Pos2::new(row.left() + 24.0, row.center().y),
+                            Align2::LEFT_CENTER,
+                            "加载更多",
+                            style.tiny(),
+                            if row_resp.hovered() {
+                                theme.text
+                            } else {
+                                theme.text_dim
+                            },
+                        );
+                        if row_resp.clicked() {
+                            load_more_now = true;
+                        }
+                    }
                 });
         }
 
@@ -3544,6 +3790,34 @@ impl KestrelApp {
                 Ok(msg) => self.toast(msg, ToastKind::Success),
                 Err(err) => self.toast(err, ToastKind::Warning),
             }
+            executed = true;
+        }
+        if fetch_now {
+            self.git.fetch(&root);
+            executed = true;
+        }
+        if pull_now {
+            let _ = self.git.pull(&root);
+            executed = true;
+        }
+        if push_now {
+            let _ = self.git.push(&root);
+            executed = true;
+        }
+        if publish_now {
+            let _ = self.git.publish_branch(&root);
+            executed = true;
+        }
+        if let Some(side) = resolve_all {
+            self.git.resolve_all_conflicts(&root, side);
+            executed = true;
+        }
+        if let Some((path, side)) = resolve_conflict_now {
+            self.git.resolve_conflict(&root, &path, side);
+            executed = true;
+        }
+        if load_more_now {
+            self.git.load_more_commits(&root);
             executed = true;
         }
 
