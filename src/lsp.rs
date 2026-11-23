@@ -221,14 +221,24 @@ fn walk_analysis(
         } else {
             format!("语法错误: 意外的 `{snippet}`")
         };
+        let line_start_byte = node.start_byte().saturating_sub(start_pos.column);
+        let start_col = text
+            .get(line_start_byte..node.start_byte())
+            .map(|s| s.chars().count())
+            .unwrap_or(start_pos.column);
+        let end_col = if end_pos.row == start_pos.row {
+            let ec = text
+                .get(line_start_byte..node.end_byte())
+                .map(|s| s.chars().count())
+                .unwrap_or(end_pos.column);
+            ec.max(start_col + 1)
+        } else {
+            start_col + snippet.chars().count().max(1)
+        };
         diagnostics.push(Diagnostic {
             line: start_pos.row,
-            col: start_pos.column,
-            end_col: if end_pos.row == start_pos.row {
-                end_pos.column.max(start_pos.column + 1)
-            } else {
-                start_pos.column + snippet.len().max(1)
-            },
+            col: start_col,
+            end_col,
             start_byte: node.start_byte(),
             end_byte: node.end_byte().max(node.start_byte() + 1),
             severity: DiagSeverity::Error,
@@ -622,10 +632,16 @@ fn run_stdio_formatter(program: &str, args: &[&str], input: &str) -> Option<Stri
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
     let mut child = cmd.spawn().ok()?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(input.as_bytes()).ok()?;
-    }
+    let writer = child.stdin.take().map(|mut stdin| {
+        let payload = input.as_bytes().to_vec();
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&payload);
+        })
+    });
     let output = child.wait_with_output().ok()?;
+    if let Some(handle) = writer {
+        let _ = handle.join();
+    }
     if output.status.success() && !output.stdout.is_empty() {
         String::from_utf8(output.stdout).ok().map(|s| s.replace("\r\n", "\n"))
     } else {

@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// One visible line of the tree.
 #[derive(Clone, Debug)]
@@ -16,9 +17,12 @@ pub struct FileRow {
 pub struct FileTree {
     root: Option<PathBuf>,
     expanded: HashSet<PathBuf>,
-    /// Cached directory listings: sorted (name, is_dir, is_symlink).
+    /// Cached directory listings: sorted (name, is_dir).
     dirs: HashMap<PathBuf, Vec<(String, bool)>>,
     pub show_hidden: bool,
+    cached_rows: Arc<[FileRow]>,
+    cached_show_hidden: bool,
+    rows_dirty: bool,
 }
 
 impl FileTree {
@@ -28,6 +32,9 @@ impl FileTree {
             expanded: HashSet::new(),
             dirs: HashMap::new(),
             show_hidden: false,
+            cached_rows: Arc::from(Vec::new()),
+            cached_show_hidden: false,
+            rows_dirty: true,
         }
     }
 
@@ -37,6 +44,7 @@ impl FileTree {
         self.expanded.clear();
         self.dirs.clear();
         self.expanded.insert(root);
+        self.rows_dirty = true;
     }
 
     pub fn is_expanded(&self, path: &Path) -> bool {
@@ -44,19 +52,23 @@ impl FileTree {
     }
 
     pub fn expand(&mut self, path: &Path) {
-        self.expanded.insert(path.to_path_buf());
+        if self.expanded.insert(path.to_path_buf()) {
+            self.rows_dirty = true;
+        }
     }
 
     pub fn toggle_dir(&mut self, path: &Path) {
         if !self.expanded.remove(path) {
             self.expanded.insert(path.to_path_buf());
         }
+        self.rows_dirty = true;
     }
 
     /// Collapse all expanded subdirectories; if none are expanded, collapse the root directory itself.
     pub fn collapse_all(&mut self) {
         let Some(root) = self.root.clone() else {
             self.expanded.clear();
+            self.rows_dirty = true;
             return;
         };
         let has_subdirs = self.expanded.iter().any(|p| p != &root);
@@ -64,16 +76,26 @@ impl FileTree {
         if has_subdirs {
             self.expanded.insert(root);
         }
+        self.rows_dirty = true;
     }
 
-    /// Flattened list of currently visible rows, loading directory listings on demand.
-    pub fn rows(&mut self) -> Vec<FileRow> {
+    /// Flattened list of currently visible rows, cached across frames until mutated.
+    pub fn rows(&mut self) -> Arc<[FileRow]> {
+        if self.cached_show_hidden != self.show_hidden {
+            self.cached_show_hidden = self.show_hidden;
+            self.dirs.clear();
+            self.rows_dirty = true;
+        }
+        if !self.rows_dirty {
+            return Arc::clone(&self.cached_rows);
+        }
         let mut out = Vec::new();
-        let Some(root) = self.root.clone() else {
-            return out;
-        };
-        self.walk(&root, 0, &mut out);
-        out
+        if let Some(root) = self.root.clone() {
+            self.walk(&root, 0, &mut out);
+        }
+        self.cached_rows = Arc::from(out);
+        self.rows_dirty = false;
+        Arc::clone(&self.cached_rows)
     }
 
     fn walk(&mut self, dir: &Path, depth: usize, out: &mut Vec<FileRow>) {
@@ -111,18 +133,16 @@ impl FileTree {
                     continue;
                 };
 
-                let is_dir = entry
-                    .metadata()
-                    .map(|m| m.is_dir())
-                    .unwrap_or(file_type.is_dir());
+                // Avoid an extra stat syscall on regular files/dirs; only follow symlinks.
+                let is_dir = if file_type.is_symlink() {
+                    entry.metadata().map(|m| m.is_dir()).unwrap_or(false)
+                } else {
+                    file_type.is_dir()
+                };
                 entries.push((name, is_dir));
             }
         }
-        entries.sort_by(|a, b| match (a.1, b.1) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => a.0.to_lowercase().cmp(&b.0.to_lowercase()),
-        });
+        entries.sort_by_cached_key(|(name, is_dir)| (!*is_dir, name.to_lowercase()));
         self.dirs.insert(dir.to_path_buf(), entries.clone());
         entries
     }
@@ -130,10 +150,12 @@ impl FileTree {
     /// Drop cached listings so the next paint re-reads the disk.
     pub fn reload(&mut self) {
         self.dirs.clear();
+        self.rows_dirty = true;
     }
 
     pub fn reload_dir(&mut self, dir: &Path) {
         self.dirs.remove(dir);
+        self.rows_dirty = true;
     }
 }
 
@@ -331,6 +353,29 @@ mod tests {
         assert!(moved.exists());
 
         assert!(copy_path_to_dir(&base.join("sub"), &base.join("sub")).is_err());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn rows_cache_reuses_arc_until_mutated() {
+        let base = std::env::temp_dir().join(format!("kestrel_tree_cache_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("sub")).unwrap();
+        std::fs::write(base.join("a.txt"), "hello").unwrap();
+        std::fs::write(base.join("sub/b.txt"), "world").unwrap();
+
+        let mut tree = FileTree::new();
+        tree.set_root(base.clone());
+        let r1 = tree.rows();
+        let r2 = tree.rows();
+        assert!(std::sync::Arc::ptr_eq(&r1, &r2));
+        assert_eq!(r1.len(), 2);
+
+        tree.expand(&base.join("sub"));
+        let r3 = tree.rows();
+        assert!(!std::sync::Arc::ptr_eq(&r1, &r3));
+        assert_eq!(r3.len(), 3);
+
         let _ = std::fs::remove_dir_all(&base);
     }
 }

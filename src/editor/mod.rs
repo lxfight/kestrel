@@ -6,12 +6,12 @@ pub mod syntax;
 pub mod view;
 
 use std::collections::HashSet;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use egui::FontFamily;
 
 use crate::doc::{Document, EditKind, Encoding, Eol, SaveOutcome};
-use crate::git::{LineDiffKind, compute_line_diff};
+use crate::git::LineDiffKind;
 use crate::highlight::{Language, Span, TokenKind};
 use crate::lsp::{CompletionItem, Diagnostic, OutlineSymbol};
 use crate::theme::Theme;
@@ -122,9 +122,11 @@ pub struct Editor {
     /// Preview tabs are reused on single-click in Explorer until edited or pinned.
     pub preview: bool,
     pub pinned: bool,
-    /// Synced from settings on every paint.
+    /// Synced from settings on every paint (or overridden by `detected_indent`).
     pub tab_size: usize,
     pub insert_spaces: bool,
+    /// Per-file indentation detected on load when `settings.detect_indentation` is on.
+    pub detected_indent: Option<(usize, bool)>,
     pub autocomplete_enabled: bool,
     /// Mirrors `Settings::auto_close_pairs`; off inserts brackets literally.
     pub auto_close: bool,
@@ -152,6 +154,10 @@ pub struct Editor {
     line_map: LineMap,
     fold_index: FoldIndex,
     fold_rev: u64,
+    /// Per-visible-row wrapped heights and prefix Y offsets (only populated when `word_wrap` is on).
+    wrap_heights: Vec<f32>,
+    wrap_y: Vec<f32>,
+    wrap_key: (u64, u64, u32, u32),
     /// Height of the sticky-scroll header currently covering the top of the canvas.
     sticky_h: f32,
     minimap_cache: MinimapCache,
@@ -378,6 +384,7 @@ impl Editor {
             pinned: false,
             tab_size: 4,
             insert_spaces: true,
+            detected_indent: None,
             autocomplete_enabled: true,
             auto_close: true,
             galleys: std::collections::HashMap::new(),
@@ -394,6 +401,9 @@ impl Editor {
             line_map: LineMap::default(),
             fold_index: FoldIndex::default(),
             fold_rev: 0,
+            wrap_heights: Vec::new(),
+            wrap_y: Vec::new(),
+            wrap_key: (0, 0, 0, 0),
             sticky_h: 0.0,
             minimap_cache: MinimapCache::default(),
             char_w: 8.0,
@@ -453,6 +463,103 @@ impl Editor {
 
     pub fn invalidate_layout(&mut self) {
         self.galleys.clear();
+        self.wrap_key = (0, 0, 0, 0);
+    }
+
+    /// Delay until this tab needs another frame for in-flight or debounced syntax work.
+    pub fn syntax_wakeup_after(&self) -> Option<Duration> {
+        if self.syntax.is_busy() {
+            return Some(Duration::from_millis(50));
+        }
+        self.syntax_due.map(|due| {
+            due.saturating_duration_since(Instant::now())
+                .max(Duration::from_millis(1))
+        })
+    }
+
+    /// Effective `(tab_size, insert_spaces)` for this buffer, honoring detected indentation when enabled.
+    pub fn effective_indent(
+        &self,
+        default_tab_size: usize,
+        default_insert_spaces: bool,
+        detect_enabled: bool,
+    ) -> (usize, bool) {
+        if detect_enabled
+            && let Some((tab_size, insert_spaces)) = self.detected_indent
+        {
+            return (tab_size.max(1), insert_spaces);
+        }
+        (default_tab_size.max(1), default_insert_spaces)
+    }
+
+    /// Inspect the leading whitespace of the first ~200 lines to detect tabs vs 2/4 spaces.
+    pub fn detect_indentation(&mut self) {
+        let mut tab_lines = 0usize;
+        let mut space_lines = 0usize;
+        let mut two_space_diffs = 0usize;
+        let mut four_space_diffs = 0usize;
+        let mut prev_spaces = 0usize;
+        let limit = self.doc.line_count().min(200);
+        for line in 0..limit {
+            let content = self.doc.line_content(line);
+            if content.trim().is_empty() {
+                continue;
+            }
+            if content.starts_with('\t') {
+                tab_lines += 1;
+                prev_spaces = 0;
+            } else {
+                let spaces = content.bytes().take_while(|&b| b == b' ').count();
+                if spaces >= 2 {
+                    space_lines += 1;
+                    let diff = spaces.abs_diff(prev_spaces);
+                    if diff == 2 || (spaces % 2 == 0 && spaces % 4 != 0) {
+                        two_space_diffs += 1;
+                    } else if diff == 4 || (spaces >= 4 && spaces % 4 == 0) {
+                        four_space_diffs += 1;
+                    }
+                }
+                prev_spaces = spaces;
+            }
+        }
+        if tab_lines > space_lines && tab_lines >= 2 {
+            self.detected_indent = Some((self.tab_size.max(1), false));
+            self.insert_spaces = false;
+        } else if space_lines >= 2 {
+            let size = if two_space_diffs > four_space_diffs {
+                2
+            } else {
+                4
+            };
+            self.detected_indent = Some((size, true));
+            self.tab_size = size;
+            self.insert_spaces = true;
+        }
+    }
+
+    /// Reload the underlying document from disk and resync cursors, folds,
+    /// syntax tree, and layout caches cleanly.
+    pub fn reload(&mut self) -> std::io::Result<()> {
+        self.doc.reload()?;
+        let len = self.doc.len_chars();
+        self.caret = self.caret.min(len);
+        self.anchor = self.anchor.min(len);
+        self.extra_cursors.clear();
+        self.completion.open = false;
+        self.ime_preedit.clear();
+        self.ime_active_range = None;
+        self.syntax.reset(self.language);
+        self.spans.clear();
+        self.spans_version = 0;
+        self.diagnostics.clear();
+        self.folds.clear();
+        self.folded_lines.clear();
+        self.fold_rev += 1;
+        self.diff_version = 0;
+        self.syntax_due = Some(Instant::now());
+        self.invalidate_layout();
+        self.refresh_find_matches();
+        Ok(())
     }
 
     // ---------------------------------------------------------------------
@@ -991,7 +1098,7 @@ impl Editor {
         let end = self.caret;
         self.completion.open = false;
         let before = (self.caret, self.anchor);
-        let after_pos = (start + insert.chars().count()).min(self.doc.len_chars());
+        let after_pos = start + insert.chars().count();
         let sed = self.doc.edit(
             start,
             end,
@@ -1001,8 +1108,8 @@ impl Editor {
             (after_pos, after_pos),
         );
         self.syntax.apply_edit(sed);
-        self.caret = after_pos;
-        self.anchor = after_pos;
+        self.caret = after_pos.min(self.doc.len_chars());
+        self.anchor = self.caret;
         self.after_edit();
         true
     }
@@ -1083,7 +1190,7 @@ impl Editor {
         let clamped_col = target_col.min(self.doc.line_char_len(target_line));
         let target = self.doc.line_col_to_char(target_line, clamped_col);
         self.set_caret(target, extend);
-        self.desired_col = Some(clamped_col);
+        self.desired_col = Some(target_col);
     }
 
     pub fn move_home(&mut self, extend: bool) {
@@ -1127,6 +1234,9 @@ impl Editor {
         kind: EditKind,
         caret_after_override: Option<usize>,
     ) -> bool {
+        if self.doc.readonly {
+            return false;
+        }
         if !self.extra_cursors.is_empty() {
             return self.replace_multi_cursors(text);
         }
@@ -1360,6 +1470,11 @@ impl Editor {
             return;
         }
         self.completion.open = false;
+        if !self.extra_cursors.is_empty() {
+            self.replace_multi_cursors("\n");
+            self.refresh_find_matches();
+            return;
+        }
         if self.has_selection() {
             self.replace_selection("", EditKind::Other, None);
         }
@@ -1380,7 +1495,7 @@ impl Editor {
         let next_char = self.doc.char_at(self.caret);
         let closing_next = next_char.is_some_and(|c| matches!(c, '}' | ')' | ']'));
 
-        let extra = if opens_block || closing_next {
+        let extra = if opens_block {
             if self.doc.line_indent(line).contains('\t') {
                 "\t".to_string()
             } else {
@@ -1539,6 +1654,54 @@ impl Editor {
             return;
         }
         self.completion.open = false;
+        if !self.extra_cursors.is_empty() {
+            let any_sel = self.has_selection() || self.extra_cursors.iter().any(|(c, a)| c != a);
+            if any_sel {
+                self.replace_multi_cursors("");
+            } else {
+                let doc_len = self.doc.len_chars();
+                let mut all = Vec::with_capacity(self.extra_cursors.len() + 1);
+                all.push((self.caret, true));
+                for &(c, _) in &self.extra_cursors {
+                    all.push((c, false));
+                }
+                all.sort_by_key(|(c, _)| *c);
+                let edits: Vec<(usize, usize, String)> = all
+                    .iter()
+                    .filter(|(c, _)| *c < doc_len)
+                    .map(|(c, _)| (*c, c + 1, String::new()))
+                    .collect();
+                if !edits.is_empty() {
+                    let before = (self.caret, self.anchor);
+                    let mut delta = 0usize;
+                    let mut new_extras = Vec::new();
+                    let mut primary_after = self.caret;
+                    for (c, is_primary) in all {
+                        let new_c = c.saturating_sub(delta);
+                        if c < doc_len {
+                            delta += 1;
+                        }
+                        if is_primary {
+                            primary_after = new_c;
+                        } else {
+                            new_extras.push((new_c, new_c));
+                        }
+                    }
+                    let seds = self
+                        .doc
+                        .edit_many(&edits, before, (primary_after, primary_after));
+                    for sed in seds {
+                        self.syntax.apply_edit(sed);
+                    }
+                    self.caret = primary_after.min(self.doc.len_chars());
+                    self.anchor = self.caret;
+                    self.extra_cursors = new_extras;
+                    self.after_edit();
+                }
+            }
+            self.refresh_find_matches();
+            return;
+        }
         if self.has_selection() {
             self.replace_selection("", EditKind::Other, None);
             self.refresh_find_matches();
@@ -1566,6 +1729,64 @@ impl Editor {
             return;
         }
         self.completion.open = false;
+        if !self.extra_cursors.is_empty() {
+            let mut all = Vec::with_capacity(self.extra_cursors.len() + 1);
+            all.push((self.caret, self.anchor, true));
+            for &(c, a) in &self.extra_cursors {
+                all.push((c, a, false));
+            }
+            all.sort_by_key(|(c, a, _)| (*c).min(*a));
+            let mut ranges: Vec<(usize, usize, bool)> = Vec::with_capacity(all.len());
+            for (c, a, is_primary) in all {
+                let (s, e) = if c != a {
+                    (c.min(a), c.max(a))
+                } else if backward {
+                    (self.prev_word(c), c)
+                } else {
+                    (c, self.next_word(c))
+                };
+                if let Some(last) = ranges.last_mut()
+                    && s <= last.1
+                {
+                    last.1 = last.1.max(e);
+                    last.2 |= is_primary;
+                } else {
+                    ranges.push((s, e, is_primary));
+                }
+            }
+            let edits: Vec<(usize, usize, String)> = ranges
+                .iter()
+                .filter(|(s, e, _)| s < e)
+                .map(|(s, e, _)| (*s, *e, String::new()))
+                .collect();
+            if !edits.is_empty() {
+                let before = (self.caret, self.anchor);
+                let mut delta = 0usize;
+                let mut primary_after = self.caret;
+                let mut new_extras = Vec::new();
+                for (s, e, is_primary) in ranges {
+                    let pos = s.saturating_sub(delta);
+                    delta += e - s;
+                    if is_primary {
+                        primary_after = pos;
+                    } else {
+                        new_extras.push((pos, pos));
+                    }
+                }
+                let seds = self
+                    .doc
+                    .edit_many(&edits, before, (primary_after, primary_after));
+                for sed in seds {
+                    self.syntax.apply_edit(sed);
+                }
+                self.caret = primary_after.min(self.doc.len_chars());
+                self.anchor = self.caret;
+                self.extra_cursors = new_extras;
+                self.after_edit();
+                self.refresh_find_matches();
+            }
+            return;
+        }
         if self.has_selection() {
             self.replace_selection("", EditKind::Other, None);
             self.refresh_find_matches();
@@ -1659,14 +1880,18 @@ impl Editor {
             clamp(&self.doc, anchor_line, anchor_col as isize)
         };
         self.anchor = new_anchor_line;
+        if let Some(last_undo) = self.doc.undo.last_mut() {
+            last_undo.after = (self.caret, self.anchor);
+        }
         self.after_edit();
     }
 
-    fn comment_prefix(&self) -> &'static str {
+    fn comment_delimiters(&self) -> (&'static str, &'static str) {
         match self.language {
-            Language::Python | Language::Bash | Language::Yaml | Language::Toml => "# ",
-            Language::Html | Language::Markdown => "<!-- ",
-            _ => "// ",
+            Language::Python | Language::Bash | Language::Yaml | Language::Toml => ("# ", ""),
+            Language::Html | Language::Markdown => ("<!-- ", " -->"),
+            Language::Css => ("/* ", " */"),
+            _ => ("// ", ""),
         }
     }
 
@@ -1675,14 +1900,16 @@ impl Editor {
             return;
         }
         let (first, last) = self.selected_lines();
-        let prefix = self.comment_prefix();
+        let (prefix, suffix) = self.comment_delimiters();
+        let prefix_bare = prefix.trim_end();
+        let suffix_bare = suffix.trim_start();
         let all_commented = (first..=last)
             .filter(|line| !self.doc.line_content(*line).trim().is_empty())
             .all(|line| {
-                self.doc
-                    .line_content(line)
-                    .trim_start()
-                    .starts_with(prefix.trim_end())
+                let content = self.doc.line_content(line);
+                let trimmed = content.trim();
+                trimmed.starts_with(prefix_bare)
+                    && (suffix_bare.is_empty() || trimmed.ends_with(suffix_bare))
             });
         let mut edits: Vec<(usize, usize, String)> = Vec::new();
         for line in first..=last {
@@ -1691,15 +1918,17 @@ impl Editor {
                 continue;
             }
             let indent_len = content.len() - content.trim_start().len();
-            let start = self.doc.line_to_char(line) + content[..indent_len].chars().count();
+            let line_start = self.doc.line_to_char(line);
+            let start = line_start + content[..indent_len].chars().count();
+            let trimmed_right_end = line_start + content.trim_end().chars().count();
             if all_commented {
                 let rest = &content[indent_len..];
                 let trimmed = rest.trim_start();
-                if trimmed.starts_with(prefix.trim_end()) {
+                if trimmed.starts_with(prefix_bare) {
                     let remove_len = if trimmed.starts_with(prefix) {
                         prefix.len()
                     } else {
-                        prefix.trim_end().len()
+                        prefix_bare.len()
                     };
                     edits.push((
                         start,
@@ -1707,19 +1936,59 @@ impl Editor {
                         String::new(),
                     ));
                 }
+                if !suffix_bare.is_empty() {
+                    let trimmed_r = content.trim_end();
+                    if trimmed_r.ends_with(suffix_bare) {
+                        let remove_bytes = if trimmed_r.ends_with(suffix) {
+                            suffix.len()
+                        } else {
+                            suffix_bare.len()
+                        };
+                        let remove_chars =
+                            trimmed_r[trimmed_r.len() - remove_bytes..].chars().count();
+                        edits.push((
+                            trimmed_right_end.saturating_sub(remove_chars),
+                            trimmed_right_end,
+                            String::new(),
+                        ));
+                    }
+                }
             } else {
                 edits.push((start, start, prefix.to_string()));
+                if !suffix.is_empty() {
+                    edits.push((trimmed_right_end, trimmed_right_end, suffix.to_string()));
+                }
             }
         }
         if edits.is_empty() {
             return;
         }
+        let (caret_line, caret_col) = self.doc.char_to_line_col(self.caret);
+        let (anchor_line, anchor_col) = self.doc.char_to_line_col(self.anchor);
         let before = (self.caret, self.anchor);
         let syntax_edits = self
             .doc
             .edit_many(&edits, before, (self.caret, self.anchor));
         for se in syntax_edits {
             self.syntax.apply_edit(se);
+        }
+        let shift = if all_commented {
+            -(prefix.chars().count() as isize)
+        } else {
+            prefix.chars().count() as isize
+        };
+        let clamp = |doc: &Document, line: usize, col: usize| -> usize {
+            let new_col = (col as isize + shift).max(0) as usize;
+            doc.line_col_to_char(line, new_col.min(doc.line_char_len(line)))
+        };
+        self.caret = clamp(&self.doc, caret_line, caret_col);
+        self.anchor = if before.0 == before.1 {
+            self.caret
+        } else {
+            clamp(&self.doc, anchor_line, anchor_col)
+        };
+        if let Some(last_undo) = self.doc.undo.last_mut() {
+            last_undo.after = (self.caret, self.anchor);
         }
         self.after_edit();
         self.refresh_find_matches();
@@ -1735,16 +2004,17 @@ impl Editor {
         let block = self.doc.text_range(start, end);
         let inserted = format!("\n{block}");
         let before = (self.caret, self.anchor);
+        let after_caret = self.caret + inserted.chars().count();
         let syntax_edit = self.doc.edit(
             end,
             end,
             &inserted,
             EditKind::Other,
             before,
-            (self.caret, self.anchor),
+            (after_caret, after_caret),
         );
         self.syntax.apply_edit(syntax_edit);
-        self.caret += inserted.chars().count();
+        self.caret = after_caret.min(self.doc.len_chars());
         self.anchor = self.caret;
         self.after_edit();
         self.ensure_visible = true;
@@ -1832,17 +2102,26 @@ impl Editor {
             new_anchor_line,
             anchor_col.min(self.doc.line_char_len(new_anchor_line)),
         );
+        if let Some(last_undo) = self.doc.undo.last_mut() {
+            last_undo.after = (self.caret, self.anchor);
+        }
         self.after_edit();
         self.ensure_visible = true;
     }
 
     pub fn undo(&mut self) {
+        if self.doc.readonly {
+            return;
+        }
         if let Some((caret, anchor)) = self.doc.undo() {
             self.restore_after_history(caret, anchor);
         }
     }
 
     pub fn redo(&mut self) {
+        if self.doc.readonly {
+            return;
+        }
         if let Some((caret, anchor)) = self.doc.redo() {
             self.restore_after_history(caret, anchor);
         }
@@ -1920,6 +2199,9 @@ impl Editor {
         if let Some(start) = first_start {
             self.caret = start.min(self.doc.len_chars());
             self.anchor = self.caret;
+            if let Some(last_undo) = self.doc.undo.last_mut() {
+                last_undo.after = (self.caret, self.anchor);
+            }
         }
         self.after_edit();
         self.recompute_find();
@@ -2088,6 +2370,9 @@ impl Editor {
     }
 
     pub fn replace_current(&mut self) {
+        if self.doc.readonly {
+            return;
+        }
         let Some(index) = self.find.active else {
             return;
         };
@@ -2177,6 +2462,7 @@ impl Editor {
             _ => return None,
         };
         let other = if forward { close } else { open };
+        let origin_in_lit = self.is_in_string_or_comment(pos);
         let mut depth = 0i32;
         let mut p = pos;
         // Bounded scan: a broken file must not stall the key handler.
@@ -2190,13 +2476,16 @@ impl Editor {
                 p = p.checked_sub(1)?;
             }
             let ch = self.doc.char_at(p)?;
+            if ch != bracket && ch != other {
+                continue;
+            }
+            if !origin_in_lit && self.is_in_string_or_comment(p) {
+                continue;
+            }
             if ch == bracket {
                 depth += 1;
             } else if ch == other {
                 if depth == 0 {
-                    if self.is_in_string_or_comment(p) {
-                        return None;
-                    }
                     return if forward { Some((pos, p)) } else { Some((p, pos)) };
                 }
                 depth -= 1;
@@ -2305,12 +2594,10 @@ impl Editor {
         while p > floor {
             p -= 1;
             match self.doc.char_at(p) {
-                Some(')' | ']' | '}') => depth += 1,
-                Some('(' | '[' | '{') => {
+                Some(')' | ']' | '}') if !self.is_in_string_or_comment(p) => depth += 1,
+                Some('(' | '[' | '{') if !self.is_in_string_or_comment(p) => {
                     if depth == 0 {
-                        if !self.is_in_string_or_comment(p) {
-                            ancestors.push(p);
-                        }
+                        ancestors.push(p);
                     } else {
                         depth -= 1;
                     }
@@ -2334,8 +2621,8 @@ impl Editor {
             while q + 1 < len {
                 q += 1;
                 match self.doc.char_at(q) {
-                    Some(ch) if ch == open_ch => depth += 1,
-                    Some(ch) if ch == close_ch => {
+                    Some(ch) if ch == open_ch && !self.is_in_string_or_comment(q) => depth += 1,
+                    Some(ch) if ch == close_ch && !self.is_in_string_or_comment(q) => {
                         if depth == 0 {
                             mate = Some(q);
                             break;
@@ -2408,6 +2695,9 @@ impl Editor {
         let line_len = self.doc.line_char_len(caret_line.min(last_line));
         self.caret = self.doc.line_col_to_char(caret_line, caret_col.min(line_len));
         self.anchor = self.caret;
+        if let Some(last_undo) = self.doc.undo.last_mut() {
+            last_undo.after = (self.caret, self.anchor);
+        }
         self.after_edit();
         self.refresh_find_matches();
         count
@@ -2587,7 +2877,8 @@ impl Editor {
     // Syntax & Diff refresh
     // ---------------------------------------------------------------------
 
-    /// Pick up finished background highlights, symbols, folds, and diagnostics; schedule a new one when due.
+    /// Pick up finished background highlights, symbols, folds, diagnostics, and Git gutter diffs;
+    /// schedule a new worker job when due.
     pub fn refresh_syntax(&mut self, now: Instant) -> bool {
         let mut changed = false;
         while let Some(analysis) = self.syntax.poll_analysis() {
@@ -2598,22 +2889,23 @@ impl Editor {
                 self.fold_rev += 1;
                 self.diagnostics = analysis.diagnostics;
                 self.spans_version = analysis.version;
+                if let Some(diffs) = analysis.line_diffs {
+                    self.line_diffs = diffs;
+                    self.diff_version = analysis.version;
+                }
                 self.invalidate_layout();
                 changed = true;
             }
         }
-        if self.diff_version != self.doc.version {
+        let needs_diff = self.diff_version != self.doc.version
+            && self.doc.baseline_text.is_some()
+            && self.doc.len_bytes() <= 512 * 1024;
+        if self.diff_version != self.doc.version && !needs_diff {
+            self.line_diffs.clear();
             self.diff_version = self.doc.version;
-            if let Some(base) = &self.doc.baseline_text
-                && self.doc.len_bytes() <= 512 * 1024
-            {
-                let cur = self.doc.text();
-                self.line_diffs = compute_line_diff(base, &cur);
-            } else {
-                self.line_diffs.clear();
-            }
         }
-        if self.spans_version == self.doc.version {
+        let needs_syntax = self.spans_version != self.doc.version;
+        if !needs_syntax && !needs_diff {
             return changed;
         }
         if self.doc.len_bytes() > MAX_HIGHLIGHT_BYTES {
@@ -2625,7 +2917,9 @@ impl Editor {
                 self.fold_rev += 1;
                 self.diagnostics.clear();
             }
+            self.line_diffs.clear();
             self.spans_version = self.doc.version;
+            self.diff_version = self.doc.version;
             return true;
         }
         if self.syntax.is_busy() {
@@ -2637,7 +2931,10 @@ impl Editor {
         }
         let version = self.doc.version;
         let rope = self.doc.rope.clone();
-        self.syntax.request_rope(version, rope);
+        let baseline = needs_diff
+            .then(|| self.doc.baseline_text.clone())
+            .flatten();
+        self.syntax.request_rope(version, rope, baseline);
         self.syntax_due = None;
         changed
     }
@@ -3003,7 +3300,89 @@ cc
         ed.move_vertical(1, false);
         assert_eq!(ed.doc.char_to_line_col(ed.caret), (1, 2));
         ed.move_vertical(1, false);
-        assert_eq!(ed.doc.char_to_line_col(ed.caret), (2, 2));
+        assert_eq!(ed.doc.char_to_line_col(ed.caret), (2, 4));
+    }
+
+    #[test]
+    fn phase1_editor_core_bug_regressions() {
+        // 1. Readonly guards prevent mutation on replace_selection / replace_current / undo.
+        let mut ro = editor("hello world");
+        ro.doc.readonly = true;
+        ro.select_all();
+        assert!(!ro.replace_selection("x", EditKind::Other, None));
+        assert_eq!(ro.doc.text(), "hello world");
+
+        // 2. newline() before closing paren without opening block does not jump past ')'.
+        let mut nl = editor("foo(bar)");
+        nl.caret = 7; // before ')'
+        nl.anchor = 7;
+        nl.newline();
+        assert_eq!(nl.doc.text(), "foo(bar\n)");
+        assert_eq!(nl.doc.char_at(nl.caret), Some(')'));
+
+        // 3. toggle_comment closes HTML and CSS comments properly.
+        let mut html = editor("<div>hi</div>");
+        html.language = Language::Html;
+        html.toggle_comment();
+        assert_eq!(html.doc.text(), "<!-- <div>hi</div> -->");
+        html.toggle_comment();
+        assert_eq!(html.doc.text(), "<div>hi</div>");
+
+        let mut css = editor("color: red;");
+        css.language = Language::Css;
+        css.toggle_comment();
+        assert_eq!(css.doc.text(), "/* color: red; */");
+        css.toggle_comment();
+        assert_eq!(css.doc.text(), "color: red;");
+
+        // 4. Multi-cursor delete_forward deletes at every cursor.
+        let mut mc = editor("ab\ncd");
+        mc.caret = 0;
+        mc.anchor = 0;
+        mc.extra_cursors.push((3, 3));
+        mc.delete_forward();
+        assert_eq!(mc.doc.text(), "b\nd");
+    }
+
+    #[test]
+    fn phase1_security_and_doc_safety() {
+        assert!(crate::app::is_safe_external_url("https://example.com/path?a=1"));
+        assert!(crate::app::is_safe_external_url("mailto:user@example.com"));
+        assert!(!crate::app::is_safe_external_url("https://example.com & calc.exe"));
+        assert!(!crate::app::is_safe_external_url("javascript:alert(1)"));
+        assert!(!crate::app::is_safe_external_url("file:///C:/Windows/cmd.exe"));
+
+        // Toggling EOL twice clears dirty flag instead of leaving inverted hash.
+        let mut doc = Document::from_text("a\nb\n");
+        assert!(!doc.is_dirty());
+        doc.set_eol(Eol::CrLf);
+        assert!(doc.is_dirty());
+        doc.set_eol(Eol::Lf);
+        assert!(!doc.is_dirty());
+
+        // Git baseline survives Document::save().
+        let tmp = std::env::temp_dir().join(format!(
+            "kestrel_git_baseline_{}.txt",
+            std::process::id()
+        ));
+        std::fs::write(&tmp, "line1\n").unwrap();
+        let mut gdoc = Document::load(&tmp).unwrap();
+        gdoc.set_git_baseline("head_version\n");
+        let _ = gdoc.edit(0, 5, "edited", EditKind::Other, (0, 0), (6, 6));
+        assert!(matches!(gdoc.save(), SaveOutcome::Saved));
+        assert_eq!(gdoc.baseline_text.as_deref(), Some("head_version\n"));
+        let _ = std::fs::remove_file(&tmp);
+
+        // Non-UTF-8 / Lossy file is opened readonly to prevent silent corruption.
+        let bad = std::env::temp_dir().join(format!(
+            "kestrel_lossy_ro_{}.txt",
+            std::process::id()
+        ));
+        std::fs::write(&bad, b"hello \xC4\xE3\xBA\xC3").unwrap();
+        let ldoc = Document::load(&bad).unwrap();
+        assert_eq!(ldoc.encoding, Encoding::LossyUtf8);
+        assert!(ldoc.readonly);
+        let _ = std::fs::remove_file(&bad);
     }
 
     #[test]

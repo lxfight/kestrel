@@ -206,14 +206,14 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32, stroke: 
     }
 
     let p = |x: f32, y: f32| -> Pos2 { Pos2::new(r.left() + x * s, r.top() + y * s) };
-    let st = Stroke::new(stroke.max(1.2), color);
+    let st = Stroke::new(stroke.max(1.25), color);
     match icon {
         Icon::Sun => {
-            painter.circle_stroke(p(0.5, 0.5), s * 0.21, st);
+            painter.circle_stroke(p(0.5, 0.5), s * 0.19, st);
             for i in 0..8 {
                 let a = i as f32 * std::f32::consts::TAU / 8.0;
                 let inner = 0.31;
-                let outer = 0.44;
+                let outer = 0.43;
                 painter.add(Shape::line_segment(
                     [
                         p(0.5 + a.cos() * inner, 0.5 + a.sin() * inner),
@@ -224,28 +224,105 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32, stroke: 
             }
         }
         Icon::Moon => {
-            // Crisp crescent moon using outer arc + inner offset arc.
+            // Mathematically closed crescent: solve exact intersection of two circles
+            // so the outer and inner arcs meet cleanly with zero stray gap.
+            let c1 = Vec2::new(0.49, 0.51);
+            let r1 = 0.34f32;
+            let c2 = Vec2::new(0.65, 0.36);
+            let r2 = 0.27f32;
+            let d_vec = c2 - c1;
+            let d = d_vec.length();
+            let base = d_vec.y.atan2(d_vec.x);
+            let cos1 = ((r1 * r1 + d * d - r2 * r2) / (2.0 * r1 * d)).clamp(-1.0, 1.0);
+            let a1 = cos1.acos();
+            let start1 = base + a1;
+            let end1 = base + std::f32::consts::TAU - a1;
+
+            let cos2 = ((r2 * r2 + d * d - r1 * r1) / (2.0 * r2 * d)).clamp(-1.0, 1.0);
+            let a2 = cos2.acos();
+            let rev_base = (c1 - c2).y.atan2((c1 - c2).x);
+            let start2 = rev_base + a2;
+            let end2 = rev_base - a2;
+
             let mut pts = Vec::with_capacity(34);
-            let c1 = p(0.50, 0.50);
-            let r1 = s * 0.36;
-            let c2 = p(0.64, 0.38);
-            let r2 = s * 0.30;
             for i in 0..=18 {
                 let t = i as f32 / 18.0;
-                let a = 0.65 + t * 4.35;
-                pts.push(Pos2::new(c1.x + a.cos() * r1, c1.y + a.sin() * r1));
+                let a = start1 + t * (end1 - start1);
+                pts.push(p(c1.x + a.cos() * r1, c1.y + a.sin() * r1));
             }
-            for i in (0..=14).rev() {
+            for i in 1..=14 {
                 let t = i as f32 / 14.0;
-                let a = 1.15 + t * 3.35;
-                pts.push(Pos2::new(c2.x + a.cos() * r2, c2.y + a.sin() * r2));
+                let a = start2 + t * (end2 - start2);
+                pts.push(p(c2.x + a.cos() * r2, c2.y + a.sin() * r2));
             }
-            if let Some(first) = pts.first().copied() {
-                pts.push(first);
-            }
-            painter.add(Shape::line(pts, st));
+            painter.add(Shape::closed_line(pts, st));
         }
         _ => {}
+    }
+}
+
+/// Paint Kestrel's signature geometric falcon-wing brand mark inside `rect`.
+pub fn paint_kestrel_logo(painter: &Painter, rect: Rect, theme: &crate::theme::Theme) {
+    let s = rect.width().min(rect.height()).max(16.0);
+    let r = Rect::from_center_size(rect.center(), Vec2::splat(s));
+    let radius = (s * 0.24).round().clamp(4.0, 14.0) as u8;
+    // Deep cobalt badge with crisp subtle rim highlight.
+    painter.rect_filled(r, CornerRadius::same(radius), theme.accent_fill);
+    painter.rect_stroke(
+        r,
+        CornerRadius::same(radius),
+        Stroke::new(1.0, Color32::from_white_alpha(if theme.kind.is_dark() { 45 } else { 60 })),
+        egui::StrokeKind::Inside,
+    );
+    let p = |x: f32, y: f32| Pos2::new(r.left() + x * s, r.top() + y * s);
+    // Clean geometric K-wing emblem (two crisp convex facets, no font dependency).
+    let stem = vec![p(0.27, 0.23), p(0.41, 0.23), p(0.41, 0.77), p(0.27, 0.77)];
+    painter.add(Shape::convex_polygon(stem, theme.accent_text, Stroke::NONE));
+
+    let upper_wing = vec![p(0.43, 0.50), p(0.62, 0.23), p(0.77, 0.23), p(0.55, 0.52)];
+    painter.add(Shape::convex_polygon(upper_wing, theme.accent_text, Stroke::NONE));
+
+    let lower_wing = vec![
+        p(0.45, 0.48),
+        p(0.57, 0.48),
+        p(0.77, 0.77),
+        p(0.61, 0.77),
+    ];
+    painter.add(Shape::convex_polygon(
+        lower_wing,
+        Color32::from_rgba_unmultiplied(255, 255, 255, 215),
+        Stroke::NONE,
+    ));
+}
+
+/// Semantic color for outline / autocomplete symbol icons.
+pub fn symbol_color(kind: crate::lsp::SymbolKind, theme: &crate::theme::Theme) -> Color32 {
+    use crate::lsp::SymbolKind;
+    match kind {
+        SymbolKind::Function | SymbolKind::Method => theme.syn_function,
+        SymbolKind::Struct | SymbolKind::Class | SymbolKind::Interface | SymbolKind::Enum => {
+            theme.syn_type
+        }
+        SymbolKind::Constant => theme.syn_constant,
+        SymbolKind::Module | SymbolKind::Heading | SymbolKind::Keyword => theme.syn_keyword,
+        SymbolKind::Snippet => theme.syn_macro,
+        SymbolKind::Variable | SymbolKind::Field | SymbolKind::Property => theme.syn_property,
+    }
+}
+
+/// Semantic color for completion icons.
+pub fn completion_icon_color(icon: Icon, theme: &crate::theme::Theme) -> Color32 {
+    match icon {
+        Icon::SymbolFunction | Icon::SymbolMethod => theme.syn_function,
+        Icon::SymbolStruct | Icon::SymbolClass | Icon::SymbolInterface | Icon::SymbolEnum => {
+            theme.syn_type
+        }
+        Icon::SymbolConstant => theme.syn_constant,
+        Icon::SymbolKeyword => theme.syn_keyword,
+        Icon::SymbolSnippet => theme.syn_macro,
+        Icon::SymbolModule => theme.syn_attribute,
+        Icon::SymbolField | Icon::SymbolProperty | Icon::SymbolVariable => theme.syn_property,
+        _ => theme.accent,
     }
 }
 
@@ -392,7 +469,7 @@ pub fn paint_path_icon(
             return;
         }
         "cargo.toml" => {
-            paint_badge(painter, rect, "CG", file_color("rs", dark));
+            paint_codicon(painter, rect, '\u{eb29}', file_color("rs", dark));
             return;
         }
         "license" | "license.md" | "license.txt" => {
@@ -446,53 +523,59 @@ fn paint_folder_duotone(painter: &Painter, rect: Rect, color: Color32, expanded:
     let r = Rect::from_center_size(rect.center(), Vec2::splat(s));
     let p = |x: f32, y: f32| Pos2::new(r.left() + x * s, r.top() + y * s);
 
-    // Back tab plate
-    let tab_pts = vec![
-        p(0.10, 0.24),
-        p(0.42, 0.24),
-        p(0.50, 0.34),
-        p(0.88, 0.34),
-        p(0.88, 0.78),
-        p(0.10, 0.78),
-    ];
-    painter.add(Shape::convex_polygon(
-        tab_pts,
-        color.gamma_multiply(0.28),
-        Stroke::new(1.15, color),
-    ));
+    let tab_fill = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 155);
+    let body_fill = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 215);
+    let rim = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 255);
 
-    // Front folder flap
-    let top_y = if expanded { 0.44 } else { 0.36 };
+    // Strictly convex top folder tab + back plate (zero concave polygon artifacts).
+    let tab = Rect::from_min_max(p(0.10, 0.22), p(0.48, 0.40));
+    painter.rect_filled(
+        tab,
+        CornerRadius {
+            nw: 2,
+            ne: 2,
+            sw: 0,
+            se: 0,
+        },
+        tab_fill,
+    );
+    let back = Rect::from_min_max(p(0.10, 0.30), p(0.88, 0.78));
+    painter.rect_filled(back, CornerRadius::same(2), tab_fill);
+
+    // Front folder flap (drops open slightly when expanded).
+    let top_y = if expanded { 0.43 } else { 0.35 };
     let body = Rect::from_min_max(p(0.10, top_y), p(0.90, 0.80));
-    painter.rect_filled(body, CornerRadius::same(2), color.gamma_multiply(0.45));
+    painter.rect_filled(body, CornerRadius::same(2), body_fill);
     painter.rect_stroke(
         body,
         CornerRadius::same(2),
-        Stroke::new(1.15, color),
+        Stroke::new(0.85, rim),
         egui::StrokeKind::Inside,
     );
 }
 
 fn paint_badge(painter: &Painter, rect: Rect, label: &str, color: Color32) {
     let s = rect.width().min(rect.height()).max(12.0);
-    let badge = Rect::from_center_size(rect.center(), Vec2::new(s * 0.94, s * 0.82));
-    painter.rect_filled(badge, CornerRadius::same(3), color.gamma_multiply(0.22));
+    let badge = Rect::from_center_size(rect.center(), Vec2::new(s * 0.96, s * 0.80));
+    let fill = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 38);
+    let border = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 140);
+    painter.rect_filled(badge, CornerRadius::same(3), fill);
     painter.rect_stroke(
         badge,
         CornerRadius::same(3),
-        Stroke::new(1.1, color.gamma_multiply(0.88)),
+        Stroke::new(1.0, border),
         egui::StrokeKind::Inside,
     );
     let font_size = if label.len() == 1 {
         (s * 0.56).round().max(8.5)
     } else {
-        (s * 0.48).round().max(7.5)
+        (s * 0.47).round().max(7.5)
     };
     painter.text(
         badge.center(),
         Align2::CENTER_CENTER,
         label,
-        FontId::new(font_size, egui::FontFamily::Monospace),
+        FontId::new(font_size, egui::FontFamily::Proportional),
         color,
     );
 }

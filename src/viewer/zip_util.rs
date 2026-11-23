@@ -5,6 +5,25 @@ use std::io::Read;
 
 use flate2::read::DeflateDecoder;
 
+/// Maximum uncompressed size allowed when reading a single ZIP entry (64 MiB).
+pub const MAX_ZIP_ENTRY_BYTES: usize = 64 * 1024 * 1024;
+
+fn read_u16_le(data: &[u8], off: usize) -> Result<u16, String> {
+    let bytes: [u8; 2] = data
+        .get(off..off + 2)
+        .and_then(|s| s.try_into().ok())
+        .ok_or_else(|| "ZIP 文件头截断".to_string())?;
+    Ok(u16::from_le_bytes(bytes))
+}
+
+fn read_u32_le(data: &[u8], off: usize) -> Result<u32, String> {
+    let bytes: [u8; 4] = data
+        .get(off..off + 4)
+        .and_then(|s| s.try_into().ok())
+        .ok_or_else(|| "ZIP 文件头截断".to_string())?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
 #[derive(Clone, Debug)]
 struct ZipEntry {
     method: u16,
@@ -24,8 +43,8 @@ impl ZipArchive {
         if eocd + 22 > data.len() {
             return Err("ZIP 目录尾截断".to_string());
         }
-        let cd_size = u32::from_le_bytes(data[eocd + 12..eocd + 16].try_into().unwrap()) as usize;
-        let cd_offset = u32::from_le_bytes(data[eocd + 16..eocd + 20].try_into().unwrap()) as usize;
+        let cd_size = read_u32_le(&data, eocd + 12)? as usize;
+        let cd_offset = read_u32_le(&data, eocd + 16)? as usize;
         if cd_offset.saturating_add(cd_size) > data.len() {
             return Err("ZIP 中央目录越界".to_string());
         }
@@ -38,16 +57,13 @@ impl ZipArchive {
             if &data[pos..pos + 4] != b"PK\x01\x02" {
                 break;
             }
-            let method = u16::from_le_bytes(data[pos + 10..pos + 12].try_into().unwrap());
-            let comp_size = u32::from_le_bytes(data[pos + 20..pos + 24].try_into().unwrap()) as usize;
-            let uncomp_size =
-                u32::from_le_bytes(data[pos + 24..pos + 28].try_into().unwrap()) as usize;
-            let name_len = u16::from_le_bytes(data[pos + 28..pos + 30].try_into().unwrap()) as usize;
-            let extra_len = u16::from_le_bytes(data[pos + 30..pos + 32].try_into().unwrap()) as usize;
-            let comment_len =
-                u16::from_le_bytes(data[pos + 32..pos + 34].try_into().unwrap()) as usize;
-            let local_offset =
-                u32::from_le_bytes(data[pos + 42..pos + 46].try_into().unwrap()) as usize;
+            let method = read_u16_le(&data, pos + 10)?;
+            let comp_size = read_u32_le(&data, pos + 20)? as usize;
+            let uncomp_size = read_u32_le(&data, pos + 24)? as usize;
+            let name_len = read_u16_le(&data, pos + 28)? as usize;
+            let extra_len = read_u16_le(&data, pos + 30)? as usize;
+            let comment_len = read_u16_le(&data, pos + 32)? as usize;
+            let local_offset = read_u32_le(&data, pos + 42)? as usize;
 
             let name_start = pos + 46;
             let name_end = name_start + name_len;
@@ -103,9 +119,8 @@ impl ZipArchive {
         if off + 30 > self.data.len() || &self.data[off..off + 4] != b"PK\x03\x04" {
             return Err(format!("无效的本地文件头: {normalized}"));
         }
-        let name_len = u16::from_le_bytes(self.data[off + 26..off + 28].try_into().unwrap()) as usize;
-        let extra_len =
-            u16::from_le_bytes(self.data[off + 28..off + 30].try_into().unwrap()) as usize;
+        let name_len = read_u16_le(&self.data, off + 26)? as usize;
+        let extra_len = read_u16_le(&self.data, off + 28)? as usize;
         let data_start = off + 30 + name_len + extra_len;
         let data_end = data_start.saturating_add(entry.comp_size);
         if data_end > self.data.len() {
@@ -113,13 +128,21 @@ impl ZipArchive {
         }
         let slice = &self.data[data_start..data_end];
         match entry.method {
-            0 => Ok(slice.to_vec()),
+            0 => {
+                if slice.len() > MAX_ZIP_ENTRY_BYTES {
+                    return Err(format!("ZIP 条目超过 64 MB 大小上限: {normalized}"));
+                }
+                Ok(slice.to_vec())
+            }
             8 => {
-                let mut out = Vec::with_capacity(entry.uncomp_size.min(64 * 1024 * 1024));
-                let mut decoder = DeflateDecoder::new(slice);
+                let mut out = Vec::with_capacity(entry.uncomp_size.min(MAX_ZIP_ENTRY_BYTES));
+                let mut decoder = DeflateDecoder::new(slice).take((MAX_ZIP_ENTRY_BYTES + 1) as u64);
                 decoder
                     .read_to_end(&mut out)
                     .map_err(|e| format!("解压 {normalized} 失败: {e}"))?;
+                if out.len() > MAX_ZIP_ENTRY_BYTES {
+                    return Err(format!("ZIP 条目解压超过 64 MB 安全上限: {normalized}"));
+                }
                 Ok(out)
             }
             other => Err(format!("不支持的 ZIP 压缩方式 ({other}): {normalized}")),

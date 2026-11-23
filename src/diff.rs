@@ -1270,11 +1270,11 @@ pub fn diff_ui(
     // Scroll state is handled by egui; keep navigation target cleared.
     let _ = out;
 
-    // Overview ruler for changed blocks.
+    // Overview ruler sits cleanly left of the floating vertical scrollbar.
     if !tab.inline {
         let ruler = Rect::from_min_max(
-            Pos2::new(body.right() - 8.0, body.top()),
-            Pos2::new(body.right() - 2.0, body.bottom()),
+            Pos2::new(body.right() - 16.0, body.top()),
+            Pos2::new(body.right() - 11.0, body.bottom()),
         );
         ui.painter().rect_filled(ruler, 0.0, theme.bg);
         let total = data.rows.len().max(1) as f32;
@@ -1326,7 +1326,7 @@ fn hunk_header_ui(
         return;
     };
     let line = Rect::from_min_size(Pos2::new(x, y), Vec2::new(width, line_h));
-    painter.rect_filled(line, 0.0, theme.input_bg.gamma_multiply(0.85));
+    painter.rect_filled(line, 0.0, theme.diff_hunk_bg);
     painter.line_segment(
         [line.left_top(), line.right_top()],
         Stroke::new(1.0, theme.border),
@@ -1502,6 +1502,7 @@ fn line_job(
             TextFormat {
                 font_id: font.clone(),
                 color: default_color,
+                line_height: Some(line_height),
                 ..Default::default()
             },
         );
@@ -1512,12 +1513,10 @@ fn line_job(
 fn row_colors(kind: RowKind, theme: Theme) -> (Option<Color32>, Option<Color32>) {
     match kind {
         RowKind::Equal => (None, None),
-        RowKind::Added => (None, Some(theme.git_added.gamma_multiply(0.16))),
-        RowKind::Removed => (Some(theme.git_deleted.gamma_multiply(0.16)), None),
-        RowKind::Modified => (
-            Some(theme.git_modified.gamma_multiply(0.14)),
-            Some(theme.git_modified.gamma_multiply(0.14)),
-        ),
+        RowKind::Added => (None, Some(theme.diff_added_bg)),
+        RowKind::Removed => (Some(theme.diff_removed_bg), None),
+        // Standard red-removed (left) / green-added (right) cue for modified lines.
+        RowKind::Modified => (Some(theme.diff_removed_bg), Some(theme.diff_added_bg)),
     }
 }
 
@@ -1532,7 +1531,7 @@ fn paint_side_row(
     row_index: usize,
     left_side: bool,
     line_h: f32,
-    char_w: f32,
+    _char_w: f32,
     font: &FontId,
     number_color: &Color32,
     theme: Theme,
@@ -1563,7 +1562,7 @@ fn paint_side_row(
         painter.rect_filled(rect, 0.0, tint);
     }
     let Some(line_index) = line_index else {
-        painter.rect_filled(rect, 0.0, theme.input_bg.gamma_multiply(0.55));
+        painter.rect_filled(rect, 0.0, theme.diff_filler_bg);
         return;
     };
     let number = format!("{}", line_index + 1);
@@ -1576,22 +1575,34 @@ fn paint_side_row(
     );
     let text_line = line_text(text, starts, line_index as usize);
     let line_start = starts.get(line_index as usize).copied().unwrap_or(0);
+    let job = line_job(text_line, spans, line_start, font, theme.text, theme, line_h);
+    let galley = ui.ctx().fonts_mut(|fonts| fonts.layout_job(job));
+    let code_clip = Rect::from_min_max(
+        Pos2::new(rect.left() + gutter_w, rect.top()),
+        Pos2::new(rect.right(), rect.bottom()),
+    );
+    let cp = painter.with_clip_rect(code_clip);
     if let Some((start, len)) = hl {
-        let x = rect.left() + gutter_w - tab.h_scroll + start as f32 * char_w;
-        let width = len as f32 * char_w;
-        let color = match row.kind {
-            RowKind::Modified => theme.git_modified.gamma_multiply(0.28),
-            _ => theme.git_added.gamma_multiply(0.24),
+        let x0 = galley
+            .pos_from_cursor(egui::text::CCursor::new(start as usize))
+            .left();
+        let x1 = galley
+            .pos_from_cursor(egui::text::CCursor::new((start + len) as usize))
+            .left();
+        let x = rect.left() + gutter_w - tab.h_scroll + x0;
+        let width = (x1 - x0).max(2.0);
+        let color = if left_side {
+            Color32::from_rgba_unmultiplied(theme.git_deleted.r(), theme.git_deleted.g(), theme.git_deleted.b(), 64)
+        } else {
+            Color32::from_rgba_unmultiplied(theme.git_added.r(), theme.git_added.g(), theme.git_added.b(), 64)
         };
-        painter.rect_filled(
+        cp.rect_filled(
             Rect::from_min_size(Pos2::new(x, rect.top()), Vec2::new(width, line_h)),
-            0.0,
+            2.0,
             color,
         );
     }
-    let job = line_job(text_line, spans, line_start, font, theme.text, theme, line_h);
-    let galley = ui.ctx().fonts_mut(|fonts| fonts.layout_job(job));
-    painter.galley(
+    cp.galley(
         Pos2::new(rect.left() + gutter_w - tab.h_scroll, rect.top()),
         galley,
         theme.text,
@@ -1666,21 +1677,34 @@ fn paint_inline_row(
     let text_line = line_text(text, starts, entry.line as usize);
     let line_start = starts.get(entry.line as usize).copied().unwrap_or(0);
     let code_left = rect.left() + layout.gutter_w + 18.0;
-    if let Some((start, len)) = entry.hl {
-        let x = code_left - tab.h_scroll + start as f32 * char_w;
-        painter.rect_filled(
-            Rect::from_min_size(Pos2::new(x, y), Vec2::new(len as f32 * char_w, line_h)),
-            0.0,
-            theme.git_modified.gamma_multiply(0.3),
-        );
-    }
     let job = line_job(text_line, spans, line_start, font, theme.text, theme, line_h);
     let galley = ui.ctx().fonts_mut(|fonts| fonts.layout_job(job));
-    painter.galley(
-        Pos2::new(code_left - tab.h_scroll, y),
-        galley,
-        theme.text,
+    let code_clip = Rect::from_min_max(
+        Pos2::new(code_left, y),
+        Pos2::new(rect.right(), y + line_h),
     );
+    let cp = painter.with_clip_rect(code_clip);
+    if let Some((start, len)) = entry.hl {
+        let x0 = galley
+            .pos_from_cursor(egui::text::CCursor::new(start as usize))
+            .left();
+        let x1 = galley
+            .pos_from_cursor(egui::text::CCursor::new((start + len) as usize))
+            .left();
+        let x = code_left - tab.h_scroll + x0;
+        let color = if entry.left_side {
+            Color32::from_rgba_unmultiplied(theme.git_deleted.r(), theme.git_deleted.g(), theme.git_deleted.b(), 64)
+        } else {
+            Color32::from_rgba_unmultiplied(theme.git_added.r(), theme.git_added.g(), theme.git_added.b(), 64)
+        };
+        cp.rect_filled(
+            Rect::from_min_size(Pos2::new(x, y), Vec2::new((x1 - x0).max(2.0), line_h)),
+            2.0,
+            color,
+        );
+    }
+    cp.galley(Pos2::new(code_left - tab.h_scroll, y), galley, theme.text);
+    let _ = char_w;
 }
 
 // ---------------------------------------------------------------------------
@@ -1871,6 +1895,7 @@ mod tests {
             ui_family: egui::FontFamily::Proportional,
             ui_bold_family: egui::FontFamily::Proportional,
             mono_family: egui::FontFamily::Monospace,
+            mono_bold_family: egui::FontFamily::Monospace,
             ui_size: 13.0,
         };
         let editor_style = EditorStyle {

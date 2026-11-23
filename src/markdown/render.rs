@@ -56,7 +56,7 @@ pub fn preview_ui(
     let rect = ui.available_rect_before_wrap();
     ui.painter().rect_filled(rect, 0.0, theme.bg);
 
-    let doc = state.doc.clone();
+    let doc = std::sync::Arc::clone(&state.doc);
     let doc_dir = doc_path.and_then(|p| p.parent());
     let base_size = base_font_size.clamp(11.0, 24.0);
 
@@ -405,28 +405,33 @@ fn render_heading(
     let row_resp = ui.horizontal(|ui| {
         ui.set_max_width(max_w);
         render_inlines_flow(ui, rctx, inlines, max_w - 24.0, size, true, color, None);
-    });
-    if row_resp.response.hovered() {
-        let hash_rect = Rect::from_min_size(
-            Pos2::new(row_resp.response.rect.right() + 4.0, row_resp.response.rect.top()),
-            Vec2::new(18.0, row_resp.response.rect.height()),
-        );
-        let h_resp = ui.interact(
-            hash_rect,
-            ui.scope_id().with(("md_anchor", source_line, slug)),
-            Sense::click(),
-        );
-        ui.painter().text(
-            hash_rect.center(),
-            Align2::CENTER_CENTER,
-            "#",
-            FontId::new(size * 0.78, rctx.style.mono_family.clone()),
-            rctx.theme.accent,
-        );
+        let (hash_rect, h_resp) =
+            ui.allocate_exact_size(Vec2::new(18.0, size * 1.15), Sense::click());
+        let pointer_on_row = ui.input(|i| i.pointer.hover_pos()).is_some_and(|p| {
+            let band = Rect::from_min_max(
+                Pos2::new(ui.min_rect().left(), hash_rect.top()),
+                Pos2::new(hash_rect.right() + 4.0, hash_rect.bottom()),
+            );
+            band.contains(p)
+        });
+        if pointer_on_row || h_resp.hovered() {
+            ui.painter().text(
+                hash_rect.center(),
+                Align2::CENTER_CENTER,
+                "#",
+                FontId::new(size * 0.78, rctx.style.mono_family.clone()),
+                if h_resp.hovered() {
+                    rctx.theme.accent
+                } else {
+                    rctx.theme.text_muted
+                },
+            );
+        }
         if h_resp.on_hover_text("定位到源码行").clicked() {
             rctx.events.push(PreviewEvent::JumpSourceLine(source_line));
         }
-    }
+    });
+    let _ = (row_resp, slug);
 
     if level <= 2 {
         ui.add_space(4.0);
@@ -467,9 +472,9 @@ fn render_code_block(
     };
 
     Frame::new()
-        .fill(theme.input_bg)
-        .stroke(Stroke::new(1.0, theme.border_strong))
-        .corner_radius(CornerRadius::same(8))
+        .fill(theme.code_bg)
+        .stroke(Stroke::new(1.0, theme.border))
+        .corner_radius(CornerRadius::same(crate::theme::R_LG))
         .inner_margin(Margin::ZERO)
         .show(ui, |ui| {
             ui.set_width(max_w);
@@ -1193,7 +1198,7 @@ fn append_inlines(
         valign: if s.sup {
             EguiAlign::TOP
         } else {
-            EguiAlign::BOTTOM
+            EguiAlign::Center
         },
         ..Default::default()
     };

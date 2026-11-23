@@ -50,7 +50,16 @@ pub struct SpreadsheetViewer {
 
 impl SpreadsheetViewer {
     pub fn load_xlsx(path: &Path) -> Self {
+        const MAX_XLSX_BYTES: u64 = 64 * 1024 * 1024;
         let file_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        if file_bytes > MAX_XLSX_BYTES {
+            return Self::with_error(
+                path,
+                file_bytes,
+                false,
+                "表格体积超过 64 MB 预览限制".to_string(),
+            );
+        }
         let bytes = match std::fs::read(path) {
             Ok(b) => b,
             Err(err) => return Self::with_error(path, file_bytes, false, format!("读取失败: {err}")),

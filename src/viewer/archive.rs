@@ -72,7 +72,11 @@ pub(crate) fn extract_entry(
 }
 
 fn safe_archive_name(archive_path: &Path) -> String {
-    archive_path
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    archive_path.hash(&mut h);
+    let digest = h.finish();
+    let stem: String = archive_path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "archive".to_string())
@@ -84,12 +88,28 @@ fn safe_archive_name(archive_path: &Path) -> String {
                 '_'
             }
         })
-        .collect()
+        .collect();
+    format!("{stem}-{digest:08x}")
 }
 
 impl ArchiveViewer {
     pub fn load(path: &Path) -> Self {
+        const MAX_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
         let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        if file_size > MAX_ARCHIVE_BYTES {
+            return Self {
+                path: path.to_path_buf(),
+                file_size,
+                archive: None,
+                entries: Vec::new(),
+                total_uncomp: 0,
+                total_comp: 0,
+                search: String::new(),
+                selected: None,
+                preview_text: None,
+                error: Some("压缩包体积超过 64 MB 预览限制".to_string()),
+            };
+        }
         let Ok(bytes) = std::fs::read(path) else {
             return Self {
                 path: path.to_path_buf(),

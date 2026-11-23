@@ -10,7 +10,7 @@ use std::path::Path;
 pub mod markdown;
 pub mod tree;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub enum Language {
     Rust,
     Python,

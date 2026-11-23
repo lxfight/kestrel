@@ -166,30 +166,9 @@ impl KestrelApp {
             );
             let button = Rect::from_center_size(
                 Pos2::new(rect.center().x, rect.top() + 58.0),
-                Vec2::new(148.0, 28.0),
+                Vec2::new(152.0, 30.0),
             );
-            let resp = ui.interact(
-                button,
-                ui.scope_id().with("open_folder_welcome"),
-                Sense::click(),
-            );
-            ui.painter().rect_filled(
-                button,
-                CornerRadius::same(6),
-                if resp.hovered() {
-                    theme.accent.gamma_multiply(0.9)
-                } else {
-                    theme.accent
-                },
-            );
-            ui.painter().text(
-                button.center(),
-                Align2::CENTER_CENTER,
-                "打开文件夹",
-                style.small(),
-                theme.accent_text,
-            );
-            if resp.clicked() {
+            if self.primary_button(ui, button, "打开文件夹", style) {
                 self.open_folder_dialog();
             }
             return;
@@ -321,17 +300,24 @@ impl KestrelApp {
                         .inner
                         .1;
                     let rect = resp.rect;
-                    // Drag-capable row: pointer state stays on this response, so the
-                    // shared primitive's own interact would fight the drag handling.
+                    let pill_rect = rect.shrink2(Vec2::new(6.0, 1.0));
                     if is_selected || resp.is_pointer_button_down_on() {
-                        ui.painter().rect_filled(rect, 0.0, theme.active);
+                        ui.painter().rect_filled(
+                            pill_rect,
+                            CornerRadius::same(crate::theme::R_SM),
+                            theme.active,
+                        );
                     } else if resp.hovered() {
-                        ui.painter().rect_filled(rect, 0.0, theme.hover);
+                        ui.painter().rect_filled(
+                            pill_rect,
+                            CornerRadius::same(crate::theme::R_SM),
+                            theme.hover,
+                        );
                     }
                     if resp.has_focus() {
                         ui.painter().rect_stroke(
-                            rect.shrink(1.0),
-                            0.0,
+                            pill_rect,
+                            CornerRadius::same(crate::theme::R_SM),
                             Stroke::new(1.0, theme.accent),
                             egui::StrokeKind::Inside,
                         );
@@ -1195,7 +1181,7 @@ impl KestrelApp {
         let bg = if resp.hovered() {
             theme.hover
         } else {
-            theme.panel_bg.gamma_multiply(0.7)
+            theme.surface_subtle
         };
         ui.painter().rect_filled(rect, 0.0, bg);
         ui.painter().line_segment(
@@ -1217,7 +1203,7 @@ impl KestrelApp {
             Pos2::new(rect.left() + 24.0, rect.center().y),
             Align2::LEFT_CENTER,
             title,
-            style.font(10.5),
+            style.bold(10.5),
             theme.text_dim,
         );
         if let Some(badge_text) = badge {
@@ -2051,7 +2037,7 @@ impl KestrelApp {
                         resp.clone().on_hover_text(&rel);
                     }
                     let pill_rect = Rect::from_center_size(
-                        Pos2::new(rect.right() - 16.0, rect.center().y),
+                        Pos2::new(rect.right() - pill_w * 0.5 - 8.0, rect.center().y),
                         Vec2::new(pill_w, 16.0),
                     );
                     ui.painter()
@@ -2074,20 +2060,32 @@ impl KestrelApp {
                             Vec2::new(ui.available_width(), 22.0),
                             Sense::hover(),
                         );
-                        let mresp =
-                            widgets::paint_row(ui, mrect, &theme, widgets::RowState::idle());
+                        let mresp = widgets::paint_row(
+                            ui,
+                            mrect.shrink2(Vec2::new(4.0, 0.5)),
+                            &theme,
+                            widgets::RowState::idle(),
+                        );
                         ui.painter().text(
                             Pos2::new(mrect.left() + 32.0, mrect.center().y),
                             Align2::RIGHT_CENTER,
                             m.line.to_string(),
                             style.tiny(),
-                            theme.text_faint,
+                            theme.text_muted,
+                        );
+                        let preview_rect = Rect::from_min_max(
+                            Pos2::new(mrect.left() + 40.0, mrect.top()),
+                            Pos2::new(
+                                (mrect.right() - if can_replace { 28.0 } else { 8.0 })
+                                    .max(mrect.left() + 48.0),
+                                mrect.bottom(),
+                            ),
                         );
                         paint_highlighted_preview(
                             ui,
                             style,
-                            mrect,
-                            mrect.left() + 40.0,
+                            preview_rect,
+                            preview_rect.left(),
                             &m.preview,
                             &needle,
                             case_sensitive,
@@ -2897,12 +2895,12 @@ impl KestrelApp {
             }
             let btn_rect = Rect::from_min_size(
                 ui.cursor().min,
-                Vec2::new((ui.available_width() - 4.0).max(60.0), 24.0),
+                Vec2::new((ui.available_width() - 4.0).max(60.0), 26.0),
             );
             let label = if self.git.amend {
-                "✓ 修订提交 (Amend)"
+                "修订提交"
             } else {
-                "✓ 提交更改 (Commit)"
+                "提交更改"
             };
             if self.primary_button(ui, btn_rect, label, style) {
                 do_commit = true;
@@ -2991,7 +2989,11 @@ impl KestrelApp {
                                 Sense::click(),
                             );
                             if resp.hovered() {
-                                ui.painter().rect_filled(row, 0.0, theme.hover);
+                                ui.painter().rect_filled(
+                                    row.shrink2(Vec2::new(6.0, 1.0)),
+                                    CornerRadius::same(crate::theme::R_SM),
+                                    theme.hover,
+                                );
                             }
                             icons::paint_path_icon(
                                 ui.painter(),
@@ -3005,13 +3007,27 @@ impl KestrelApp {
                                 theme.text_dim,
                                 theme.kind.is_dark(),
                             );
-                            ui.painter().text(
-                                Pos2::new(row.left() + 34.0, row.center().y),
-                                Align2::LEFT_CENTER,
+                            let right_reserve = if resp.hovered() { 42.0 } else { 24.0 };
+                            let path_max = (row.width() - 34.0 - right_reserve).max(32.0);
+                            let (path_g, path_cut) = widgets::ellipsize_mode(
+                                ui,
                                 &item.rel_path,
                                 style.small(),
                                 theme.text,
+                                path_max,
+                                widgets::EllipsizeMode::Middle,
                             );
+                            ui.painter().galley(
+                                Pos2::new(
+                                    row.left() + 34.0,
+                                    row.center().y - path_g.rect.height() * 0.5,
+                                ),
+                                path_g,
+                                theme.text,
+                            );
+                            if path_cut {
+                                resp.clone().on_hover_text(&item.rel_path);
+                            }
                             if resp.hovered() {
                                 let unstage_r = Rect::from_center_size(
                                     Pos2::new(row.right() - 28.0, row.center().y),
@@ -3137,13 +3153,27 @@ impl KestrelApp {
                             GitFileStatus::Deleted | GitFileStatus::Conflicted => theme.git_deleted,
                             GitFileStatus::Renamed => theme.accent,
                         };
-                        ui.painter().text(
-                            Pos2::new(row.left() + 34.0, row.center().y),
-                            Align2::LEFT_CENTER,
+                        let right_reserve = if resp.hovered() { 60.0 } else { 24.0 };
+                        let path_max = (row.width() - 34.0 - right_reserve).max(32.0);
+                        let (path_g, path_cut) = widgets::ellipsize_mode(
+                            ui,
                             &item.rel_path,
                             style.small(),
                             theme.text,
+                            path_max,
+                            widgets::EllipsizeMode::Middle,
                         );
+                        ui.painter().galley(
+                            Pos2::new(
+                                row.left() + 34.0,
+                                row.center().y - path_g.rect.height() * 0.5,
+                            ),
+                            path_g,
+                            theme.text,
+                        );
+                        if path_cut {
+                            resp.clone().on_hover_text(&item.rel_path);
+                        }
                         if resp.hovered() {
                             let discard_r = Rect::from_center_size(
                                 Pos2::new(row.right() - 46.0, row.center().y),
@@ -3469,7 +3499,11 @@ impl KestrelApp {
                             Sense::click(),
                         );
                         if resp.hovered() {
-                            ui.painter().rect_filled(row, 0.0, theme.hover);
+                            ui.painter().rect_filled(
+                                row.shrink2(Vec2::new(6.0, 1.0)),
+                                CornerRadius::same(crate::theme::R_SM),
+                                theme.hover,
+                            );
                         }
                         icons::paint(
                             ui.painter(),
@@ -3482,26 +3516,42 @@ impl KestrelApp {
                             } else {
                                 Icon::ChevronRight
                             },
-                            theme.text_faint,
+                            theme.text_muted,
                             1.2,
                         );
-                        let text_painter = ui.painter().with_clip_rect(Rect::from_min_max(
-                            Pos2::new(row.left() + 24.0, row.top()),
-                            Pos2::new(row.right() - 62.0, row.bottom()),
-                        ));
-                        text_painter.text(
-                            Pos2::new(row.left() + 24.0, row.top() + 11.0),
-                            Align2::LEFT_CENTER,
+                        let text_max = (row.width() - 90.0).max(40.0);
+                        let (subj_g, subj_cut) = widgets::ellipsize_mode(
+                            ui,
                             commit.subject.as_str(),
                             style.small(),
                             theme.text,
+                            text_max,
+                            widgets::EllipsizeMode::End,
                         );
-                        text_painter.text(
-                            Pos2::new(row.left() + 24.0, row.bottom() - 9.0),
-                            Align2::LEFT_CENTER,
-                            format!("{} · {}", commit.author, commit.time),
+                        ui.painter().galley(
+                            Pos2::new(
+                                row.left() + 24.0,
+                                row.top() + 11.0 - subj_g.rect.height() * 0.5,
+                            ),
+                            subj_g,
+                            theme.text,
+                        );
+                        let meta_str = format!("{} · {}", commit.author, commit.time);
+                        let (meta_g, _) = widgets::ellipsize_mode(
+                            ui,
+                            &meta_str,
                             style.tiny(),
-                            theme.text_faint,
+                            theme.text_muted,
+                            text_max,
+                            widgets::EllipsizeMode::End,
+                        );
+                        ui.painter().galley(
+                            Pos2::new(
+                                row.left() + 24.0,
+                                row.bottom() - 9.0 - meta_g.rect.height() * 0.5,
+                            ),
+                            meta_g,
+                            theme.text_muted,
                         );
                         ui.painter().text(
                             Pos2::new(row.right() - 8.0, row.center().y),
@@ -3510,6 +3560,10 @@ impl KestrelApp {
                             style.tiny(),
                             theme.accent,
                         );
+                        if subj_cut {
+                            resp.clone()
+                                .on_hover_text(format!("{}\n{} · {}", commit.subject, commit.author, commit.time));
+                        }
                         if resp.clicked() {
                             toggle_commit = Some(commit.hash.clone());
                         }
@@ -3844,7 +3898,7 @@ impl KestrelApp {
         let bg = if resp.hovered() {
             theme.hover
         } else {
-            theme.panel_bg.gamma_multiply(0.7)
+            theme.surface_subtle
         };
         ui.painter().rect_filled(rect, 0.0, bg);
         ui.painter().line_segment(
@@ -3870,7 +3924,7 @@ impl KestrelApp {
         );
         let title_painter = ui.painter().with_clip_rect(rect);
         let title_galley =
-            title_painter.layout_no_wrap(title.to_string(), style.font(10.5), theme.text_dim);
+            title_painter.layout_no_wrap(title.to_string(), style.bold(10.5), theme.text_dim);
         let title_width = title_galley.size().x;
         title_painter.galley(
             Pos2::new(
@@ -4036,27 +4090,42 @@ impl KestrelApp {
                             Vec2::splat(14.0),
                         ),
                         sym.kind.icon(),
-                        theme.accent,
+                        icons::symbol_color(sym.kind, &theme),
                         1.2,
                     );
-                    ui.painter().text(
-                        Pos2::new(row.left() + indent + 32.0, row.center().y),
-                        Align2::LEFT_CENTER,
+                    let line_label = format!(":{}", sym.start_line + 1);
+                    let name_color = if is_current {
+                        theme.text
+                    } else {
+                        theme.text_dim
+                    };
+                    let name_max = (row.width() - indent - 74.0).max(32.0);
+                    let (name_g, name_cut) = widgets::ellipsize_mode(
+                        ui,
                         &sym.name,
                         style.small(),
-                        if is_current {
-                            theme.text
-                        } else {
-                            theme.text_dim
-                        },
+                        name_color,
+                        name_max,
+                        widgets::EllipsizeMode::End,
+                    );
+                    ui.painter().galley(
+                        Pos2::new(
+                            row.left() + indent + 32.0,
+                            row.center().y - name_g.rect.height() * 0.5,
+                        ),
+                        name_g,
+                        name_color,
                     );
                     ui.painter().text(
                         Pos2::new(row.right() - 10.0, row.center().y),
                         Align2::RIGHT_CENTER,
-                        format!(":{}", sym.start_line + 1),
+                        line_label,
                         style.tiny(),
-                        theme.text_faint,
+                        theme.text_muted,
                     );
+                    if name_cut {
+                        resp.clone().on_hover_text(&sym.name);
+                    }
                     let on_chevron = has_children
                         && pointer_pos.is_some_and(|pos| chevron_rect.contains(pos));
                     if resp.clicked() {
@@ -4191,9 +4260,19 @@ fn paint_highlighted_preview(
         return;
     };
 
-    let prefix = &preview[..m_start];
+    let raw_prefix = &preview[..m_start];
     let matched = &preview[m_start..m_end];
     let suffix = &preview[m_end..];
+    // Center around matches deep in long lines so the hit stays visible in narrow sidebars.
+    let prefix_display: std::borrow::Cow<'_, str> = {
+        let chars: Vec<char> = raw_prefix.chars().collect();
+        if chars.len() > 18 {
+            let tail: String = chars[chars.len() - 14..].iter().collect();
+            std::borrow::Cow::Owned(format!("…{tail}"))
+        } else {
+            std::borrow::Cow::Borrowed(raw_prefix)
+        }
+    };
 
     let measure = |s: &str| -> f32 {
         if s.is_empty() {
@@ -4212,28 +4291,28 @@ fn paint_highlighted_preview(
     };
 
     let mut x = start_x;
-    if !prefix.is_empty() {
+    if !prefix_display.is_empty() {
         painter.text(
             Pos2::new(x, row_rect.center().y),
             Align2::LEFT_CENTER,
-            prefix,
+            prefix_display.as_ref(),
             font.clone(),
             theme.text_dim,
         );
-        x += measure(prefix);
+        x += measure(prefix_display.as_ref());
     }
     let mw = measure(matched);
     let hl_rect = Rect::from_min_size(
-        Pos2::new(x - 1.0, row_rect.center().y - 7.0),
-        Vec2::new(mw + 2.0, 14.0),
+        Pos2::new(x - 1.0, row_rect.center().y - 7.5),
+        Vec2::new(mw + 2.0, 15.0),
     );
-    painter.rect_filled(hl_rect, CornerRadius::same(2), theme.find_match);
+    painter.rect_filled(hl_rect, CornerRadius::same(2), theme.search_match_bg);
     painter.text(
         Pos2::new(x, row_rect.center().y),
         Align2::LEFT_CENTER,
         matched,
         font.clone(),
-        theme.accent,
+        theme.search_match_fg,
     );
     x += mw;
     if !suffix.is_empty() {

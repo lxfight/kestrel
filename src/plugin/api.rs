@@ -3,7 +3,7 @@
 
 use std::cell::RefCell;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -169,7 +169,7 @@ fn root_fn(_lua: &Lua, shared: &Rc<RefCell<PluginShared>>) -> mlua::Result<Funct
 fn open_file_fn(_lua: &Lua, shared: &Rc<RefCell<PluginShared>>) -> mlua::Result<Function> {
     let shared = shared.clone();
     _lua.create_function(move |_, path: String| {
-        let path = resolve_path(&shared, &path);
+        let path = resolve_path(&shared, &path)?;
         shared.borrow_mut().actions.push(HostAction::OpenFile(path));
         Ok(())
     })
@@ -178,7 +178,7 @@ fn open_file_fn(_lua: &Lua, shared: &Rc<RefCell<PluginShared>>) -> mlua::Result<
 fn read_file_fn(_lua: &Lua, shared: &Rc<RefCell<PluginShared>>) -> mlua::Result<Function> {
     let shared = shared.clone();
     _lua.create_function(move |_, path: String| {
-        let path = resolve_path(&shared, &path);
+        let path = resolve_path(&shared, &path)?;
         std::fs::read_to_string(&path)
             .map_err(|err| mlua::Error::runtime(format!("读取 {} 失败: {err}", path.display())))
     })
@@ -187,7 +187,7 @@ fn read_file_fn(_lua: &Lua, shared: &Rc<RefCell<PluginShared>>) -> mlua::Result<
 fn write_file_fn(_lua: &Lua, shared: &Rc<RefCell<PluginShared>>) -> mlua::Result<Function> {
     let shared = shared.clone();
     _lua.create_function(move |_, (path, text): (String, String)| {
-        let path = resolve_path(&shared, &path);
+        let path = resolve_path(&shared, &path)?;
         std::fs::write(&path, text)
             .map_err(|err| mlua::Error::runtime(format!("写入 {} 失败: {err}", path.display())))
     })
@@ -248,14 +248,20 @@ fn exec_fn(_lua: &Lua, shared: &Rc<RefCell<PluginShared>>) -> mlua::Result<Funct
             )
         };
         let slot = ExecSlot(running);
-        std::thread::Builder::new()
+        if let Err(err) = std::thread::Builder::new()
             .name("kestrel-plugin-exec".into())
             .spawn(move || {
                 let _slot = slot;
                 let done = run_process(runtime, task, &program, &args, stdin.as_deref(), &cancel);
                 let _ = tx.send(done);
             })
-            .ok();
+        {
+            shared
+                .borrow_mut()
+                .exec_callbacks
+                .retain(|(id, _)| *id != task);
+            return Err(mlua::Error::runtime(format!("启动外部命令线程失败: {err}")));
+        }
         Ok(())
     })
 }
@@ -287,20 +293,56 @@ fn set_config_fn(_lua: &Lua, shared: &Rc<RefCell<PluginShared>>) -> mlua::Result
     })
 }
 
-fn resolve_path(shared: &Rc<RefCell<PluginShared>>, path: &str) -> PathBuf {
-    let path = PathBuf::from(path);
-    if path.is_absolute() {
-        return path;
-    }
+fn resolve_path(shared: &Rc<RefCell<PluginShared>>, raw: &str) -> mlua::Result<PathBuf> {
+    let input = PathBuf::from(raw);
     let root = shared
         .borrow()
         .ctx
         .as_ref()
         .and_then(|ctx| ctx.root.clone());
-    match root {
-        Some(root) => root.join(path),
-        None => path,
+    let Some(root) = root else {
+        if input.is_absolute() {
+            return Ok(input);
+        }
+        return Err(mlua::Error::runtime("当前未打开工作区，无法解析相对路径"));
+    };
+    let candidate = if input.is_absolute() {
+        input
+    } else {
+        root.join(input)
+    };
+    let canon_root = std::fs::canonicalize(&root).unwrap_or(root);
+    let canon_target = if candidate.exists() {
+        std::fs::canonicalize(&candidate).unwrap_or_else(|_| normalize_lexical(&candidate))
+    } else if let Some(parent) = candidate.parent()
+        && let Some(name) = candidate.file_name()
+        && let Ok(canon_parent) = std::fs::canonicalize(parent)
+    {
+        canon_parent.join(name)
+    } else {
+        normalize_lexical(&candidate)
+    };
+    if !canon_target.starts_with(&canon_root) {
+        return Err(mlua::Error::runtime(format!(
+            "插件文件访问越界（限制在当前工作区内）: {raw}"
+        )));
     }
+    Ok(canon_target)
+}
+
+fn normalize_lexical(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 type PipeOutput = (Arc<Mutex<Vec<u8>>>, JoinHandle<()>);

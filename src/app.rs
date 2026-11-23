@@ -2,7 +2,6 @@
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use egui::FontFamily;
@@ -361,6 +360,7 @@ pub struct EditorGroup {
     pub active: usize,
     pub weight: f32,
     pub tab_scroll: f32,
+    pub pane_scroll: std::collections::HashMap<u64, (f32, f32)>,
 }
 
 impl EditorGroup {
@@ -370,6 +370,7 @@ impl EditorGroup {
             active: 0,
             weight: 1.0,
             tab_scroll: 0.0,
+            pane_scroll: std::collections::HashMap::new(),
         }
     }
 
@@ -382,8 +383,67 @@ impl EditorGroup {
     }
 }
 
-pub const GROUP_GAP: f32 = 5.0;
+pub const GROUP_GAP: f32 = 1.0;
 pub const TABBAR_H: f32 = 34.0;
+
+/// Validate and open an external URL via the OS handler without invoking a shell.
+pub(crate) fn is_safe_external_url(url: &str) -> bool {
+    let trimmed = url.trim();
+    if trimmed.is_empty()
+        || trimmed.chars().any(|c| c.is_control() || c.is_whitespace())
+    {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with("mailto:")
+}
+
+pub(crate) fn open_external_url(url: &str) -> bool {
+    if !is_safe_external_url(url) {
+        return false;
+    }
+    let trimmed = url.trim();
+    #[cfg(windows)]
+    {
+        use std::ffi::OsStr;
+        use std::os::windows::ffi::OsStrExt;
+        #[link(name = "shell32")]
+        unsafe extern "system" {
+            fn ShellExecuteW(
+                hwnd: *mut std::ffi::c_void,
+                lp_operation: *const u16,
+                lp_file: *const u16,
+                lp_parameters: *const u16,
+                lp_directory: *const u16,
+                n_show_cmd: i32,
+            ) -> isize;
+        }
+        let op: Vec<u16> = OsStr::new("open").encode_wide().chain(Some(0)).collect();
+        let target: Vec<u16> = OsStr::new(trimmed).encode_wide().chain(Some(0)).collect();
+        // SAFETY: `op` and `target` are NUL-terminated UTF-16 slices live for the call.
+        let rc = unsafe {
+            ShellExecuteW(
+                std::ptr::null_mut(),
+                op.as_ptr(),
+                target.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                1, // SW_SHOWNORMAL
+            )
+        };
+        rc > 32
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open").arg(trimmed).spawn().is_ok()
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open").arg(trimmed).spawn().is_ok()
+    }
+}
 
 /// First line of a Git failure for a toast; the full text already went to the log.
 fn error_summary(error: &str) -> String {
@@ -503,12 +563,20 @@ impl StatusCache {
         &self.zoom_text
     }
 
-    /// File size label; the metadata syscall only runs when the tab or buffer changes.
-    pub fn file_size(&mut self, editor_id: u64, doc_version: u64, path: Option<&Path>) -> &str {
+    /// File size label; avoids disk metadata syscalls when buffer size is already known.
+    pub fn file_size(
+        &mut self,
+        editor_id: u64,
+        doc_version: u64,
+        buf_bytes: usize,
+        path: Option<&Path>,
+    ) -> &str {
         if self.size_key != (editor_id, doc_version) {
             self.size_key = (editor_id, doc_version);
             self.size_text.clear();
-            if let Some(path) = path
+            if buf_bytes > 0 {
+                self.size_text = crate::viewer::image_view::format_bytes(buf_bytes as u64);
+            } else if let Some(path) = path
                 && let Ok(meta) = std::fs::metadata(path)
             {
                 self.size_text = crate::viewer::image_view::format_bytes(meta.len());
@@ -545,25 +613,21 @@ impl StatusCache {
         (&self.branch_label, &self.branch_counts)
     }
 
-    /// Document-wide error/warning totals. The key is the tab count plus the total
-    /// diagnostic count, so the per-diagnostic walk only runs when that changes.
+    /// Document-wide error/warning totals, formatted only when `(errors, warnings)` changes.
     pub fn diagnostics(&mut self, tabs: &[Editor]) -> (usize, usize, &str, &str) {
-        let key = (
-            tabs.len(),
-            tabs.iter().map(|tab| tab.diagnostics.len()).sum::<usize>(),
-        );
-        if self.diag_key != key {
-            self.diag_key = key;
-            let (mut errors, mut warnings) = (0usize, 0usize);
-            for tab in tabs {
-                for diagnostic in &tab.diagnostics {
-                    match diagnostic.severity {
-                        DiagSeverity::Error => errors += 1,
-                        DiagSeverity::Warning => warnings += 1,
-                        DiagSeverity::Info => {}
-                    }
+        let (mut errors, mut warnings) = (0usize, 0usize);
+        for tab in tabs {
+            for diagnostic in &tab.diagnostics {
+                match diagnostic.severity {
+                    DiagSeverity::Error => errors += 1,
+                    DiagSeverity::Warning => warnings += 1,
+                    DiagSeverity::Info => {}
                 }
             }
+        }
+        let key = (errors, warnings);
+        if self.diag_key != key || self.diag_error_text.is_empty() {
+            self.diag_key = key;
             self.diag_errors = errors;
             self.diag_warnings = warnings;
             self.diag_error_text = errors.to_string();
@@ -578,21 +642,30 @@ impl StatusCache {
     }
 }
 
-/// Every command with a built-in shortcut, sorted once so a Shift/Alt chord is
-/// matched before its unmodified prefix (Ctrl+Shift+X must not fire Ctrl+X).
-///
-/// The old code rebuilt and sorted this list on every frame. Only key events can
-/// match a shortcut, so it is built lazily and read-only afterwards.
-static DEFAULT_SHORTCUTS: LazyLock<Vec<(Command, Shortcut)>> = LazyLock::new(|| {
+/// Resolve every active command shortcut (including custom bindings on commands
+/// that have no built-in default), sorted so more specific chords match first.
+pub(crate) fn effective_shortcut_bindings(
+    custom: &std::collections::HashMap<Command, Shortcut>,
+) -> Vec<(Command, Shortcut)> {
     let mut bindings: Vec<(Command, Shortcut)> = Command::ALL
         .iter()
-        .filter_map(|command| command.shortcut().map(|shortcut| (*command, shortcut)))
+        .filter_map(|&command| {
+            custom
+                .get(&command)
+                .copied()
+                .or_else(|| command.shortcut())
+                .map(|shortcut| (command, shortcut))
+        })
         .collect();
     bindings.sort_by_key(|(_, shortcut)| {
-        std::cmp::Reverse((shortcut.mods.shift as u8) * 2 + (shortcut.mods.alt as u8))
+        let count = (shortcut.mods.command as u8)
+            + (shortcut.mods.ctrl as u8)
+            + (shortcut.mods.shift as u8)
+            + (shortcut.mods.alt as u8);
+        std::cmp::Reverse((count, shortcut.mods.shift as u8, shortcut.mods.alt as u8))
     });
     bindings
-});
+}
 
 pub struct KestrelApp {
     pub settings: Settings,
@@ -601,6 +674,7 @@ pub struct KestrelApp {
     pub ui_family: FontFamily,
     pub ui_bold_family: FontFamily,
     pub mono_family: FontFamily,
+    pub mono_bold_family: FontFamily,
 
     pub tabs: Vec<Editor>,
     pub active: usize,
@@ -660,6 +734,13 @@ pub struct KestrelApp {
     /// Navigation history behind / ahead of the caret (Alt+← / Alt+→).
     jump_back: Vec<JumpPoint>,
     jump_forward: Vec<JumpPoint>,
+    /// Background Git `HEAD` baseline loader so file open never blocks on `git.exe`.
+    baseline_tx: Option<std::sync::mpsc::Sender<(u64, PathBuf, PathBuf)>>,
+    baseline_rx: std::sync::mpsc::Receiver<(u64, Option<String>)>,
+    pending_baselines: usize,
+    /// Defer ConPTY spawning for restored visible terminals until after frame 1 paints.
+    deferred_terminal_restore: bool,
+    deferred_terminal_active: usize,
 }
 
 /// A navigation target recorded by goto-definition / goto-line / symbol jumps.
@@ -672,6 +753,7 @@ struct JumpPoint {
 
 impl KestrelApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let startup_started = Instant::now();
         let mut settings = Settings::load();
         if let Ok(theme) = std::env::var("KESTREL_THEME") {
             settings.theme = theme;
@@ -682,9 +764,11 @@ impl KestrelApp {
         let font_set = crate::fonts::install(&cc.egui_ctx);
         let theme = Theme::by_kind(ThemeKind::from_str(&settings.theme));
         theme.apply(&cc.egui_ctx);
+        let ui_ready_ms = startup_started.elapsed().as_secs_f64() * 1000.0;
         let plugin_started = std::time::Instant::now();
         let plugins = PluginHost::new(&settings);
         let custom_shortcuts = build_custom_shortcuts(&settings);
+        let (_, baseline_rx) = std::sync::mpsc::channel();
 
         let term_h = settings.terminal_height.max(120.0);
         let mut bottom = BottomPanel::new();
@@ -715,6 +799,7 @@ impl KestrelApp {
             ui_family: font_set.ui_family,
             ui_bold_family: font_set.ui_bold_family,
             mono_family: font_set.mono_family,
+            mono_bold_family: font_set.mono_bold_family,
             tabs: Vec::new(),
             active: 0,
             groups: vec![EditorGroup::new()],
@@ -759,14 +844,21 @@ impl KestrelApp {
             last_session_save: Instant::now(),
             jump_back: Vec::new(),
             jump_forward: Vec::new(),
+            baseline_tx: None,
+            baseline_rx,
+            pending_baselines: 0,
+            deferred_terminal_restore: false,
+            deferred_terminal_active: 0,
         };
         app.bottom.follow_active_dir = app.settings.terminal_follow_active_dir;
         app.workspace.search_panel.include = app.settings.search_include.clone();
         app.workspace.search_panel.exclude = app.settings.search_exclude.clone();
         app.apply_dev_env();
+        let session_started = Instant::now();
         if app.workspace.root.is_none() && app.tabs.is_empty() && app.dev_ui.is_none() {
             app.restore_session();
         }
+        let session_ms = session_started.elapsed().as_secs_f64() * 1000.0;
         app.load_plugins();
         app.apply_dev_ui();
         if std::env::var_os("KESTREL_TRACE").is_some() {
@@ -774,6 +866,14 @@ impl KestrelApp {
                 "启动插件阶段 {:.2}ms",
                 plugin_started.elapsed().as_secs_f64() * 1000.0
             ));
+        }
+        if std::env::var_os("KESTREL_PROFILE").is_some() {
+            eprintln!(
+                "[kestrel profile] startup total={:.1}ms (fonts/theme={:.1}ms, session={:.1}ms)",
+                startup_started.elapsed().as_secs_f64() * 1000.0,
+                ui_ready_ms,
+                session_ms
+            );
         }
         app
     }
@@ -802,34 +902,55 @@ impl KestrelApp {
                 }
             }
         } else {
+            let mut opened_by_path: std::collections::HashMap<PathBuf, u64> =
+                std::collections::HashMap::new();
+            let mut restored_scrolls: Vec<std::collections::HashMap<u64, (f32, f32)>> = Vec::new();
             for saved in &session.groups {
                 let mut ids = Vec::new();
                 let mut active = 0usize;
+                let mut pane_scroll = std::collections::HashMap::new();
                 for (position, tab) in saved.tabs.iter().enumerate() {
-                    let path = PathBuf::from(&tab.path);
+                    let path = self.canonical(PathBuf::from(&tab.path));
                     if !path.is_file() {
                         continue;
                     }
-                    let before = self.tabs.len();
-                    self.open_file_quiet(path, Some((tab.caret, tab.scroll)));
-                    if self.tabs.len() > before {
-                        ids.push(self.tabs[self.tabs.len() - 1].id);
+                    let id = if let Some(&existing_id) = opened_by_path.get(&path) {
+                        Some(existing_id)
+                    } else {
+                        let before = self.tabs.len();
+                        self.open_file_quiet(path.clone(), Some((tab.caret, tab.scroll)));
+                        if self.tabs.len() > before {
+                            let new_id = self.tabs[self.tabs.len() - 1].id;
+                            opened_by_path.insert(path, new_id);
+                            Some(new_id)
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(id) = id {
+                        pane_scroll.insert(id, (tab.scroll, 0.0));
+                        if !ids.contains(&id) {
+                            ids.push(id);
+                        }
                         if position == saved.active {
-                            active = ids.len() - 1;
+                            active = ids.iter().position(|&t| t == id).unwrap_or(0);
                         }
                     }
                 }
                 if !ids.is_empty() {
                     restored_groups.push((ids, active));
+                    restored_scrolls.push(pane_scroll);
                 }
             }
             if !restored_groups.is_empty() {
                 self.groups = restored_groups
                     .iter()
-                    .map(|(ids, active)| {
+                    .zip(restored_scrolls)
+                    .map(|((ids, active), pane_scroll)| {
                         let mut group = EditorGroup::new();
                         group.tabs = ids.clone();
                         group.active = *active;
+                        group.pane_scroll = pane_scroll;
                         group
                     })
                     .collect();
@@ -886,11 +1007,12 @@ impl KestrelApp {
             self.sync_active();
         }
         self.restore_panel_state(&session);
+        // Avoid synchronous `is_file()` syscalls on startup (can stall on dead UNC/network paths).
         self.recent_files = session
             .recent_files
             .iter()
+            .take(12)
             .map(PathBuf::from)
-            .filter(|path| path.is_file())
             .collect();
         if let Some(editor) = self.tabs.get_mut(self.active) {
             editor.focus_requested = true;
@@ -923,17 +1045,13 @@ impl KestrelApp {
                 Some((ShellKind::from_str(&entry.shell), cwd))
             })
             .collect();
+        self.bottom.pending_terminals = specs;
         if session.bottom_visible {
-            for (shell, cwd) in specs {
-                self.open_terminal_in(cwd, shell);
-            }
             self.bottom.visible = true;
             self.bottom.tab = BottomTab::from_str(&session.bottom_tab);
-            self.bottom.active_terminal = session
-                .active_terminal
-                .min(self.bottom.terminals.len().saturating_sub(1));
-        } else {
-            self.bottom.pending_terminals = specs;
+            // Defer ConPTY spawn until frame 2 so frame 1 paints without waiting on PowerShell.
+            self.deferred_terminal_restore = !self.bottom.pending_terminals.is_empty();
+            self.deferred_terminal_active = session.active_terminal;
         }
         if !session.search_query.is_empty() {
             self.workspace.search_panel.query = session.search_query.clone();
@@ -1352,24 +1470,19 @@ impl KestrelApp {
             ui_family: self.ui_family.clone(),
             ui_bold_family: self.ui_bold_family.clone(),
             mono_family: self.mono_family.clone(),
+            mono_bold_family: self.mono_bold_family.clone(),
             ui_size: 13.0,
         }
     }
 
     pub fn editor_style(&self) -> EditorStyle {
-
-        // A >8 MB document is a read-only preview: its minimap row scan is pure
-        // overhead (syntax highlighting is already off above 1.5 MB).
-        let large_active = self
-            .active_editor()
-            .is_some_and(|tab| tab.doc.len_bytes() as u64 > MAX_OPEN_FILE_BYTES);
         EditorStyle {
             theme: self.theme,
             font_size: self.settings.font_size,
             line_h: self.settings.line_px(),
             tab_size: self.settings.tab_size,
             insert_spaces: self.settings.insert_spaces,
-            show_minimap: self.settings.show_minimap && !large_active,
+            show_minimap: self.settings.show_minimap,
             show_line_numbers: self.settings.show_line_numbers,
             show_indent_guides: self.settings.show_indent_guides,
             show_whitespace: self.settings.show_whitespace,
@@ -1381,6 +1494,42 @@ impl KestrelApp {
             ui_size: 12.5,
             ui_family: self.ui_family.clone(),
             mono_family: self.mono_family.clone(),
+        }
+    }
+
+    /// Fetch the Git `HEAD` blob for `path` on a background thread so opening files
+    /// and restoring sessions never block on `git.exe`.
+    fn queue_git_baseline(&mut self, tab_id: u64, path: PathBuf) {
+        let Some(root) = self.workspace.root.clone() else {
+            return;
+        };
+        if self.baseline_tx.is_none() {
+            let (req_tx, req_rx) = std::sync::mpsc::channel::<(u64, PathBuf, PathBuf)>();
+            let (res_tx, res_rx) = std::sync::mpsc::channel::<(u64, Option<String>)>();
+            let ctx = self.egui_ctx.clone();
+            if std::thread::Builder::new()
+                .name("kestrel-git-baseline".to_string())
+                .spawn(move || {
+                    while let Ok((id, repo_root, file_path)) = req_rx.recv() {
+                        let blob = crate::git::read_head_blob(&repo_root, &file_path);
+                        if res_tx.send((id, blob)).is_err() {
+                            break;
+                        }
+                        ctx.request_repaint();
+                    }
+                })
+                .is_ok()
+            {
+                self.baseline_tx = Some(req_tx);
+                self.baseline_rx = res_rx;
+            } else {
+                return;
+            }
+        }
+        if let Some(tx) = &self.baseline_tx
+            && tx.send((tab_id, root, path)).is_ok()
+        {
+            self.pending_baselines += 1;
         }
     }
 
@@ -1813,14 +1962,9 @@ impl KestrelApp {
                     }
                 }
                 PreviewEvent::OpenUrl(url) => {
-                    #[cfg(windows)]
-                    let _ = std::process::Command::new("cmd")
-                        .args(["/C", "start", "", &url])
-                        .spawn();
-                    #[cfg(target_os = "macos")]
-                    let _ = std::process::Command::new("open").arg(&url).spawn();
-                    #[cfg(all(unix, not(target_os = "macos")))]
-                    let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+                    if !open_external_url(&url) {
+                        self.toast("已阻止打开不安全或无效的外部链接", ToastKind::Warning);
+                    }
                 }
                 PreviewEvent::OpenFile { path, anchor } => {
                     self.open_file(path);
@@ -1869,14 +2013,9 @@ impl KestrelApp {
                 }
                 ViewerEvent::OpenPath(path) => self.open_file(path),
                 ViewerEvent::OpenUrl(url) => {
-                    #[cfg(windows)]
-                    let _ = std::process::Command::new("cmd")
-                        .args(["/C", "start", "", &url])
-                        .spawn();
-                    #[cfg(target_os = "macos")]
-                    let _ = std::process::Command::new("open").arg(&url).spawn();
-                    #[cfg(all(unix, not(target_os = "macos")))]
-                    let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+                    if !open_external_url(&url) {
+                        self.toast("已阻止打开不安全或无效的外部链接", ToastKind::Warning);
+                    }
                 }
             }
         }
@@ -1964,6 +2103,7 @@ impl KestrelApp {
     }
 
     fn open_file_internal(&mut self, path: PathBuf, as_preview: bool) {
+        let path = self.canonical(path);
         if path.is_file() {
             self.record_recent_file(&path);
         }
@@ -2024,13 +2164,9 @@ impl KestrelApp {
             Ok(mut doc) => {
                 if large {
                     // >8 MB: read-only preview. Syntax analysis is already gated at
-                    // 1.5 MB and the minimap is disabled by editor_style, so the tab
+                    // 1.5 MB and the minimap is disabled per pane, so the tab
                     // stays cheap to paint.
                     doc.readonly = true;
-                } else if let Some(root) = &self.workspace.root
-                    && let Some(head_text) = crate::git::read_head_blob(root, &path)
-                {
-                    doc.baseline_text = Some(head_text.replace("\r\n", "\n").into());
                 }
                 if large {
                     self.toast(LARGE_FILE_TOAST, ToastKind::Warning);
@@ -2047,6 +2183,9 @@ impl KestrelApp {
                 let id = self.next_id;
                 self.next_id += 1;
                 let mut editor = Editor::new(doc, id, 0);
+                if self.settings.detect_indentation {
+                    editor.detect_indentation();
+                }
                 editor.focus_requested = true;
                 editor.ensure_visible = true;
                 editor.preview = as_preview;
@@ -2067,7 +2206,7 @@ impl KestrelApp {
                     );
                 }
                 // Reuse existing clean preview tab if opening in preview mode
-                if as_preview
+                let final_id = if as_preview
                     && let Some(prev_idx) = self
                         .tabs
                         .iter()
@@ -2077,9 +2216,14 @@ impl KestrelApp {
                     editor.id = keep_id;
                     self.tabs[prev_idx] = editor;
                     self.focus_tab(keep_id);
+                    keep_id
                 } else {
                     self.tabs.push(editor);
                     self.attach_editor_to_active_group(id);
+                    id
+                };
+                if !large {
+                    self.queue_git_baseline(final_id, path.clone());
                 }
                 self.reveal_in_tree(&path);
                 self.record_recent_file(&path);
@@ -2114,17 +2258,17 @@ impl KestrelApp {
             return;
         }
         let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let large = is_large_file(size);
         if let Ok(mut doc) = Document::load(&path) {
-            if is_large_file(size) {
+            if large {
                 doc.readonly = true;
-            } else if let Some(root) = &self.workspace.root
-                && let Some(head_text) = crate::git::read_head_blob(root, &path)
-            {
-                doc.baseline_text = Some(head_text.replace("\r\n", "\n").into());
             }
             let id = self.next_id;
             self.next_id += 1;
             let mut editor = Editor::new(doc, id, 0);
+            if self.settings.detect_indentation {
+                editor.detect_indentation();
+            }
             editor.focus_requested = true;
             if let Some(kind) = mm_kind {
                 let text = editor.doc.text();
@@ -2140,6 +2284,9 @@ impl KestrelApp {
             }
             self.tabs.push(editor);
             self.attach_editor_to_active_group(id);
+            if !large {
+                self.queue_git_baseline(id, path);
+            }
         }
     }
 
@@ -2548,10 +2695,24 @@ impl KestrelApp {
             return;
         }
         let doc_id = tab.id;
+        let format_on_save = self.settings.format_on_save;
+        let trim_ws = self.settings.trim_trailing_whitespace;
+        if let Some(tab) = self.tabs.get_mut(self.active)
+            && !tab.doc.readonly
+            && tab.doc.encoding != crate::doc::Encoding::Binary
+        {
+            if format_on_save {
+                let _ = tab.format_document();
+            }
+            if trim_ws {
+                tab.trim_trailing_whitespace();
+            }
+        }
         self.emit_plugin_event_for(Event::BeforeSave, doc_id);
         let Some(index) = self.tabs.iter().position(|tab| tab.id == doc_id) else {
             return;
         };
+        let saved_path = self.tabs[index].doc.path.clone();
         let result = {
             let tab = &mut self.tabs[index];
             let result = tab.doc.save();
@@ -2564,6 +2725,10 @@ impl KestrelApp {
         let name = self.tabs[index].title();
         match result {
             SaveOutcome::Saved => {
+                if let Some(path) = saved_path {
+                    self.reload_notified.remove(&path);
+                    self.conflict_notified.remove(&path);
+                }
                 self.toast(format!("已保存 {name}"), ToastKind::Success);
                 if let Some(root) = self.workspace.root.clone() {
                     self.git.refresh(&root);
@@ -2691,11 +2856,20 @@ impl KestrelApp {
         let mut saved = 0;
         let mut blocked = 0;
         let mut failed = 0;
+        let trim_ws = self.settings.trim_trailing_whitespace;
         for id in ids {
+            if trim_ws
+                && let Some(index) = self.tabs.iter().position(|tab| tab.id == id)
+                && !self.tabs[index].doc.readonly
+                && self.tabs[index].doc.encoding != crate::doc::Encoding::Binary
+            {
+                self.tabs[index].trim_trailing_whitespace();
+            }
             self.emit_plugin_event_for(Event::BeforeSave, id);
             let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else {
                 continue;
             };
+            let saved_path = self.tabs[index].doc.path.clone();
             let outcome = {
                 let tab = &mut self.tabs[index];
                 let result = tab.doc.save();
@@ -2708,6 +2882,10 @@ impl KestrelApp {
             match outcome {
                 SaveOutcome::Saved => {
                     saved += 1;
+                    if let Some(path) = saved_path {
+                        self.reload_notified.remove(&path);
+                        self.conflict_notified.remove(&path);
+                    }
                     self.emit_plugin_event_for(Event::Saved, id);
                 }
                 SaveOutcome::DiskChanged | SaveOutcome::ReadOnly => blocked += 1,
@@ -2729,9 +2907,19 @@ impl KestrelApp {
     }
 
     pub fn reload_active(&mut self) {
+        let reloaded_path = self
+            .tabs
+            .get(self.active)
+            .and_then(|tab| tab.doc.path.clone());
         if let Some(tab) = self.tabs.get_mut(self.active) {
-            match tab.doc.reload() {
-                Ok(()) => self.toast("已从磁盘重新加载", ToastKind::Info),
+            match tab.reload() {
+                Ok(()) => {
+                    if let Some(path) = reloaded_path {
+                        self.reload_notified.remove(&path);
+                        self.conflict_notified.remove(&path);
+                    }
+                    self.toast("已从磁盘重新加载", ToastKind::Info);
+                }
                 Err(err) => self.toast(format!("重新加载失败: {err}"), ToastKind::Error),
             }
         }
@@ -2758,11 +2946,10 @@ impl KestrelApp {
                     ToastKind::Warning,
                 );
             }
-        } else if self.tabs[index].doc.reload().is_ok() {
-            self.tabs[index].invalidate_layout();
-            if self.reload_notified.insert(path.to_path_buf()) {
-                self.toast(format!("{title} 已从磁盘重新加载"), ToastKind::Info);
-            }
+        } else if self.tabs[index].reload().is_ok()
+            && self.reload_notified.insert(path.to_path_buf())
+        {
+            self.toast(format!("{title} 已从磁盘重新加载"), ToastKind::Info);
         }
     }
 
@@ -2952,14 +3139,16 @@ impl KestrelApp {
                 if let Some(parent) = path.parent() {
                     self.workspace.tree.reload_dir(parent);
                 }
-                if let Some(index) = self
-                    .tabs
-                    .iter()
-                    .position(|t| t.doc.path.as_deref() == Some(path.as_path()))
-                {
-                    self.tabs.remove(index);
-                    self.active = self.active.min(self.tabs.len().saturating_sub(1));
-                }
+                let canonical = self.canonical(path.clone());
+                self.tabs.retain(|t| {
+                    t.doc.path.as_deref().is_none_or(|p| {
+                        p != path.as_path()
+                            && !p.starts_with(&path)
+                            && p != canonical.as_path()
+                            && !p.starts_with(&canonical)
+                    })
+                });
+                self.normalize_groups();
                 if let Some(root) = &self.workspace.root {
                     self.workspace.index.scan(root);
                     self.git.refresh(root);
@@ -2975,6 +3164,7 @@ impl KestrelApp {
         let mut deleted = 0usize;
         let mut failed = 0usize;
         let mut parents: Vec<PathBuf> = Vec::new();
+        let mut removed_roots: Vec<(PathBuf, PathBuf)> = Vec::new();
         for path in paths {
             match crate::workspace::tree::delete(path) {
                 Ok(()) => {
@@ -2982,18 +3172,24 @@ impl KestrelApp {
                     if let Some(parent) = path.parent() {
                         parents.push(parent.to_path_buf());
                     }
-                    if let Some(index) = self
-                        .tabs
-                        .iter()
-                        .position(|t| t.doc.path.as_deref() == Some(path.as_path()))
-                    {
-                        self.tabs.remove(index);
-                    }
+                    removed_roots.push((path.clone(), self.canonical(path.clone())));
                 }
                 Err(_) => failed += 1,
             }
         }
-        self.active = self.active.min(self.tabs.len().saturating_sub(1));
+        if !removed_roots.is_empty() {
+            self.tabs.retain(|t| {
+                t.doc.path.as_deref().is_none_or(|p| {
+                    !removed_roots.iter().any(|(raw, canon)| {
+                        p == raw.as_path()
+                            || p.starts_with(raw)
+                            || p == canon.as_path()
+                            || p.starts_with(canon)
+                    })
+                })
+            });
+            self.normalize_groups();
+        }
         for parent in &parents {
             self.workspace.tree.reload_dir(parent);
         }
@@ -3204,8 +3400,7 @@ impl KestrelApp {
                     .find(|t| t.doc.path.as_deref() == Some(path.as_path()))
                     && !tab.is_dirty()
                 {
-                    let _ = tab.doc.reload();
-                    tab.invalidate_layout();
+                    let _ = tab.reload();
                 }
             }
         }
@@ -3822,7 +4017,7 @@ impl KestrelApp {
                     && let Ok(text) = clipboard.get_text()
                     && let Some(tab) = self.tabs.get_mut(self.active)
                 {
-                    tab.insert_text(&text);
+                    tab.paste_text(&text);
                 }
             }
             Command::SelectAll => {
@@ -4292,15 +4487,11 @@ impl KestrelApp {
             .is_some_and(|tab| tab.has_focus && tab.ime_preedit.is_empty());
         let terminal_focused = self.bottom.visible && self.bottom.terminal_has_focus;
         let mut handled = false;
-        for &(command, default_shortcut) in DEFAULT_SHORTCUTS.iter() {
+        let bindings = effective_shortcut_bindings(&self.custom_shortcuts);
+        for (command, shortcut) in bindings {
             if command.is_editor_command() && !editor_focused {
                 continue;
             }
-            let shortcut = self
-                .custom_shortcuts
-                .get(&command)
-                .copied()
-                .unwrap_or(default_shortcut);
             // Ctrl+Shift+V is both markdown-preview toggle and terminal paste; the
             // focused terminal owns it so paste never swaps in a preview.
             if terminal_focused && command == Command::ToggleMarkdownPreview {
@@ -4355,6 +4546,27 @@ impl KestrelApp {
         // Poll returns are the only wake-up for background work: without these
         // repaints a finished search or Git scan waited for the next input event.
         let mut repaint = false;
+        if self.deferred_terminal_restore && self.frame >= 1 {
+            self.deferred_terminal_restore = false;
+            let specs = std::mem::take(&mut self.bottom.pending_terminals);
+            for (shell, cwd) in specs {
+                self.open_terminal_in(cwd, shell);
+            }
+            self.bottom.active_terminal = self
+                .deferred_terminal_active
+                .min(self.bottom.terminals.len().saturating_sub(1));
+            repaint = true;
+        }
+        while let Ok((tab_id, head_text)) = self.baseline_rx.try_recv() {
+            self.pending_baselines = self.pending_baselines.saturating_sub(1);
+            if let Some(text) = head_text
+                && let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id)
+            {
+                tab.doc.set_git_baseline(text.replace("\r\n", "\n"));
+                tab.diff_version = 0;
+                repaint = true;
+            }
+        }
         if self.workspace.index.poll() {
             self.on_index_changed();
             repaint = true;
@@ -4372,8 +4584,7 @@ impl KestrelApp {
                     .iter_mut()
                     .find(|tab| tab.doc.path.as_deref() == Some(path.as_path()))
                 {
-                    let _ = tab.doc.reload();
-                    tab.diff_version = 0;
+                    let _ = tab.reload();
                 }
             }
             match op.result {
@@ -4549,8 +4760,55 @@ impl KestrelApp {
         if let Some(delay) = Settings::save_delay() {
             ctx.request_repaint_after(delay);
         }
-        if !self.viewer_loads.is_empty() {
+        if !self.viewer_loads.is_empty() || self.pending_baselines > 0 {
             ctx.request_repaint_after(Duration::from_millis(60));
+        }
+        if self.deferred_terminal_restore {
+            ctx.request_repaint();
+        }
+        if let Some(delay) = self
+            .tabs
+            .iter()
+            .filter_map(Editor::syntax_wakeup_after)
+            .min()
+        {
+            ctx.request_repaint_after(delay);
+        }
+        if self.plugins.has_pending_exec() {
+            ctx.request_repaint_after(Duration::from_millis(60));
+        }
+        if self.settings.autosave {
+            let mut next_autosave: Option<Duration> = None;
+            for tab in &self.tabs {
+                if tab.is_dirty() && tab.doc.path.is_some() {
+                    let wait = Duration::from_millis(1250)
+                        .saturating_sub(tab.last_edit.elapsed())
+                        .max(
+                            Duration::from_millis(950)
+                                .saturating_sub(self.last_autosave.elapsed()),
+                        )
+                        .max(Duration::from_millis(50));
+                    next_autosave = Some(match next_autosave {
+                        Some(best) => best.min(wait),
+                        None => wait,
+                    });
+                }
+            }
+            if let Some(delay) = next_autosave {
+                ctx.request_repaint_after(delay);
+            }
+        }
+        if let Some(delay) = self
+            .toasts
+            .iter()
+            .map(|toast| {
+                Duration::from_millis(3650)
+                    .saturating_sub(toast.created.elapsed())
+                    .max(Duration::from_millis(50))
+            })
+            .min()
+        {
+            ctx.request_repaint_after(delay);
         }
         ctx.request_repaint_after(
             Duration::from_secs(30).saturating_sub(self.last_session_save.elapsed()),
@@ -4594,7 +4852,11 @@ impl KestrelApp {
             let corner = 10.0;
             let left = pos.x - rect.left() <= edge;
             let right = rect.right() - pos.x <= edge;
-            let top = pos.y - rect.top() <= edge;
+            // Keep the top-right window control buttons (Min/Max/Close, 3*38px) clickable
+            // right up to the top edge; only the outermost corner/right edge resizes there.
+            let over_win_controls =
+                pos.y - rect.top() <= edge && pos.x >= rect.right() - 116.0 && !right;
+            let top = pos.y - rect.top() <= edge && !over_win_controls;
             let bottom = rect.bottom() - pos.y <= edge;
             let corner_left = pos.x - rect.left() <= corner;
             let corner_right = rect.right() - pos.x <= corner;
@@ -5134,8 +5396,10 @@ mod tests {
 
     #[test]
     fn default_shortcut_table_covers_every_bound_command_once() {
+        let empty = std::collections::HashMap::new();
+        let bindings = super::effective_shortcut_bindings(&empty);
         let mut seen = std::collections::HashSet::new();
-        for &(command, shortcut) in DEFAULT_SHORTCUTS.iter() {
+        for &(command, shortcut) in &bindings {
             assert_eq!(command.shortcut(), Some(shortcut), "{}", command.id());
             assert!(seen.insert(command), "duplicate {}", command.id());
         }
@@ -5147,12 +5411,59 @@ mod tests {
                 command.id()
             );
         }
-        // Shift/Alt chords sort before their unmodified prefix, so they win dispatch.
-        let priority =
-            |shortcut: Shortcut| (shortcut.mods.shift as u8) * 2 + shortcut.mods.alt as u8;
-        for pair in DEFAULT_SHORTCUTS.windows(2) {
+        // More specific chords sort before less specific ones so they win dispatch.
+        let priority = |shortcut: Shortcut| {
+            let count = (shortcut.mods.command as u8)
+                + (shortcut.mods.ctrl as u8)
+                + (shortcut.mods.shift as u8)
+                + (shortcut.mods.alt as u8);
+            (count, shortcut.mods.shift as u8, shortcut.mods.alt as u8)
+        };
+        for pair in bindings.windows(2) {
             assert!(priority(pair[0].1) >= priority(pair[1].1));
         }
+    }
+
+    #[test]
+    fn phase4_reliability_and_settings_regressions() {
+        // 1. Custom shortcut on a previously unbound command is now resolved & sorted properly.
+        let unbound = Command::ALL
+            .iter()
+            .copied()
+            .find(|cmd| cmd.shortcut().is_none())
+            .expect("expected at least one unbound command");
+        let chord = Shortcut::new(
+            egui::Modifiers::COMMAND | egui::Modifiers::ALT,
+            egui::Key::F9,
+        );
+        let mut custom = std::collections::HashMap::new();
+        custom.insert(unbound, chord);
+        let bindings = super::effective_shortcut_bindings(&custom);
+        assert!(bindings.iter().any(|&(cmd, sc)| cmd == unbound && sc == chord));
+
+        // 2. StatusCache::diagnostics updates even when total diagnostic count stays equal.
+        let mut cache = StatusCache::default();
+        let tabs_err = [editor_with(1, &[DiagSeverity::Error])];
+        assert_eq!(cache.diagnostics(&tabs_err), (1, 0, "1", "0"));
+        let tabs_warn = [editor_with(1, &[DiagSeverity::Warning])];
+        assert_eq!(cache.diagnostics(&tabs_warn), (0, 1, "0", "1"));
+
+        // 3. Editor indentation detection distinguishes 2 spaces, 4 spaces, and tabs.
+        let mut ed2 = Editor::new(
+            Document::from_text("fn a() {\n  let x = 1;\n  let y = 2;\n}\n"),
+            1,
+            0,
+        );
+        ed2.detect_indentation();
+        assert_eq!(ed2.detected_indent, Some((2, true)));
+
+        let mut ed_tab = Editor::new(
+            Document::from_text("func main() {\n\tfmt.Println()\n\treturn\n}\n"),
+            2,
+            0,
+        );
+        ed_tab.detect_indentation();
+        assert_eq!(ed_tab.detected_indent, Some((4, false)));
     }
 
     #[test]

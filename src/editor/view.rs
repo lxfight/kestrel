@@ -46,15 +46,118 @@ impl Editor {
         self.scroll_y = (row as f32 * line_h.max(1.0) + PAD_TOP).max(0.0);
     }
 
-    /// First row whose top edge is at or above the viewport.
+    /// Ensure `wrap_heights` and `wrap_y` match the current document / fold / width
+    /// when `style.word_wrap` is enabled; clears them when word wrap is off.
+    fn sync_wrap_metrics(&mut self, style: &EditorStyle, text_width: f32, line_h: f32) {
+        if !style.word_wrap {
+            if !self.wrap_heights.is_empty() {
+                self.wrap_heights.clear();
+                self.wrap_y.clear();
+                self.wrap_key = (0, 0, 0, 0);
+            }
+            return;
+        }
+        let row_count = self.line_map.row_count().max(1);
+        let key = (
+            self.doc.version,
+            self.fold_rev,
+            text_width.to_bits(),
+            line_h.to_bits(),
+        );
+        if self.wrap_key == key && self.wrap_heights.len() == row_count && self.wrap_y.len() == row_count + 1 {
+            return;
+        }
+        let wrap_w = (text_width - 12.0).max(40.0);
+        let chars_per_row = (wrap_w / self.char_w.max(1.0)).floor().max(1.0) as usize;
+        self.wrap_heights.clear();
+        self.wrap_heights.reserve(row_count);
+        self.wrap_y.clear();
+        self.wrap_y.reserve(row_count + 1);
+        let mut acc = 0.0f32;
+        self.wrap_y.push(0.0);
+        for row in 0..row_count {
+            let line = self.line_map.line_of_row(row);
+            let h = if let Some(cached) = self.galleys.get(&line) {
+                (cached.galley.rows.len().max(1) as f32 * line_h).max(cached.galley.rect.height())
+            } else {
+                let len = self.doc.line_char_len(line);
+                let est_rows = len.div_ceil(chars_per_row).max(1);
+                est_rows as f32 * line_h
+            };
+            self.wrap_heights.push(h);
+            acc += h;
+            self.wrap_y.push(acc);
+        }
+        self.wrap_key = key;
+    }
+
+    /// Update a single visible row's exact wrapped height from its laid-out galley.
+    fn sync_row_wrapped_height(&mut self, row: usize, line: usize, line_h: f32) {
+        if self.wrap_heights.is_empty() || row >= self.wrap_heights.len() {
+            return;
+        }
+        let Some(cached) = self.galleys.get(&line) else {
+            return;
+        };
+        let exact = (cached.galley.rows.len().max(1) as f32 * line_h).max(cached.galley.rect.height());
+        if (exact - self.wrap_heights[row]).abs() > 0.5 {
+            self.wrap_heights[row] = exact;
+            let mut acc = self.wrap_y[row];
+            for r in row..self.wrap_heights.len() {
+                acc += self.wrap_heights[r];
+                self.wrap_y[r + 1] = acc;
+            }
+        }
+    }
+
+    fn row_top_offset(&self, row: usize, line_h: f32) -> f32 {
+        if !self.wrap_y.is_empty() {
+            self.wrap_y[row.min(self.wrap_y.len().saturating_sub(1))]
+        } else {
+            row as f32 * line_h
+        }
+    }
+
+    fn row_visual_height(&self, row: usize, line_h: f32) -> f32 {
+        if !self.wrap_heights.is_empty() {
+            self.wrap_heights.get(row).copied().unwrap_or(line_h)
+        } else {
+            line_h
+        }
+    }
+
+    fn total_view_height(&mut self, line_h: f32) -> f32 {
+        if let Some(&h) = self.wrap_y.last() {
+            h.max(line_h)
+        } else {
+            self.total_content_height(line_h)
+        }
+    }
+
+    /// First row whose bottom edge is at or below the top of the viewport.
     fn first_visible_row(&self, line_h: f32) -> usize {
-        ((self.scroll_y - PAD_TOP).max(0.0) / line_h.max(1.0)).floor() as usize
+        let y = (self.scroll_y - PAD_TOP).max(0.0);
+        if !self.wrap_y.is_empty() {
+            let row_count = self.wrap_heights.len().max(1);
+            let idx = self.wrap_y.partition_point(|&top| top <= y);
+            idx.saturating_sub(1).min(row_count - 1)
+        } else {
+            (y / line_h.max(1.0)).floor() as usize
+        }
     }
 
     /// Row under a screen y coordinate, clamped to the last row.
     fn row_at_y(&self, y: f32, view_top: f32, line_h: f32, row_count: usize) -> usize {
-        (((y - view_top + self.scroll_y - PAD_TOP) / line_h).floor() as isize)
-            .clamp(0, row_count as isize - 1) as usize
+        let doc_y = y - view_top + self.scroll_y - PAD_TOP;
+        if !self.wrap_y.is_empty() {
+            if doc_y <= 0.0 {
+                return 0;
+            }
+            let idx = self.wrap_y.partition_point(|&top| top <= doc_y);
+            idx.saturating_sub(1).min(row_count.saturating_sub(1))
+        } else {
+            ((doc_y / line_h).floor() as isize).clamp(0, row_count as isize - 1) as usize
+        }
     }
 
     /// Start line of the sticky header floating above the viewport, if any.
@@ -93,8 +196,13 @@ impl Editor {
     }
 
     pub fn ui(&mut self, ui: &mut Ui, style: &EditorStyle) -> Option<EditorEvent> {
-        self.tab_size = style.tab_size.max(1);
-        self.insert_spaces = style.insert_spaces;
+        if let Some((tab_size, insert_spaces)) = self.detected_indent {
+            self.tab_size = tab_size.max(1);
+            self.insert_spaces = insert_spaces;
+        } else {
+            self.tab_size = style.tab_size.max(1);
+            self.insert_spaces = style.insert_spaces;
+        }
         self.autocomplete_enabled = style.autocomplete;
         let mut event = None;
 
@@ -141,6 +249,7 @@ impl Editor {
         self.refresh_syntax(Instant::now());
         self.sync_layout();
         self.sync_cache(ui, style, text_width);
+        self.sync_wrap_metrics(style, text_width, line_h);
         self.snap_caret_out_of_folds();
 
         if style.word_wrap {
@@ -153,7 +262,7 @@ impl Editor {
         self.sticky_h = self.sticky_height(style, line_h);
         let mut view_h = (rect.height() - self.sticky_h).max(line_h);
         let mut max_scroll =
-            Self::max_scroll(self.total_content_height(line_h), view_h, style, line_h);
+            Self::max_scroll(self.total_view_height(line_h), view_h, style, line_h);
         let rows = ((view_h / line_h).ceil() as usize + 1).max(2);
 
         let (scroll_delta, modifiers) = ui.input(|i| (i.smooth_scroll_delta, i.modifiers));
@@ -176,7 +285,7 @@ impl Editor {
 
         self.sticky_h = self.sticky_height(style, line_h);
         view_h = (rect.height() - self.sticky_h).max(line_h);
-        max_scroll = Self::max_scroll(self.total_content_height(line_h), view_h, style, line_h);
+        max_scroll = Self::max_scroll(self.total_view_height(line_h), view_h, style, line_h);
         self.scroll_y = self.scroll_y.clamp(0.0, max_scroll);
         let view_top = rect.top() + self.sticky_h;
         let row_count = self.line_map.row_count().max(1);
@@ -337,9 +446,11 @@ impl Editor {
         }
 
         // Folding or an edit changed the row count; settle the viewport metrics.
+        self.sync_layout();
+        self.sync_wrap_metrics(style, text_width, line_h);
         self.sticky_h = self.sticky_height(style, line_h);
         view_h = (rect.height() - self.sticky_h).max(line_h);
-        let total_h = self.total_content_height(line_h);
+        let total_h = self.total_view_height(line_h);
         max_scroll = Self::max_scroll(total_h, view_h, style, line_h);
         self.scroll_y = self.scroll_y.clamp(0.0, max_scroll);
         let view_top = rect.top() + self.sticky_h;
@@ -350,22 +461,25 @@ impl Editor {
         }
 
         // ---- caret visibility ----
-        let caret_line = self.doc.char_to_line(self.caret);
+        let (caret_line, caret_col) = self.doc.char_to_line_col(self.caret);
         let caret_row = self.row_of_line(caret_line).unwrap_or(0);
-        let care_y = caret_row as f32 * line_h - self.scroll_y + PAD_TOP;
         if self.ensure_visible {
+            let _ = self.line_galley(ui, style, caret_line, text_width);
+            self.sync_row_wrapped_height(caret_row, caret_line, line_h);
+            let total_h = self.total_view_height(line_h);
+            max_scroll = Self::max_scroll(total_h, view_h, style, line_h);
+            let caret_local = match self.galleys.get(&caret_line) {
+                Some(cached) => self.pos_of_col_in(cached, caret_col),
+                None => Pos2::ZERO,
+            };
+            let care_y = self.row_top_offset(caret_row, line_h) + caret_local.y - self.scroll_y + PAD_TOP;
             if care_y < 0.0 {
                 self.scroll_y += care_y - 2.0;
             } else if care_y + line_h > view_h {
                 self.scroll_y += care_y + line_h - view_h + 2.0;
             }
             if !style.word_wrap {
-                let (caret_col, _) = self.doc.char_to_line_col(self.caret);
-                let _ = self.line_galley(ui, style, caret_line, text_width);
-                let x = match self.galleys.get(&caret_line) {
-                    Some(cached) => self.x_of_col_in(cached, caret_col),
-                    None => 0.0,
-                };
+                let x = caret_local.x;
                 if x - self.scroll_x < 0.0 {
                     self.scroll_x = (x - 10.0).max(0.0);
                 } else if x - self.scroll_x > text_width - 16.0 {
@@ -376,7 +490,13 @@ impl Editor {
             self.scroll_y = self.scroll_y.clamp(0.0, max_scroll);
         }
 
-        // ---- scrollbars and minimap interaction ----
+        // ---- paint canvas first so scrollbars render cleanly on top ----
+        self.paint(ui, style, rect, line_h, text_left, text_right, text_width);
+
+        // ---- vertical scrollbar (painted on top of canvas) ----
+        let total_h = self.total_view_height(line_h);
+        max_scroll = Self::max_scroll(total_h, view_h, style, line_h);
+        self.scroll_y = self.scroll_y.clamp(0.0, max_scroll);
         let scrollbar_rect = Rect::from_min_size(
             Pos2::new(rect.right() - SCROLLBAR_W, rect.top()),
             Vec2::new(SCROLLBAR_W, rect.height()),
@@ -384,29 +504,79 @@ impl Editor {
         if total_h > view_h {
             let sb_id = ui.scope_id().with(("v_scroll", self.id));
             let sb = ui.interact(scrollbar_rect, sb_id, Sense::click_and_drag());
-            let thumb_h = ((view_h / total_h) * view_h).clamp(30.0, view_h);
+            let thumb_h = ((view_h / total_h) * rect.height()).clamp(28.0, rect.height());
             if (sb.dragged() || sb.clicked())
                 && let Some(pos) = sb.interact_pointer_pos()
             {
-                let travel = (view_h - thumb_h).max(1.0);
+                let travel = (rect.height() - thumb_h).max(1.0);
                 let t = ((pos.y - rect.top() - thumb_h * 0.5) / travel).clamp(0.0, 1.0);
                 self.scroll_y = t * max_scroll;
             }
-            let thumb_y = rect.top() + (self.scroll_y / max_scroll.max(1.0)) * (view_h - thumb_h);
+            let thumb_y =
+                rect.top() + (self.scroll_y / max_scroll.max(1.0)) * (rect.height() - thumb_h);
+            let active_sb = sb.hovered() || sb.dragged();
+            let thumb_w = if active_sb { 8.0 } else { 5.0 };
             let thumb = Rect::from_min_size(
-                Pos2::new(scrollbar_rect.right() - 8.0, thumb_y),
-                Vec2::new(7.0, thumb_h),
+                Pos2::new(scrollbar_rect.right() - thumb_w - 1.5, thumb_y),
+                Vec2::new(thumb_w, thumb_h),
             );
-            let thumb_color = if sb.hovered() || sb.dragged() {
-                style.theme.border_strong
+            let thumb_color = if sb.dragged() {
+                style.theme.text_dim
+            } else if sb.hovered() {
+                style.theme.scrollbar_hover
             } else {
-                style.theme.border
+                style.theme.scrollbar
             };
-            ui.painter().rect_filled(thumb, 3.0, thumb_color);
+            ui.painter().rect_filled(thumb, thumb_w * 0.5, thumb_color);
         }
 
-        // ---- paint ----
-        self.paint(ui, style, rect, line_h, text_left, text_right, text_width);
+        // ---- horizontal scrollbar (when word_wrap is off and content overflows) ----
+        if !style.word_wrap {
+            let max_line_w = self
+                .galleys
+                .values()
+                .map(|c| c.text_width)
+                .fold(0.0f32, f32::max)
+                .max(self.scroll_x + text_width * 0.5);
+            let content_w = max_line_w + 48.0;
+            if content_w > text_width + 4.0 {
+                let max_scroll_x = (content_w - text_width).max(1.0);
+                self.scroll_x = self.scroll_x.clamp(0.0, max_scroll_x);
+                let hbar_h = 10.0;
+                let hbar_rect = Rect::from_min_max(
+                    Pos2::new(text_left, rect.bottom() - hbar_h),
+                    Pos2::new(text_right, rect.bottom()),
+                );
+                let hb_id = ui.scope_id().with(("h_scroll", self.id));
+                let hb = ui.interact(hbar_rect, hb_id, Sense::click_and_drag());
+                let track_w = hbar_rect.width().max(1.0);
+                let thumb_w = ((text_width / content_w) * track_w).clamp(28.0, track_w);
+                if (hb.dragged() || hb.clicked())
+                    && let Some(pos) = hb.interact_pointer_pos()
+                {
+                    let travel = (track_w - thumb_w).max(1.0);
+                    let t = ((pos.x - hbar_rect.left() - thumb_w * 0.5) / travel).clamp(0.0, 1.0);
+                    self.scroll_x = t * max_scroll_x;
+                }
+                let thumb_x =
+                    hbar_rect.left() + (self.scroll_x / max_scroll_x) * (track_w - thumb_w);
+                let active_hb = hb.hovered() || hb.dragged();
+                let thumb_h = if active_hb { 7.0 } else { 4.5 };
+                let thumb = Rect::from_min_size(
+                    Pos2::new(thumb_x, hbar_rect.bottom() - thumb_h - 1.5),
+                    Vec2::new(thumb_w, thumb_h),
+                );
+                let thumb_color = if hb.dragged() {
+                    style.theme.text_dim
+                } else if hb.hovered() {
+                    style.theme.scrollbar_hover
+                } else {
+                    style.theme.scrollbar
+                };
+                ui.painter().rect_filled(thumb, thumb_h * 0.5, thumb_color);
+            }
+        }
+
         self.paint_completion_popup(ui, style, rect, text_left, line_h);
         self.paint_find_widget(ui, style, rect);
 
@@ -474,9 +644,12 @@ impl Editor {
     fn atlas_probe(ui: &Ui, style: &EditorStyle) -> u64 {
         use std::hash::{Hash, Hasher};
         let font = style.mono();
+        let ppp = ui.ctx().pixels_per_point().to_bits();
         ui.ctx().fonts_mut(|fonts| {
             let galley = fonts.layout_no_wrap("Mg0_".to_owned(), font, Color32::WHITE);
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            ppp.hash(&mut hasher);
+            fonts.font_image_size().hash(&mut hasher);
             for row in &galley.rows {
                 for glyph in &row.glyphs {
                     glyph.uv_rect.min.hash(&mut hasher);
@@ -641,7 +814,7 @@ impl Editor {
         galley
     }
 
-    fn x_of_col_in(&self, cached: &super::CachedLine, col: usize) -> f32 {
+    fn pos_of_col_in(&self, cached: &super::CachedLine, col: usize) -> Pos2 {
         let vis_col = match &cached.vis_to_doc {
             Some(map) => map
                 .iter()
@@ -649,10 +822,14 @@ impl Editor {
                 .unwrap_or(map.len().saturating_sub(1)),
             None => col,
         };
-        cached
+        let r = cached
             .galley
-            .pos_from_cursor(egui::text::CCursor::new(vis_col))
-            .left()
+            .pos_from_cursor(egui::text::CCursor::new(vis_col));
+        Pos2::new(r.left(), r.top())
+    }
+
+    fn x_of_col_in(&self, cached: &super::CachedLine, col: usize) -> f32 {
+        self.pos_of_col_in(cached, col).x
     }
 
     fn pos_to_char(
@@ -671,13 +848,21 @@ impl Editor {
         let line = self.line_map.line_of_row(row);
         let x = pos.x - text_left + self.scroll_x;
         let galley = self.line_galley(ui, style, line, text_width);
+        self.sync_row_wrapped_height(row, line, line_h);
         let Some(cached) = self.galleys.get(&line) else {
             return self.doc.line_to_char(line);
         };
-        let vis_col = if x <= 0.0 {
+        let row_top = view_top + PAD_TOP - self.scroll_y + self.row_top_offset(row, line_h);
+        let row_h = self.row_visual_height(row, line_h).max(line_h);
+        let local_y = if style.word_wrap {
+            (pos.y - row_top).clamp(0.0, (row_h - 1.0).max(0.0))
+        } else {
+            line_h * 0.5
+        };
+        let vis_col = if x <= 0.0 && local_y < line_h {
             0
         } else {
-            let cc = galley.cursor_from_pos(Vec2::new(x, line_h * 0.5));
+            let cc = galley.cursor_from_pos(Vec2::new(x.max(0.0), local_y));
             cc.index.0.min(galley.text().chars().count())
         };
         let doc_col = match &cached.vis_to_doc {
@@ -704,13 +889,8 @@ impl Editor {
 
         let sticky_h = self.sticky_h.max(0.0);
         let view_top = rect.top() + sticky_h;
-        let view_h = (rect.height() - sticky_h).max(line_h);
         let row_count = self.line_map.row_count().max(1);
         let first_row = self.first_visible_row(line_h).min(row_count - 1);
-        let visible_rows = (view_h / line_h).ceil() as usize + 2;
-        let last_row = (first_row + visible_rows).min(row_count);
-        let first_line = self.line_map.line_of_row(first_row);
-        let last_line = self.line_map.line_of_row(last_row.saturating_sub(1));
         let origin_y = view_top + PAD_TOP - self.scroll_y;
         let origin = Pos2::new(text_left, origin_y);
         let clip = Rect::from_min_max(
@@ -718,9 +898,33 @@ impl Editor {
             Pos2::new(text_right, rect.bottom()),
         );
         let tp = painter.with_clip_rect(clip);
-        let row_y = |row: usize| origin_y + row as f32 * line_h;
 
-        // Current line highlight
+        // Ensure galleys exist for visible rows and refine wrapped heights before painting.
+        let mut last_row = first_row;
+        while last_row < row_count {
+            let line = self.line_map.line_of_row(last_row);
+            let _ = self.line_galley(ui, style, line, text_width);
+            self.sync_row_wrapped_height(last_row, line, line_h);
+            let row_bottom =
+                origin_y + self.row_top_offset(last_row, line_h) + self.row_visual_height(last_row, line_h);
+            last_row += 1;
+            if row_bottom >= rect.bottom() + line_h {
+                break;
+            }
+        }
+        let last_row = last_row.max((first_row + 1).min(row_count));
+        let first_line = self.line_map.line_of_row(first_row);
+        let last_line = self.line_map.line_of_row(last_row.saturating_sub(1));
+        let matching_brackets = if self.has_focus {
+            self.cached_matching_brackets()
+        } else {
+            None
+        };
+
+        let row_y = |row: usize| origin_y + self.row_top_offset(row, line_h);
+        let row_h = |row: usize| self.row_visual_height(row, line_h);
+
+        // Current line highlight (text area; gutter highlight painted after gutter background)
         let caret_line = self.doc.char_to_line(self.caret);
         let caret_col = self.doc.char_to_line_col(self.caret).1;
         if let Some(caret_row) = self.line_map.row_of(caret_line)
@@ -728,30 +932,15 @@ impl Editor {
             && caret_row < last_row
         {
             let y = row_y(caret_row);
-            painter.rect_filled(
-                Rect::from_min_max(Pos2::new(text_left, y), Pos2::new(text_right, y + line_h)),
+            let h = row_h(caret_row);
+            tp.rect_filled(
+                Rect::from_min_max(Pos2::new(text_left, y), Pos2::new(text_right, y + h)),
                 0.0,
                 theme.current_line,
             );
-            if style.show_line_numbers {
-                painter.rect_filled(
-                    Rect::from_min_max(
-                        Pos2::new(rect.left(), y),
-                        Pos2::new(text_left, y + line_h),
-                    ),
-                    0.0,
-                    theme.current_line,
-                );
-            }
         }
 
-        // Ensure galleys exist for visible rows.
-        for row in first_row..last_row {
-            let line = self.line_map.line_of_row(row);
-            let _ = self.line_galley(ui, style, line, text_width);
-        }
-
-        // Indent guides
+        // Indent guides (respecting scroll_x and clipped to text viewport)
         if style.show_indent_guides {
             let guide_color = theme.indent_guide;
             let active = theme.indent_guide_active;
@@ -773,16 +962,17 @@ impl Editor {
                     }
                 }
                 let y = row_y(row);
+                let h = row_h(row);
                 let mut col = tab;
                 while col <= cols {
-                    let x = origin.x + self.x_of_col_in(cached, col);
+                    let x = origin.x + self.x_of_col_in(cached, col) - self.scroll_x;
                     let color = if line == caret_line && col <= caret_col {
                         active
                     } else {
                         guide_color
                     };
-                    painter.line_segment(
-                        [Pos2::new(x, y), Pos2::new(x, y + line_h)],
+                    tp.line_segment(
+                        [Pos2::new(x, y), Pos2::new(x, y + h)],
                         Stroke::new(1.0, color),
                     );
                     col += tab;
@@ -790,7 +980,7 @@ impl Editor {
             }
         }
 
-        // Find matches (only those intersecting the viewport)
+        // Find matches (only those intersecting the viewport, clipped & wrap-aware)
         if self.find.open && !self.find.matches.is_empty() {
             let visible_start = self.doc.line_to_char(first_line);
             let visible_end =
@@ -828,23 +1018,47 @@ impl Editor {
                     } else {
                         end.saturating_sub(line_start)
                     };
-                    let x1 = origin.x + self.x_of_col_in(cached, a) - self.scroll_x;
-                    let x2 = if b >= line_len {
-                        origin.x + cached.text_width.max((b as f32) * self.char_w) - self.scroll_x
-                    } else {
-                        origin.x + self.x_of_col_in(cached, b) - self.scroll_x
-                    };
+                    let p1 = self.pos_of_col_in(cached, a);
+                    let p2 = self.pos_of_col_in(cached, b);
                     let y = row_y(row);
-                    painter.rect_filled(
-                        Rect::from_min_max(Pos2::new(x1 - 1.0, y), Pos2::new(x2 + 1.0, y + line_h)),
-                        2.0,
-                        color,
-                    );
+                    if (p1.y - p2.y).abs() < 1.0 {
+                        let x1 = origin.x + p1.x - self.scroll_x;
+                        let x2 = if b >= line_len && !style.word_wrap {
+                            origin.x + cached.text_width.max((b as f32) * self.char_w) - self.scroll_x
+                        } else {
+                            origin.x + p2.x - self.scroll_x
+                        };
+                        tp.rect_filled(
+                            Rect::from_min_max(
+                                Pos2::new(x1 - 1.0, y + p1.y),
+                                Pos2::new(x2 + 1.0, y + p1.y + line_h),
+                            ),
+                            2.0,
+                            color,
+                        );
+                    } else {
+                        for prow in &cached.galley.rows {
+                            let r = prow.rect();
+                            if r.bottom() <= p1.y + 0.5 || r.top() >= p2.y + line_h - 0.5 {
+                                continue;
+                            }
+                            let sx = if (r.top() - p1.y).abs() < 1.0 { p1.x } else { r.left() };
+                            let ex = if (r.top() - p2.y).abs() < 1.0 { p2.x } else { r.right() };
+                            tp.rect_filled(
+                                Rect::from_min_max(
+                                    Pos2::new(origin.x + sx - self.scroll_x - 1.0, y + r.top()),
+                                    Pos2::new(origin.x + ex - self.scroll_x + 1.0, y + r.top() + line_h),
+                                ),
+                                2.0,
+                                color,
+                            );
+                        }
+                    }
                 }
             }
         }
 
-        // Selections (Primary + Extra Multi-Cursors), one pass over visible rows.
+        // Selections (Primary + Extra Multi-Cursors), clipped & wrap-aware.
         let sel_color = if self.has_focus {
             theme.selection
         } else {
@@ -867,32 +1081,67 @@ impl Editor {
                 let Some(cached) = self.galleys.get(&line) else {
                     continue;
                 };
+                let y = row_y(row);
                 for &(sel_start, sel_end) in &all_selections {
                     if sel_end < line_start || sel_start > line_start + line_len {
                         continue;
                     }
                     let a = sel_start.saturating_sub(line_start).min(line_len);
-                    let b = if sel_end > line_start + line_len {
-                        line_len + 1
+                    let spans_newline = sel_end > line_start + line_len;
+                    let b = if spans_newline {
+                        line_len
                     } else {
                         sel_end.saturating_sub(line_start)
                     };
-                    let x1 = origin.x + self.x_of_col_in(cached, a) - self.scroll_x;
-                    let x2 = if b > line_len {
-                        text_right - 4.0
+                    let p1 = self.pos_of_col_in(cached, a);
+                    let p2 = self.pos_of_col_in(cached, b);
+                    if (p1.y - p2.y).abs() < 1.0 {
+                        let x1 = origin.x + p1.x - self.scroll_x;
+                        let x2 = if spans_newline {
+                            text_right - 4.0
+                        } else {
+                            origin.x + p2.x - self.scroll_x
+                        };
+                        if x2 > x1 || spans_newline {
+                            tp.rect_filled(
+                                Rect::from_min_max(
+                                    Pos2::new(x1, y + p1.y),
+                                    Pos2::new(x2.max(x1 + 2.0), y + p1.y + line_h),
+                                ),
+                                2.0,
+                                sel_color,
+                            );
+                        }
                     } else {
-                        origin.x + self.x_of_col_in(cached, b) - self.scroll_x
-                    };
-                    let y = row_y(row);
-                    if x2 > x1 || b > line_len {
-                        painter.rect_filled(
-                            Rect::from_min_max(
-                                Pos2::new(x1, y),
-                                Pos2::new(x2.max(x1 + 2.0), y + line_h),
-                            ),
-                            2.0,
-                            sel_color,
-                        );
+                        let row_len = cached.galley.rows.len();
+                        for (idx, prow) in cached.galley.rows.iter().enumerate() {
+                            let r = prow.rect();
+                            if r.bottom() <= p1.y + 0.5 || r.top() >= p2.y + line_h - 0.5 {
+                                continue;
+                            }
+                            let sx = if (r.top() - p1.y).abs() < 1.0 {
+                                origin.x + p1.x - self.scroll_x
+                            } else {
+                                origin.x + r.left() - self.scroll_x
+                            };
+                            let ex = if idx + 1 == row_len && spans_newline {
+                                text_right - 4.0
+                            } else if (r.top() - p2.y).abs() < 1.0 && !spans_newline {
+                                origin.x + p2.x - self.scroll_x
+                            } else {
+                                origin.x + r.right().max(r.left() + 4.0) - self.scroll_x
+                            };
+                            if ex > sx {
+                                tp.rect_filled(
+                                    Rect::from_min_max(
+                                        Pos2::new(sx, y + r.top()),
+                                        Pos2::new(ex.max(sx + 2.0), y + r.top() + line_h),
+                                    ),
+                                    2.0,
+                                    sel_color,
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -945,10 +1194,15 @@ impl Editor {
                 continue;
             }
             if let Some(cached) = self.galleys.get(&diag.line) {
-                let x1 = origin.x + self.x_of_col_in(cached, diag.col) - self.scroll_x;
-                let x2 = (origin.x + self.x_of_col_in(cached, diag.end_col) - self.scroll_x)
-                    .max(x1 + self.char_w * 2.0);
-                let y = row_y(row) + line_h - 2.0;
+                let p1 = self.pos_of_col_in(cached, diag.col);
+                let p2 = self.pos_of_col_in(cached, diag.end_col);
+                let x1 = origin.x + p1.x - self.scroll_x;
+                let x2 = if (p1.y - p2.y).abs() < 1.0 {
+                    (origin.x + p2.x - self.scroll_x).max(x1 + self.char_w * 2.0)
+                } else {
+                    (text_right - 6.0).max(x1 + self.char_w * 2.0)
+                };
+                let y = row_y(row) + p1.y + line_h - 2.0;
                 let color = match diag.severity {
                     DiagSeverity::Error => theme.error,
                     DiagSeverity::Warning => theme.warning,
@@ -958,7 +1212,7 @@ impl Editor {
             }
         }
 
-        // Whitespace markers
+        // Whitespace markers (clipped to text viewport)
         if style.show_whitespace {
             let dot = theme.text_faint.gamma_multiply(0.6);
             for row in first_row..last_row {
@@ -967,16 +1221,18 @@ impl Editor {
                     continue;
                 };
                 let content = self.doc.line_content(line);
-                let y = row_y(row) + line_h * 0.5;
+                let y_base = row_y(row);
                 let mut col = 0usize;
                 for ch in content.chars() {
                     if ch == ' ' {
-                        let x = origin.x + self.x_of_col_in(cached, col) - self.scroll_x
-                            + self.char_w * 0.5;
-                        painter.circle_filled(Pos2::new(x, y), 0.9, dot);
+                        let p = self.pos_of_col_in(cached, col);
+                        let x = origin.x + p.x - self.scroll_x + self.char_w * 0.5;
+                        tp.circle_filled(Pos2::new(x, y_base + p.y + line_h * 0.5), 0.9, dot);
                     } else if ch == '\t' {
-                        let x = origin.x + self.x_of_col_in(cached, col) - self.scroll_x + 2.0;
-                        painter.line_segment(
+                        let p = self.pos_of_col_in(cached, col);
+                        let x = origin.x + p.x - self.scroll_x + 2.0;
+                        let y = y_base + p.y + line_h * 0.5;
+                        tp.line_segment(
                             [Pos2::new(x, y), Pos2::new(x + self.char_w * 1.4, y)],
                             Stroke::new(1.0, dot),
                         );
@@ -998,6 +1254,26 @@ impl Editor {
                 0.0,
                 theme.bg,
             );
+            // Current-line gutter highlight painted AFTER gutter bg fill so it stays visible.
+            if let Some(caret_row) = self.line_map.row_of(caret_line)
+                && caret_row >= first_row
+                && caret_row < last_row
+            {
+                let y = row_y(caret_row);
+                let h = row_h(caret_row);
+                let gutter_clip = painter.with_clip_rect(Rect::from_min_max(
+                    Pos2::new(rect.left(), view_top),
+                    Pos2::new(text_left, rect.bottom()),
+                ));
+                gutter_clip.rect_filled(
+                    Rect::from_min_max(
+                        Pos2::new(rect.left(), y),
+                        Pos2::new(text_left, y + h),
+                    ),
+                    0.0,
+                    theme.current_line,
+                );
+            }
             painter.line_segment(
                 [
                     Pos2::new(text_left - 0.5, rect.top()),
@@ -1016,7 +1292,7 @@ impl Editor {
                 let color = if line == caret_line {
                     theme.text
                 } else {
-                    theme.text_faint
+                    theme.text_muted
                 };
                 painter.text(
                     Pos2::new(text_left - 18.0, y + line_h * 0.5),
@@ -1093,10 +1369,8 @@ impl Editor {
             }
         }
 
-        // Bracket match (memoized: the pair scan no longer runs on every frame)
-        if self.has_focus
-            && let Some((open, close)) = self.cached_matching_brackets()
-        {
+        // Bracket match (memoized, clipped & wrap-aware)
+        if let Some((open, close)) = matching_brackets {
             for ch_pos in [open, close] {
                 let line = self.doc.char_to_line(ch_pos);
                 let Some(row) = self.line_map.row_of(line) else {
@@ -1107,9 +1381,10 @@ impl Editor {
                 }
                 let col = self.doc.char_to_line_col(ch_pos).1;
                 if let Some(cached) = self.galleys.get(&line) {
-                    let x = origin.x + self.x_of_col_in(cached, col) - self.scroll_x;
-                    let y = row_y(row);
-                    painter.rect_stroke(
+                    let p = self.pos_of_col_in(cached, col);
+                    let x = origin.x + p.x - self.scroll_x;
+                    let y = row_y(row) + p.y;
+                    tp.rect_stroke(
                         Rect::from_min_max(
                             Pos2::new(x - 1.0, y + 1.0),
                             Pos2::new(x + self.char_w + 1.0, y + line_h - 1.0),
@@ -1122,7 +1397,7 @@ impl Editor {
             }
         }
 
-        // Carets (Primary + Extra Multi-Cursors)
+        // Carets (Primary + Extra Multi-Cursors, clipped & wrap-aware)
         if self.has_focus {
             let t = ui.input(|i| i.time);
             let blinking = ((t - self.blink_base) * 1.8).fract();
@@ -1142,9 +1417,10 @@ impl Editor {
                     }
                     let c_col = self.doc.char_to_line_col(c_pos).1;
                     if let Some(cached) = self.galleys.get(&c_line) {
-                        let x = origin.x + self.x_of_col_in(cached, c_col) - self.scroll_x;
-                        let y = row_y(c_row);
-                        painter.rect_filled(
+                        let p = self.pos_of_col_in(cached, c_col);
+                        let x = origin.x + p.x - self.scroll_x;
+                        let y = row_y(c_row) + p.y;
+                        tp.rect_filled(
                             Rect::from_min_size(
                                 Pos2::new(x, y + 1.0),
                                 Vec2::new(2.0, line_h - 2.0),
@@ -1157,7 +1433,7 @@ impl Editor {
             }
         }
 
-        // Drop caret while dragging selected text inside the canvas.
+        // Drop caret while dragging selected text inside the canvas (clipped & wrap-aware).
         if let Some(drag) = &self.text_drag
             && drag.moved
             && let Some(drop) = drag.drop
@@ -1169,9 +1445,10 @@ impl Editor {
                 && row < last_row
                 && let Some(cached) = self.galleys.get(&line)
             {
-                let x = origin.x + self.x_of_col_in(cached, col) - self.scroll_x;
-                let y = row_y(row);
-                painter.rect_filled(
+                let p = self.pos_of_col_in(cached, col);
+                let x = origin.x + p.x - self.scroll_x;
+                let y = row_y(row) + p.y;
+                tp.rect_filled(
                     Rect::from_min_size(Pos2::new(x - 1.0, y), Vec2::new(2.0, line_h)),
                     1.0,
                     theme.accent,
@@ -1189,11 +1466,11 @@ impl Editor {
             .row_of(caret_line)
             .filter(|row| *row >= first_row && *row < last_row);
         let caret_pos = caret_row.map(|row| {
-            let x = match self.galleys.get(&caret_line) {
-                Some(cached) => self.x_of_col_in(cached, caret_col),
-                None => 0.0,
+            let p = match self.galleys.get(&caret_line) {
+                Some(cached) => self.pos_of_col_in(cached, caret_col),
+                None => Pos2::ZERO,
             };
-            Pos2::new(origin.x + x - self.scroll_x, row_y(row))
+            Pos2::new(origin.x + p.x - self.scroll_x, row_y(row) + p.y)
         });
         if self.has_focus && !self.doc.readonly {
             // Keep IME enabled for the whole editor even while the caret is
@@ -1364,7 +1641,7 @@ impl Editor {
                 Vec2::new(mm.width() - 2.0, row_h.max(2.0)),
             ),
             0.0,
-            theme.accent.gamma_multiply(0.22),
+            theme.accent_subtle,
         );
 
         for (i, cached_row) in self.minimap_cache.rows.iter().enumerate() {
@@ -1416,11 +1693,11 @@ impl Editor {
             Pos2::new(mm.left() + 1.0, vy),
             Vec2::new(mm.width() - 2.0, vh),
         );
-        painter.rect_filled(vp_rect, 2.0, Color32::from_white_alpha(15));
+        painter.rect_filled(vp_rect, 2.0, theme.minimap_viewport);
         painter.rect_stroke(
             vp_rect,
             2.0,
-            Stroke::new(1.0, theme.border_strong.gamma_multiply(0.6)),
+            Stroke::new(1.0, theme.border_strong),
             StrokeKind::Inside,
         );
 
@@ -1524,19 +1801,43 @@ impl Editor {
         }
         let theme = style.theme;
         let (caret_line, caret_col) = self.doc.char_to_line_col(self.caret);
-        let x = match self.galleys.get(&caret_line) {
-            Some(cached) => text_left + self.x_of_col_in(cached, caret_col) - self.scroll_x,
-            None => text_left,
+        let caret_local = match self.galleys.get(&caret_line) {
+            Some(cached) => self.pos_of_col_in(cached, caret_col),
+            None => Pos2::ZERO,
         };
+        let x = text_left + caret_local.x - self.scroll_x;
         let caret_row = self.line_map.row_of(caret_line).unwrap_or(0);
-        let y = editor_rect.top()
+        let caret_top_y = editor_rect.top()
             + self.sticky_h
             + PAD_TOP
-            + (caret_row as f32 + 1.0) * line_h
+            + self.row_top_offset(caret_row, line_h)
+            + caret_local.y
             - self.scroll_y;
+        let visible_count = self
+            .completion
+            .items
+            .len()
+            .min(crate::lsp::COMPLETION_MAX_ITEMS);
+        let popup_w = 316.0;
+        let popup_h = visible_count as f32 * 24.0 + 10.0;
+        let below_y = caret_top_y + line_h + 2.0;
+        let y = if below_y + popup_h > editor_rect.bottom() - 8.0
+            && caret_top_y - popup_h - 2.0 >= editor_rect.top() + 8.0
+        {
+            // Flip above the active line when near the bottom of the editor.
+            caret_top_y - popup_h - 2.0
+        } else {
+            below_y.clamp(
+                editor_rect.top() + 8.0,
+                (editor_rect.bottom() - popup_h - 8.0).max(editor_rect.top() + 8.0),
+            )
+        };
         let popup_pos = Pos2::new(
-            x.clamp(editor_rect.left() + 8.0, editor_rect.right() - 320.0),
-            y.clamp(editor_rect.top() + 20.0, editor_rect.bottom() - 220.0),
+            x.clamp(
+                editor_rect.left() + 8.0,
+                (editor_rect.right() - popup_w - 8.0).max(editor_rect.left() + 8.0),
+            ),
+            y,
         );
 
         let mut clicked_idx = None;
@@ -1547,16 +1848,17 @@ impl Editor {
                 egui::Frame::new()
                     .fill(theme.overlay_bg)
                     .stroke(Stroke::new(1.0, theme.border_strong))
-                    .corner_radius(CornerRadius::same(7))
+                    .corner_radius(CornerRadius::same(crate::theme::R_MD))
                     .inner_margin(egui::Margin::same(4))
                     .shadow(egui::epaint::Shadow {
                         offset: [0, 8],
-                        blur: 20,
+                        blur: 24,
                         spread: 0,
                         color: theme.shadow,
                     })
                     .show(ui, |ui| {
-                        ui.set_width(300.0);
+                        let inner_w = popup_w - 8.0;
+                        ui.set_width(inner_w);
                         for (idx, item) in self
                             .completion
                             .items
@@ -1566,16 +1868,17 @@ impl Editor {
                         {
                             let selected = idx == self.completion.selected;
                             let (row_rect, resp) = ui.allocate_exact_size(
-                                Vec2::new(292.0, 24.0),
+                                Vec2::new(inner_w, 24.0),
                                 Sense::click(),
                             );
                             if selected || resp.hovered() {
                                 ui.painter().rect_filled(
                                     row_rect,
-                                    CornerRadius::same(4),
+                                    CornerRadius::same(crate::theme::R_SM),
                                     if selected { theme.active } else { theme.hover },
                                 );
                             }
+                            let icon = item.kind.icon();
                             let icon_rect = Rect::from_center_size(
                                 Pos2::new(row_rect.left() + 12.0, row_rect.center().y),
                                 Vec2::splat(14.0),
@@ -1583,24 +1886,52 @@ impl Editor {
                             icons::paint(
                                 ui.painter(),
                                 icon_rect,
-                                item.kind.icon(),
-                                theme.accent,
+                                icon,
+                                icons::completion_icon_color(icon, &theme),
                                 1.2,
                             );
-                            ui.painter().text(
-                                Pos2::new(row_rect.left() + 26.0, row_rect.center().y),
-                                Align2::LEFT_CENTER,
+                            let detail_font = FontId::new(10.5, style.ui_family.clone());
+                            let (detail_galley, _) = crate::ui::widgets::ellipsize_mode(
+                                ui,
+                                &item.detail,
+                                detail_font,
+                                theme.text_muted,
+                                110.0,
+                                crate::ui::widgets::EllipsizeMode::End,
+                            );
+                            let detail_w = if item.detail.is_empty() {
+                                0.0
+                            } else {
+                                detail_galley.rect.width() + 10.0
+                            };
+                            let label_max = (row_rect.width() - 34.0 - detail_w).max(60.0);
+                            let label_color = if selected { theme.text } else { theme.text_dim };
+                            let (label_galley, _) = crate::ui::widgets::ellipsize_mode(
+                                ui,
                                 &item.label,
                                 style.mono(),
-                                if selected { theme.text } else { theme.text_dim },
+                                label_color,
+                                label_max,
+                                crate::ui::widgets::EllipsizeMode::End,
                             );
-                            ui.painter().text(
-                                Pos2::new(row_rect.right() - 8.0, row_rect.center().y),
-                                Align2::RIGHT_CENTER,
-                                &item.detail,
-                                FontId::new(10.5, style.ui_family.clone()),
-                                theme.text_faint,
+                            ui.painter().galley(
+                                Pos2::new(
+                                    row_rect.left() + 26.0,
+                                    row_rect.center().y - label_galley.rect.height() * 0.5,
+                                ),
+                                label_galley,
+                                label_color,
                             );
+                            if !item.detail.is_empty() {
+                                ui.painter().galley(
+                                    Pos2::new(
+                                        row_rect.right() - 8.0 - detail_galley.rect.width(),
+                                        row_rect.center().y - detail_galley.rect.height() * 0.5,
+                                    ),
+                                    detail_galley,
+                                    theme.text_muted,
+                                );
+                            }
                             if resp.clicked() {
                                 clicked_idx = Some(idx);
                             }
@@ -1618,9 +1949,10 @@ impl Editor {
             return;
         }
         let theme = style.theme;
-        let width = 412.0;
+        let width = 456.0f32.min((editor_rect.width() - 24.0).max(280.0));
+        let minimap_reserve = if style.show_minimap { MINIMAP_W } else { 0.0 };
         let pos = Pos2::new(
-            (editor_rect.right() - width - MINIMAP_W - SCROLLBAR_W - 14.0)
+            (editor_rect.right() - width - minimap_reserve - SCROLLBAR_W - 12.0)
                 .max(editor_rect.left() + 12.0),
             editor_rect.top() + 8.0,
         );
@@ -1687,7 +2019,7 @@ impl Editor {
                             // `ui.input` would take the context lock twice and deadlock.
                             let query_focused = query_resp.has_focus();
                             let history_step = ui.input(|i| {
-                                if !i.modifiers.alt && !query_focused {
+                                if !query_focused {
                                     return None;
                                 }
                                 if i.key_pressed(Key::ArrowUp) {
@@ -1843,18 +2175,18 @@ fn find_icon_button(
     if active {
         ui.painter().rect_filled(
             rect,
-            CornerRadius::same(4),
-            theme.accent.gamma_multiply(0.22),
+            CornerRadius::same(crate::theme::R_SM),
+            theme.accent_subtle,
         );
         ui.painter().rect_stroke(
             rect,
-            CornerRadius::same(4),
+            CornerRadius::same(crate::theme::R_SM),
             Stroke::new(1.0, theme.accent),
             StrokeKind::Inside,
         );
     } else if resp.hovered() {
         ui.painter()
-            .rect_filled(rect, CornerRadius::same(4), theme.hover);
+            .rect_filled(rect, CornerRadius::same(crate::theme::R_SM), theme.hover);
     }
     let color = if active {
         theme.accent

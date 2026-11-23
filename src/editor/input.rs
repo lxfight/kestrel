@@ -311,7 +311,7 @@ impl Editor {
                     && let Ok(text) = clipboard.get_text()
                     && !text.is_empty()
                 {
-                    self.insert_text(&text);
+                    self.paste_text(&text);
                 }
             }
             Key::F3 => self.find_next(!shift),

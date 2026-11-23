@@ -6,6 +6,8 @@
 //! silently produces no spans instead of failing the editor.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use tree_sitter::{
     InputEdit, Language as TreeLanguage, Parser, Point, Query, QueryCursor, StreamingIterator, Tree,
@@ -17,11 +19,44 @@ use crate::highlight::{Language, Span, SyntaxEdit, TokenKind};
 /// pass would take far too long and the editor caps rendering anyway.
 const MAX_HIGHLIGHT_BYTES: usize = 2 * 1024 * 1024;
 
-pub struct TreeEngine {
-    parser: Parser,
-    query: Option<Query>,
+struct CompiledGrammar {
+    ts_language: TreeLanguage,
+    query: Query,
     /// `TokenKind` per query capture index; `None` for captures we do not paint.
     capture_kinds: Vec<Option<TokenKind>>,
+}
+
+static GRAMMAR_CACHE: LazyLock<Mutex<HashMap<Language, Option<Arc<CompiledGrammar>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn cached_grammar(language: Language) -> Option<Arc<CompiledGrammar>> {
+    if let Ok(guard) = GRAMMAR_CACHE.lock()
+        && let Some(entry) = guard.get(&language)
+    {
+        return entry.clone();
+    }
+    let compiled = grammar(language).and_then(|(ts_language, source)| {
+        let query = Query::new(&ts_language, &source).ok()?;
+        let capture_kinds = query
+            .capture_names()
+            .iter()
+            .map(|name| capture_kind(name))
+            .collect();
+        Some(Arc::new(CompiledGrammar {
+            ts_language,
+            query,
+            capture_kinds,
+        }))
+    });
+    if let Ok(mut guard) = GRAMMAR_CACHE.lock() {
+        guard.insert(language, compiled.clone());
+    }
+    compiled
+}
+
+pub struct TreeEngine {
+    parser: Parser,
+    compiled: Option<Arc<CompiledGrammar>>,
     tree: Option<Tree>,
     /// The tree was edited but not yet re-parsed, so its byte offsets are stale.
     stale: bool,
@@ -30,22 +65,10 @@ pub struct TreeEngine {
 impl TreeEngine {
     pub fn new(language: Language) -> Self {
         let mut parser = Parser::new();
-        let mut query = None;
-        let mut capture_kinds = Vec::new();
-        if let Some((ts_language, source)) = grammar(language)
-            && parser.set_language(&ts_language).is_ok()
-                && let Ok(compiled) = Query::new(&ts_language, &source) {
-                    capture_kinds = compiled
-                        .capture_names()
-                        .iter()
-                        .map(|name| capture_kind(name))
-                        .collect();
-                    query = Some(compiled);
-                }
+        let compiled = cached_grammar(language).filter(|g| parser.set_language(&g.ts_language).is_ok());
         Self {
             parser,
-            query,
-            capture_kinds,
+            compiled,
             tree: None,
             stale: false,
         }
@@ -67,7 +90,7 @@ impl TreeEngine {
     }
 
     pub fn parse(&mut self, text: &str) {
-        if self.query.is_none() || text.len() > MAX_HIGHLIGHT_BYTES {
+        if self.compiled.is_none() || text.len() > MAX_HIGHLIGHT_BYTES {
             self.tree = None;
             self.stale = false;
             return;
@@ -84,15 +107,15 @@ impl TreeEngine {
         if self.stale || text.len() > MAX_HIGHLIGHT_BYTES {
             return Vec::new();
         }
-        let (Some(query), Some(tree)) = (self.query.as_ref(), self.tree.as_ref()) else {
+        let (Some(compiled), Some(tree)) = (self.compiled.as_ref(), self.tree.as_ref()) else {
             return Vec::new();
         };
         let mut cursor = QueryCursor::new();
-        let mut captures = cursor.captures(query, tree.root_node(), text.as_bytes());
+        let mut captures = cursor.captures(&compiled.query, tree.root_node(), text.as_bytes());
         let mut spans = Vec::new();
         while let Some((matched, capture_index)) = captures.next() {
             let capture = matched.captures()[*capture_index];
-            let Some(kind) = self.capture_kinds[capture.index as usize] else {
+            let Some(kind) = compiled.capture_kinds[capture.index as usize] else {
                 continue;
             };
             let node = capture.node;

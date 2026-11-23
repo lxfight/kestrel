@@ -60,23 +60,12 @@ impl KestrelApp {
                         ui.vertical_centered(|ui| {
                             ui.add_space(6.0);
                             let (logo_rect, _) =
-                                ui.allocate_exact_size(Vec2::splat(54.0), Sense::hover());
-                            ui.painter().rect_filled(
-                                logo_rect,
-                                CornerRadius::same(14),
-                                theme.accent,
-                            );
-                            ui.painter().text(
-                                logo_rect.center(),
-                                Align2::CENTER_CENTER,
-                                "K",
-                                style.font(27.0),
-                                theme.accent_text,
-                            );
+                                ui.allocate_exact_size(Vec2::splat(56.0), Sense::hover());
+                            icons::paint_kestrel_logo(ui.painter(), logo_rect, &theme);
                             ui.add_space(12.0);
                             ui.label(
                                 egui::RichText::new("Kestrel")
-                                    .font(style.font(23.0))
+                                    .font(style.bold(22.0))
                                     .color(theme.text),
                             );
                             ui.add_space(2.0);
@@ -90,15 +79,15 @@ impl KestrelApp {
                             );
                             ui.add_space(4.0);
                             ui.label(
-                                egui::RichText::new("轻量、极速的代码编辑器")
+                                egui::RichText::new("轻量、极速的现代代码编辑器")
                                     .font(style.small())
-                                    .color(theme.text_faint),
+                                    .color(theme.text_muted),
                             );
                             ui.add_space(16.0);
                             ui.separator();
                             ui.add_space(10.0);
                             for line in [
-                                "GPU 渲染 · 虚拟化文本布局 · 6 套精选专业主题",
+                                "GPU 渲染 · 虚拟化文本布局 · 深色 / 浅色双主题",
                                 "Rope 缓冲 · 多光标编辑 · 代码折叠 · 粘性滚动",
                                 "tree-sitter 16 语言增量高亮 · 智能补全 · 符号大纲",
                                 "原生 Git 集成 · 跨文件全局替换 · 多会话内置终端",
@@ -145,20 +134,18 @@ impl KestrelApp {
                         // otherwise clamp the scroll area to the previous frame's box.
                         ui.set_min_height(30.0 + 8.0 + 28.0 + 4.0 + 13.0 + 6.0 + height);
                         ui.horizontal(|ui| {
+                            let (icon_r, _) =
+                                ui.allocate_exact_size(Vec2::splat(20.0), Sense::hover());
                             icons::paint(
                                 ui.painter(),
-                                egui::Rect::from_center_size(
-                                    Pos2::new(ui.cursor().left() + 9.0, ui.cursor().center().y),
-                                    Vec2::splat(17.0),
-                                ),
+                                icon_r.shrink(1.5),
                                 Icon::Keyboard,
                                 theme.accent,
                                 1.3,
                             );
-                            ui.add_space(26.0);
                             ui.label(
                                 egui::RichText::new("键盘快捷键")
-                                    .font(style.font(17.0))
+                                    .font(style.bold(17.0))
                                     .color(theme.text),
                             );
                             ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
@@ -495,15 +482,15 @@ impl KestrelApp {
                             );
                         }
                         ui.add_space(16.0);
-                        ui.horizontal(|ui| {
-                            if Self::modal_button(ui, &style, "取消", false) {
-                                action = Some(2);
+                        ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                            if Self::modal_button(ui, &style, "保存并退出", true) {
+                                action = Some(0);
                             }
                             if Self::modal_button(ui, &style, "不保存", false) {
                                 action = Some(1);
                             }
-                            if Self::modal_button(ui, &style, "保存并退出", true) {
-                                action = Some(0);
+                            if Self::modal_button(ui, &style, "取消", false) {
+                                action = Some(2);
                             }
                         });
                     });
@@ -555,15 +542,15 @@ impl KestrelApp {
                             );
                         }
                         ui.add_space(16.0);
-                        ui.horizontal(|ui| {
-                            if Self::modal_button(ui, &style, "取消", false) {
-                                action = Some(2);
+                        ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                            if Self::modal_button(ui, &style, "保存并关闭", true) {
+                                action = Some(0);
                             }
                             if Self::modal_button(ui, &style, "全部关闭", false) {
                                 action = Some(1);
                             }
-                            if Self::modal_button(ui, &style, "保存并关闭", true) {
-                                action = Some(0);
+                            if Self::modal_button(ui, &style, "取消", false) {
+                                action = Some(2);
                             }
                         });
                     });
@@ -601,15 +588,15 @@ impl KestrelApp {
                                 .color(theme.text),
                         );
                         ui.add_space(16.0);
-                        ui.horizontal(|ui| {
-                            if Self::modal_button(ui, &style, "取消", false) {
-                                action = Some(2);
+                        ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                            if Self::modal_button(ui, &style, "保存", true) {
+                                action = Some(0);
                             }
                             if Self::modal_button(ui, &style, "不保存", false) {
                                 action = Some(1);
                             }
-                            if Self::modal_button(ui, &style, "保存", true) {
-                                action = Some(0);
+                            if Self::modal_button(ui, &style, "取消", false) {
+                                action = Some(2);
                             }
                         });
                     });
@@ -666,12 +653,12 @@ impl KestrelApp {
                                 .color(theme.warning),
                         );
                         ui.add_space(16.0);
-                        ui.horizontal(|ui| {
+                        ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                            if Self::modal_danger_button(ui, &style, "删除") {
+                                action = Some(true);
+                            }
                             if Self::modal_button(ui, &style, "取消", false) {
                                 action = Some(false);
-                            }
-                            if Self::modal_button(ui, &style, "删除", true) {
-                                action = Some(true);
                             }
                         });
                     });
@@ -695,7 +682,7 @@ impl KestrelApp {
                                 "确定要删除选中的 {} 个项目吗？",
                                 paths.len()
                             ))
-                            .font(style.font(15.0))
+                            .font(style.bold(15.0))
                             .color(theme.text),
                         );
                         ui.add_space(6.0);
@@ -714,7 +701,7 @@ impl KestrelApp {
                             ui.label(
                                 egui::RichText::new(format!("…以及另外 {} 个项目", paths.len() - 8))
                                     .font(style.small())
-                                    .color(theme.text_faint),
+                                    .color(theme.text_muted),
                             );
                         }
                         ui.add_space(4.0);
@@ -724,12 +711,12 @@ impl KestrelApp {
                                 .color(theme.warning),
                         );
                         ui.add_space(16.0);
-                        ui.horizontal(|ui| {
+                        ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                            if Self::modal_danger_button(ui, &style, "删除") {
+                                action = Some(true);
+                            }
                             if Self::modal_button(ui, &style, "取消", false) {
                                 action = Some(false);
-                            }
-                            if Self::modal_button(ui, &style, "删除", true) {
-                                action = Some(true);
                             }
                         });
                     });
@@ -749,7 +736,7 @@ impl KestrelApp {
                         ui.set_width(420.0);
                         ui.label(
                             egui::RichText::new("当前有未保存的文件")
-                                .font(style.font(15.0))
+                                .font(style.bold(15.0))
                                 .color(theme.text),
                         );
                         ui.add_space(6.0);
@@ -759,15 +746,15 @@ impl KestrelApp {
                                 .color(theme.text_dim),
                         );
                         ui.add_space(16.0);
-                        ui.horizontal(|ui| {
-                            if Self::modal_button(ui, &style, "取消", false) {
-                                action = Some(2);
+                        ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                            if Self::modal_button(ui, &style, "保存并打开", true) {
+                                action = Some(0);
                             }
                             if Self::modal_button(ui, &style, "放弃更改", false) {
                                 action = Some(1);
                             }
-                            if Self::modal_button(ui, &style, "保存并打开", true) {
-                                action = Some(0);
+                            if Self::modal_button(ui, &style, "取消", false) {
+                                action = Some(2);
                             }
                         });
                     });
@@ -801,63 +788,58 @@ impl KestrelApp {
         Frame::new()
             .fill(theme.overlay_bg)
             .stroke(Stroke::new(1.0, theme.border_strong))
-            .corner_radius(CornerRadius::same(12))
+            .corner_radius(CornerRadius::same(crate::theme::R_LG))
             .inner_margin(egui::Margin::same(22))
     }
 
     fn modal_button(ui: &mut Ui, style: &UiStyle, label: &str, primary: bool) -> bool {
         let theme = style.theme;
-        let (rect, resp) = ui.allocate_exact_size(Vec2::new(104.0, 30.0), Sense::click());
-        // The primary action is the dialog default target: it takes focus when the
-        // modal opens, so Enter confirms without reaching for the mouse.
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(104.0, 32.0), Sense::hover());
+        let resp = crate::ui::widgets::paint_button(
+            ui,
+            rect,
+            ("modal_btn", label, primary),
+            label,
+            if primary {
+                style.small_bold()
+            } else {
+                style.small()
+            },
+            &theme,
+            if primary {
+                crate::ui::widgets::ButtonVariant::Primary
+            } else {
+                crate::ui::widgets::ButtonVariant::Secondary
+            },
+            true,
+        );
         if primary && ui.memory(|memory| memory.focused()).is_none() {
             resp.request_focus();
         }
-        let focused = resp.has_focus();
-        let fill = if primary {
-            if resp.hovered() || focused {
-                theme.accent.gamma_multiply(0.9)
-            } else {
-                theme.accent
-            }
-        } else if resp.hovered() || focused {
-            theme.hover
-        } else {
-            theme.input_bg
-        };
-        ui.painter().rect_filled(rect, CornerRadius::same(6), fill);
-        if !primary {
-            ui.painter().rect_stroke(
-                rect,
-                CornerRadius::same(6),
-                Stroke::new(1.0, theme.border_strong),
-                egui::StrokeKind::Inside,
-            );
-        }
-        if primary && focused {
-            ui.painter().rect_stroke(
-                rect.expand(2.0),
-                CornerRadius::same(7),
-                Stroke::new(1.0, theme.accent),
-                egui::StrokeKind::Inside,
-            );
-        }
-        ui.painter().text(
-            rect.center(),
-            Align2::CENTER_CENTER,
-            label,
-            style.small(),
-            if primary {
-                theme.accent_text
-            } else {
-                theme.text
-            },
-        );
-        if focused && primary && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter))
+        if resp.has_focus()
+            && primary
+            && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter))
         {
             return true;
         }
         resp.clicked()
+    }
+
+    /// Destructive confirmation action: red Danger styling and never auto-focused
+    /// so an accidental Enter press cannot trigger irreversible deletion.
+    fn modal_danger_button(ui: &mut Ui, style: &UiStyle, label: &str) -> bool {
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(104.0, 32.0), Sense::hover());
+        crate::ui::widgets::paint_button(
+            ui,
+            rect,
+            ("modal_danger", label),
+            label,
+            style.small_bold(),
+            &style.theme,
+            crate::ui::widgets::ButtonVariant::Danger,
+            true,
+        )
+        .clicked()
     }
 
     fn effective_shortcut(&self, command: Command) -> Option<Shortcut> {
@@ -975,12 +957,15 @@ impl KestrelApp {
                     if active {
                         ui.painter().rect_filled(
                             rect,
-                            CornerRadius::same(5),
-                            theme.accent.gamma_multiply(0.18),
+                            CornerRadius::same(crate::theme::R_SM),
+                            theme.accent_subtle,
                         );
                     } else if resp.hovered() {
-                        ui.painter()
-                            .rect_filled(rect, CornerRadius::same(5), theme.hover);
+                        ui.painter().rect_filled(
+                            rect,
+                            CornerRadius::same(crate::theme::R_SM),
+                            theme.hover,
+                        );
                     }
                     icons::paint(
                         ui.painter(),
@@ -1360,24 +1345,37 @@ impl KestrelApp {
     ) -> bool {
         let theme = style.theme;
         let (rect, _) =
-            ui.allocate_exact_size(Vec2::new(ui.available_width(), 44.0), Sense::hover());
-        ui.painter().text(
-            Pos2::new(rect.left() + 6.0, rect.top() + 14.0),
-            Align2::LEFT_CENTER,
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), 46.0), Sense::hover());
+        let text_max = (rect.width() - 182.0).max(60.0);
+        let (label_g, _) = crate::ui::widgets::ellipsize_mode(
+            ui,
             label,
             style.small(),
             theme.text,
+            text_max,
+            crate::ui::widgets::EllipsizeMode::End,
         );
-        ui.painter().text(
-            Pos2::new(rect.left() + 6.0, rect.top() + 30.0),
-            Align2::LEFT_CENTER,
+        ui.painter().galley(
+            Pos2::new(rect.left() + 6.0, rect.top() + 14.0 - label_g.rect.height() * 0.5),
+            label_g,
+            theme.text,
+        );
+        let (desc_g, _) = crate::ui::widgets::ellipsize_mode(
+            ui,
             desc,
             style.tiny(),
-            theme.text_faint,
+            theme.text_muted,
+            text_max,
+            crate::ui::widgets::EllipsizeMode::End,
+        );
+        ui.painter().galley(
+            Pos2::new(rect.left() + 6.0, rect.top() + 31.0 - desc_g.rect.height() * 0.5),
+            desc_g,
+            theme.text_muted,
         );
         let control_rect = Rect::from_min_max(
-            Pos2::new(rect.right() - 168.0, rect.top() + 7.0),
-            Pos2::new(rect.right() - 2.0, rect.bottom() - 7.0),
+            Pos2::new(rect.right() - 168.0, rect.top() + 8.0),
+            Pos2::new(rect.right() - 2.0, rect.bottom() - 8.0),
         );
         ui.scope_builder(
             UiBuilder::new().max_rect(control_rect).id_salt(label),
@@ -1393,9 +1391,69 @@ impl KestrelApp {
         desc: &str,
         value: &mut bool,
     ) -> bool {
-        Self::settings_row(ui, style, label, desc, |ui| {
-            Self::settings_switch(ui, style, "", value)
-        })
+        let theme = style.theme;
+        let (rect, _) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), 46.0), Sense::hover());
+        let resp = crate::ui::widgets::paint_row_with_id(
+            ui,
+            rect,
+            ("settings_toggle", label),
+            &theme,
+            crate::ui::widgets::RowState::idle(),
+        );
+        let text_max = (rect.width() - 62.0).max(60.0);
+        let (label_g, _) = crate::ui::widgets::ellipsize_mode(
+            ui,
+            label,
+            style.small(),
+            theme.text,
+            text_max,
+            crate::ui::widgets::EllipsizeMode::End,
+        );
+        ui.painter().galley(
+            Pos2::new(rect.left() + 6.0, rect.top() + 14.0 - label_g.rect.height() * 0.5),
+            label_g,
+            theme.text,
+        );
+        let (desc_g, _) = crate::ui::widgets::ellipsize_mode(
+            ui,
+            desc,
+            style.tiny(),
+            theme.text_muted,
+            text_max,
+            crate::ui::widgets::EllipsizeMode::End,
+        );
+        ui.painter().galley(
+            Pos2::new(rect.left() + 6.0, rect.top() + 31.0 - desc_g.rect.height() * 0.5),
+            desc_g,
+            theme.text_muted,
+        );
+        let switch = Rect::from_center_size(
+            Pos2::new(rect.right() - 24.0, rect.center().y),
+            Vec2::new(34.0, 18.0),
+        );
+        let on = *value;
+        ui.painter().rect_filled(
+            switch,
+            CornerRadius::same(9),
+            if on {
+                theme.accent_fill
+            } else {
+                theme.border_strong
+            },
+        );
+        let knob_x = if on {
+            switch.right() - 9.0
+        } else {
+            switch.left() + 9.0
+        };
+        ui.painter()
+            .circle_filled(Pos2::new(knob_x, switch.center().y), 6.5, Color32::WHITE);
+        if resp.clicked() {
+            *value = !*value;
+            return true;
+        }
+        false
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1418,21 +1476,30 @@ impl KestrelApp {
         let theme = style.theme;
         let mut changed = false;
         ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
+            ui.spacing_mut().item_spacing.x = 6.0;
             for (kind, icon, label) in [
                 (ThemeKind::Light, Icon::Sun, "浅色"),
                 (ThemeKind::Dark, Icon::Moon, "深色"),
             ] {
                 let active = ThemeKind::from_str(current) == kind;
-                let (rect, resp) = ui.allocate_exact_size(Vec2::new(74.0, 26.0), Sense::click());
+                let (rect, resp) = ui.allocate_exact_size(Vec2::new(76.0, 28.0), Sense::click());
                 let fill = if active {
-                    theme.accent
+                    theme.accent_fill
                 } else if resp.hovered() {
                     theme.hover
                 } else {
-                    theme.input_bg
+                    theme.surface_subtle
                 };
-                ui.painter().rect_filled(rect, CornerRadius::same(6), fill);
+                ui.painter()
+                    .rect_filled(rect, CornerRadius::same(crate::theme::R_SM), fill);
+                if !active {
+                    ui.painter().rect_stroke(
+                        rect,
+                        CornerRadius::same(crate::theme::R_SM),
+                        Stroke::new(1.0, theme.border),
+                        StrokeKind::Inside,
+                    );
+                }
                 let fg = if active { theme.accent_text } else { theme.text };
                 icons::paint(
                     ui.painter(),
@@ -1445,10 +1512,10 @@ impl KestrelApp {
                     1.2,
                 );
                 ui.painter().text(
-                    Pos2::new(rect.left() + 30.0, rect.center().y),
+                    Pos2::new(rect.left() + 31.0, rect.center().y),
                     Align2::LEFT_CENTER,
                     label,
-                    style.tiny(),
+                    if active { style.small_bold() } else { style.small() },
                     fg,
                 );
                 if resp.clicked() && !active {
@@ -1468,18 +1535,16 @@ impl KestrelApp {
         *shown = true;
     }
 
-
-
     fn settings_section_title(ui: &mut Ui, style: &UiStyle, title: &str) {
         let theme = style.theme;
         ui.add_space(8.0);
         let (rect, _) =
-            ui.allocate_exact_size(Vec2::new(ui.available_width(), 22.0), Sense::hover());
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), Sense::hover());
         ui.painter().text(
             Pos2::new(rect.left() + 6.0, rect.center().y),
             Align2::LEFT_CENTER,
             title,
-            style.font(11.5),
+            style.small_bold(),
             theme.accent,
         );
         ui.painter().line_segment(
@@ -1511,111 +1576,79 @@ impl KestrelApp {
             theme.text_dim,
         );
 
+        let can_dec = *value > min;
+        let can_inc = *value < max;
         let minus_rect = Rect::from_center_size(
-            Pos2::new(rect.right() - 78.0, rect.center().y),
-            Vec2::new(22.0, 22.0),
+            Pos2::new(rect.right() - 80.0, rect.center().y),
+            Vec2::new(24.0, 24.0),
         );
         let plus_rect = Rect::from_center_size(
             Pos2::new(rect.right() - 16.0, rect.center().y),
-            Vec2::new(22.0, 22.0),
+            Vec2::new(24.0, 24.0),
         );
         let m_resp = ui.interact(
             minus_rect,
             ui.scope_id()
-                .with(("step_minus", label, rect.top().to_bits())),
-            Sense::click(),
+                .with(("step_minus", label, display_value)),
+            if can_dec { Sense::click() } else { Sense::hover() },
         );
         let p_resp = ui.interact(
             plus_rect,
             ui.scope_id()
-                .with(("step_plus", label, rect.top().to_bits())),
-            Sense::click(),
+                .with(("step_plus", label, display_value)),
+            if can_inc { Sense::click() } else { Sense::hover() },
         );
 
-        for (r, h) in [(minus_rect, m_resp.hovered()), (plus_rect, p_resp.hovered())] {
+        for (r, hovered, enabled, glyph) in [
+            (minus_rect, m_resp.hovered(), can_dec, "−"),
+            (plus_rect, p_resp.hovered(), can_inc, "+"),
+        ] {
             ui.painter().rect_filled(
                 r,
-                CornerRadius::same(4),
-                if h { theme.hover } else { theme.input_bg },
+                CornerRadius::same(crate::theme::R_SM),
+                if !enabled {
+                    theme.input_bg
+                } else if hovered {
+                    theme.hover
+                } else {
+                    theme.surface_subtle
+                },
             );
             ui.painter().rect_stroke(
                 r,
-                CornerRadius::same(4),
-                Stroke::new(1.0, theme.border_strong),
+                CornerRadius::same(crate::theme::R_SM),
+                Stroke::new(
+                    1.0,
+                    if enabled && hovered {
+                        theme.border_strong
+                    } else {
+                        theme.border
+                    },
+                ),
                 StrokeKind::Inside,
+            );
+            ui.painter().text(
+                r.center(),
+                Align2::CENTER_CENTER,
+                glyph,
+                style.small(),
+                if enabled { theme.text } else { theme.text_muted },
             );
         }
         ui.painter().text(
-            minus_rect.center(),
-            Align2::CENTER_CENTER,
-            "−",
-            style.small(),
-            theme.text,
-        );
-        ui.painter().text(
-            Pos2::new(rect.right() - 47.0, rect.center().y),
+            Pos2::new(rect.right() - 48.0, rect.center().y),
             Align2::CENTER_CENTER,
             display_value,
-            style.small(),
-            theme.text,
-        );
-        ui.painter().text(
-            plus_rect.center(),
-            Align2::CENTER_CENTER,
-            "+",
-            style.small(),
+            style.small_bold(),
             theme.text,
         );
 
-        if m_resp.clicked() && *value > min {
+        if can_dec && m_resp.clicked() {
             *value -= 1;
             return true;
         }
-        if p_resp.clicked() && *value < max {
+        if can_inc && p_resp.clicked() {
             *value += 1;
-            return true;
-        }
-        false
-    }
-
-    fn settings_switch(ui: &mut Ui, style: &UiStyle, label: &str, value: &mut bool) -> bool {
-        let theme = style.theme;
-        let (rect, resp) =
-            ui.allocate_exact_size(Vec2::new(ui.available_width(), 28.0), Sense::click());
-        if resp.hovered() {
-            ui.painter()
-                .rect_filled(rect, CornerRadius::same(5), theme.hover);
-        }
-        ui.painter().text(
-            Pos2::new(rect.left() + 6.0, rect.center().y),
-            Align2::LEFT_CENTER,
-            label,
-            style.small(),
-            theme.text_dim,
-        );
-        let switch = Rect::from_center_size(
-            Pos2::new(rect.right() - 22.0, rect.center().y),
-            Vec2::new(32.0, 17.0),
-        );
-        let on = *value;
-        ui.painter().rect_filled(
-            switch,
-            CornerRadius::same(8),
-            if on {
-                theme.accent
-            } else {
-                theme.border_strong
-            },
-        );
-        let knob_x = if on {
-            switch.right() - 8.5
-        } else {
-            switch.left() + 8.5
-        };
-        ui.painter()
-            .circle_filled(Pos2::new(knob_x, switch.center().y), 6.2, Color32::WHITE);
-        if resp.clicked() {
-            *value = !*value;
             return true;
         }
         false
@@ -1650,7 +1683,7 @@ impl KestrelApp {
                                 ui.horizontal(|ui| {
                                     let (icon, color) = match toast.kind {
                                         ToastKind::Info => (Icon::Info, theme.accent),
-                                        ToastKind::Success => (Icon::Info, theme.success),
+                                        ToastKind::Success => (Icon::PassFilled, theme.success),
                                         ToastKind::Warning => (Icon::Warning, theme.warning),
                                         ToastKind::Error => (Icon::Error, theme.error),
                                     };

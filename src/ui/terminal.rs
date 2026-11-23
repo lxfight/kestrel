@@ -308,7 +308,7 @@ impl KestrelApp {
     fn problems_body_ui(&mut self, ui: &mut Ui, style: &UiStyle) {
         let theme = style.theme;
         let rect = ui.available_rect_before_wrap();
-        ui.painter().rect_filled(rect, 0.0, theme.input_bg);
+        ui.painter().rect_filled(rect, 0.0, theme.terminal_bg);
 
         let mut entries: Vec<(PathBuf, String, crate::lsp::Diagnostic)> = Vec::new();
         for tab in &self.tabs {
@@ -322,11 +322,23 @@ impl KestrelApp {
         if entries.is_empty() {
             ui.add_space(28.0);
             ui.vertical_centered(|ui| {
-                ui.label(
-                    egui::RichText::new("✓ 当前打开的文件中未检测到语法或诊断问题")
-                        .font(style.small())
-                        .color(theme.text_faint),
-                );
+                ui.horizontal(|ui| {
+                    let text = "当前打开的文件中未检测到语法或诊断问题";
+                    let text_w = ui.ctx().fonts_mut(|f| {
+                        f.layout_no_wrap(text.to_string(), style.small(), theme.text_muted)
+                            .rect
+                            .width()
+                    });
+                    let total_w = 18.0 + text_w;
+                    ui.add_space(((ui.available_width() - total_w) * 0.5).max(0.0));
+                    let (ir, _) = ui.allocate_exact_size(Vec2::splat(14.0), Sense::hover());
+                    icons::paint(ui.painter(), ir, Icon::PassFilled, theme.success, 1.2);
+                    ui.label(
+                        egui::RichText::new(text)
+                            .font(style.small())
+                            .color(theme.text_muted),
+                    );
+                });
             });
             return;
         }
@@ -358,21 +370,41 @@ impl KestrelApp {
                         color,
                         1.2,
                     );
-                    ui.painter().text(
-                        Pos2::new(row.left() + 34.0, row.center().y),
-                        Align2::LEFT_CENTER,
+                    let loc = format!("{} [{}:{}]", title, diag.line + 1, diag.col + 1);
+                    let (loc_g, _) = widgets::ellipsize_mode(
+                        ui,
+                        &loc,
+                        style.tiny(),
+                        theme.text_muted,
+                        (row.width() * 0.35).clamp(60.0, 220.0),
+                        widgets::EllipsizeMode::Middle,
+                    );
+                    let loc_w = loc_g.rect.width();
+                    let msg_max = (row.width() - 34.0 - loc_w - 28.0).max(40.0);
+                    let (msg_g, msg_cut) = widgets::ellipsize_mode(
+                        ui,
                         &diag.message,
                         style.small(),
                         theme.text,
+                        msg_max,
+                        widgets::EllipsizeMode::End,
                     );
-                    let loc = format!("{} [{}:{}]", title, diag.line + 1, diag.col + 1);
-                    ui.painter().text(
-                        Pos2::new(row.right() - 14.0, row.center().y),
-                        Align2::RIGHT_CENTER,
-                        loc,
-                        style.tiny(),
-                        theme.text_faint,
+                    ui.painter().galley(
+                        Pos2::new(row.left() + 34.0, row.center().y - msg_g.rect.height() * 0.5),
+                        msg_g,
+                        theme.text,
                     );
+                    ui.painter().galley(
+                        Pos2::new(
+                            row.right() - 14.0 - loc_w,
+                            row.center().y - loc_g.rect.height() * 0.5,
+                        ),
+                        loc_g,
+                        theme.text_muted,
+                    );
+                    if msg_cut {
+                        resp.clone().on_hover_text(&diag.message);
+                    }
                     if resp.clicked() && !path.as_os_str().is_empty() {
                         jump_to = Some((path.clone(), diag.start_byte));
                     }
@@ -387,7 +419,7 @@ impl KestrelApp {
     fn output_body_ui(&mut self, ui: &mut Ui, style: &UiStyle) {
         let theme = style.theme;
         let rect = ui.available_rect_before_wrap();
-        ui.painter().rect_filled(rect, 0.0, theme.input_bg);
+        ui.painter().rect_filled(rect, 0.0, theme.terminal_bg);
 
         ScrollArea::vertical()
             .auto_shrink(false)
@@ -401,7 +433,7 @@ impl KestrelApp {
                         ui.label(
                             egui::RichText::new("[Kestrel] 工作区与 Git 后台服务就绪。")
                                 .font(FontId::new(12.0, style.mono_family.clone()))
-                                .color(theme.text_faint),
+                                .color(theme.text_muted),
                         );
                     });
                 } else {
@@ -423,26 +455,20 @@ impl KestrelApp {
         let theme = style.theme;
         if self.bottom.terminals.is_empty() {
             let (body, _) = ui.allocate_exact_size(ui.available_size(), Sense::hover());
-            ui.painter().rect_filled(body, 0.0, theme.input_bg);
-            let button = Rect::from_center_size(body.center(), Vec2::new(150.0, 30.0));
-            let bresp = ui.interact(button, ui.scope_id().with("new_terminal"), Sense::click());
-            ui.painter().rect_filled(
+            ui.painter().rect_filled(body, 0.0, theme.terminal_bg);
+            let button = Rect::from_center_size(body.center(), Vec2::new(156.0, 32.0));
+            if widgets::paint_button(
+                ui,
                 button,
-                CornerRadius::same(6),
-                if bresp.hovered() {
-                    theme.hover
-                } else {
-                    theme.active
-                },
-            );
-            ui.painter().text(
-                button.center(),
-                Align2::CENTER_CENTER,
-                "+ 新建终端会话",
+                "new_terminal",
+                "新建终端会话",
                 style.small(),
-                theme.text,
-            );
-            if bresp.clicked() {
+                &theme,
+                widgets::ButtonVariant::Secondary,
+                true,
+            )
+            .clicked()
+            {
                 self.new_terminal();
             }
             return;
@@ -456,7 +482,7 @@ impl KestrelApp {
         }
 
         let area = ui.available_rect_before_wrap();
-        ui.painter().rect_filled(area, 0.0, theme.input_bg);
+        ui.painter().rect_filled(area, 0.0, theme.terminal_bg);
         ui.allocate_rect(area, Sense::hover());
 
         if self.bottom.split && len >= 2 {
@@ -537,7 +563,7 @@ impl KestrelApp {
             egui::Id::unique(("kestrel_terminal_grid", idx)),
             Sense::click_and_drag(),
         );
-        ui.painter().rect_filled(body, 0.0, theme.input_bg);
+        ui.painter().rect_filled(body, 0.0, theme.terminal_bg);
 
         if resp.clicked() {
             resp.request_focus();
@@ -673,6 +699,7 @@ impl KestrelApp {
             terminal_input(ui, terminal);
         }
 
+        let bold_font = style.mono_bold(font.size);
         let screen = terminal.screen();
         let painter = ui.painter_at(body);
         for row in 0..screen_rows {
@@ -693,7 +720,7 @@ impl KestrelApp {
                             &painter,
                             Pos2::new(origin.x + run_start as f32 * cell_w, y + y_text_off),
                             &run_text,
-                            &font,
+                            if run_bold { &bold_font } else { &font },
                             run_fg,
                             run_underline,
                         );
@@ -710,7 +737,7 @@ impl KestrelApp {
                         cell.underline(),
                         cell.inverse(),
                     ),
-                    None => (theme.text, theme.input_bg, false, false, false),
+                    None => (theme.text, theme.terminal_bg, false, false, false),
                 };
                 let (fg, bg) = if inverse { (bg, fg) } else { (fg, bg) };
                 let ch = contents.chars().next();
@@ -718,7 +745,7 @@ impl KestrelApp {
                 let is_non_ascii = !contents.is_ascii();
                 let cell_cols = if is_wide { 2.0 } else { 1.0 };
 
-                if bg != theme.input_bg {
+                if bg != theme.terminal_bg {
                     painter.rect_filled(
                         Rect::from_min_size(
                             Pos2::new(origin.x + idx as f32 * cell_w, y),
@@ -735,7 +762,7 @@ impl KestrelApp {
                             &painter,
                             Pos2::new(origin.x + run_start as f32 * cell_w, y + y_text_off),
                             &run_text,
-                            &font,
+                            if run_bold { &bold_font } else { &font },
                             run_fg,
                             run_underline,
                         );
@@ -746,7 +773,7 @@ impl KestrelApp {
                         &painter,
                         Pos2::new(origin.x + idx as f32 * cell_w, y + y_text_off),
                         &contents,
-                        &font,
+                        if bold { &bold_font } else { &font },
                         fg,
                         underline,
                     );
@@ -767,7 +794,7 @@ impl KestrelApp {
                         &painter,
                         Pos2::new(origin.x + run_start as f32 * cell_w, y + y_text_off),
                         &run_text,
-                        &font,
+                        if run_bold { &bold_font } else { &font },
                         run_fg,
                         run_underline,
                     );
@@ -786,7 +813,7 @@ impl KestrelApp {
                     &painter,
                     Pos2::new(origin.x + run_start as f32 * cell_w, y + y_text_off),
                     &run_text,
-                    &font,
+                    if run_bold { &bold_font } else { &font },
                     run_fg,
                     run_underline,
                 );
@@ -853,13 +880,24 @@ impl KestrelApp {
             }
         }
 
-        // Scrollback indicator pill if viewing history
+        // Scrollback indicator pill + thin scrollbar thumb when history is scrolled.
         if terminal.scrollback_offset > 0 {
+            let max_sb = terminal.scrollback_offset.max(100) as f32;
+            let track_h = (body.height() - 12.0).max(20.0);
+            let thumb_h = (track_h * 0.25).clamp(24.0, track_h);
+            let frac = (1.0 - (terminal.scrollback_offset as f32 / max_sb).clamp(0.0, 1.0))
+                .clamp(0.0, 1.0);
+            let thumb_y = body.top() + 6.0 + frac * (track_h - thumb_h);
+            painter.rect_filled(
+                Rect::from_min_size(Pos2::new(body.right() - 7.0, thumb_y), Vec2::new(5.0, thumb_h)),
+                2.5,
+                theme.scrollbar_hover,
+            );
             let badge = Rect::from_min_size(
-                Pos2::new(body.right() - 120.0, body.top() + 6.0),
+                Pos2::new(body.right() - 124.0, body.top() + 6.0),
                 Vec2::new(110.0, 20.0),
             );
-            painter.rect_filled(badge, CornerRadius::same(4), theme.active);
+            painter.rect_filled(badge, CornerRadius::same(crate::theme::R_SM), theme.active);
             painter.text(
                 badge.center(),
                 Align2::CENTER_CENTER,
@@ -1090,18 +1128,18 @@ fn color_to_ui(color: vt100::Color, theme: crate::theme::Theme, foreground: bool
     let default = if foreground {
         theme.text
     } else {
-        theme.input_bg
+        theme.terminal_bg
     };
     match color {
         vt100::Color::Default => default,
-        vt100::Color::Idx(idx) => ansi_color(idx, theme.kind.is_dark()),
+        vt100::Color::Idx(idx) => ansi_color(idx, theme.kind.is_dark(), foreground),
         vt100::Color::Rgb(r, g, b) => Color32::from_rgb(r, g, b),
     }
 }
 
-/// ANSI base 16. The light set is dark-on-light: reusing the dark pastels on a
-/// white terminal leaves red/green/blue at 1.1-1.8:1.
-fn ansi_color(idx: u8, dark: bool) -> Color32 {
+/// ANSI base 16. The light set keeps foreground colors high-contrast on light
+/// canvas while preserving true light whites (7/15) for TUI backgrounds.
+fn ansi_color(idx: u8, dark: bool, foreground: bool) -> Color32 {
     const DARK: [Color32; 16] = [
         Color32::from_rgb(0x22, 0x24, 0x2B),
         Color32::from_rgb(0xE0, 0x6C, 0x75),
@@ -1121,24 +1159,27 @@ fn ansi_color(idx: u8, dark: bool) -> Color32 {
         Color32::from_rgb(0xEE, 0xEF, 0xF2),
     ];
     const LIGHT: [Color32; 16] = [
-        Color32::from_rgb(0x24, 0x29, 0x2F),
+        Color32::from_rgb(0x1F, 0x24, 0x2D),
         Color32::from_rgb(0xB3, 0x26, 0x1E),
         Color32::from_rgb(0x1F, 0x6E, 0x2E),
         Color32::from_rgb(0x8A, 0x5A, 0x00),
         Color32::from_rgb(0x1F, 0x5F, 0xBF),
         Color32::from_rgb(0x82, 0x26, 0xA8),
         Color32::from_rgb(0x0B, 0x6E, 0x80),
-        Color32::from_rgb(0x5A, 0x62, 0x72),
-        Color32::from_rgb(0x5A, 0x62, 0x72),
+        Color32::from_rgb(0xD8, 0xDD, 0xE6),
+        Color32::from_rgb(0x64, 0x6E, 0x80),
         Color32::from_rgb(0xC6, 0x28, 0x28),
         Color32::from_rgb(0x2E, 0x7D, 0x32),
         Color32::from_rgb(0x9A, 0x54, 0x00),
         Color32::from_rgb(0x19, 0x76, 0xD2),
         Color32::from_rgb(0xAB, 0x47, 0xBC),
         Color32::from_rgb(0x00, 0x83, 0x8F),
-        Color32::from_rgb(0x3E, 0x46, 0x52),
+        Color32::from_rgb(0xF4, 0xF6, 0xFA),
     ];
     if idx < 16 {
+        if !dark && foreground && (idx == 7 || idx == 15) {
+            return Color32::from_rgb(0x4A, 0x53, 0x64);
+        }
         return if dark {
             DARK[idx as usize]
         } else {

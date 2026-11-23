@@ -5,6 +5,7 @@ pub mod render;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use crate::highlight::Span;
@@ -211,7 +212,7 @@ pub enum CachedImage {
 #[derive(Default)]
 pub struct MarkdownPreviewState {
     pub parsed_version: u64,
-    pub doc: MarkdownDoc,
+    pub doc: Arc<MarkdownDoc>,
     pub scroll_y: f32,
     pub pending_scroll_to: Option<String>,
     pub anchor_y: HashMap<String, f32>,
@@ -229,9 +230,13 @@ pub struct MarkdownPreviewState {
 }
 
 impl MarkdownPreviewState {
+    pub fn needs_parse(&self, version: u64) -> bool {
+        self.parsed_version != version
+    }
+
     pub fn ensure_parsed(&mut self, version: u64, text: &str) {
         if self.parsed_version != version {
-            self.doc = parser::parse(text);
+            self.doc = Arc::new(parser::parse(text));
             self.parsed_version = version;
         }
     }

@@ -32,21 +32,26 @@ impl ImageViewer {
             .unwrap_or("IMAGE")
             .to_ascii_uppercase();
 
-        let (raw_img, size, error) = match std::fs::read(path) {
-            Ok(bytes) => {
-                if bytes.len() > 64 * 1024 * 1024 {
-                    (None, [0, 0], Some("图片体积超过 64 MB 限制".to_string()))
-                } else {
-                    match image::load_from_memory(&bytes) {
-                        Ok(img) => {
-                            let sz = [img.width() as usize, img.height() as usize];
-                            (Some(img), sz, None)
+        const MAX_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
+        let (raw_img, size, error) = if file_bytes > MAX_IMAGE_BYTES {
+            (None, [0, 0], Some("图片体积超过 64 MB 限制".to_string()))
+        } else {
+            match std::fs::read(path) {
+                Ok(bytes) => {
+                    if bytes.len() > MAX_IMAGE_BYTES as usize {
+                        (None, [0, 0], Some("图片体积超过 64 MB 限制".to_string()))
+                    } else {
+                        match image::load_from_memory(&bytes) {
+                            Ok(img) => {
+                                let sz = [img.width() as usize, img.height() as usize];
+                                (Some(img), sz, None)
+                            }
+                            Err(err) => (None, [0, 0], Some(format!("解码图片失败: {err}"))),
                         }
-                        Err(err) => (None, [0, 0], Some(format!("解码图片失败: {err}"))),
                     }
                 }
+                Err(err) => (None, [0, 0], Some(format!("读取文件失败: {err}"))),
             }
-            Err(err) => (None, [0, 0], Some(format!("读取文件失败: {err}"))),
         };
 
         Self {

@@ -19,8 +19,9 @@ const UI_FONTS: &[&str] = &[
 ];
 
 const UI_BOLD_FONTS: &[&str] = &[
-    "segoeuib.ttf",
     "seguisb.ttf",
+    "segoeuib.ttf",
+    "NotoSans-SemiBold.ttf",
     "NotoSans-Bold.ttf",
     "Ubuntu-B.ttf",
     "DejaVuSans-Bold.ttf",
@@ -35,6 +36,14 @@ const MONO_FONTS: &[&str] = &[
     "Menlo.ttc",
     "JetBrainsMono-Regular.ttf",
     "DejaVuSansMono.ttf",
+];
+
+const MONO_BOLD_FONTS: &[&str] = &[
+    "CascadiaMono-Bold.ttf",
+    "CascadiaCode-Bold.ttf",
+    "consolab.ttf",
+    "JetBrainsMono-Bold.ttf",
+    "DejaVuSansMono-Bold.ttf",
 ];
 
 fn system_font_dirs() -> Vec<PathBuf> {
@@ -69,6 +78,7 @@ pub struct FontSet {
     pub ui_family: FontFamily,
     pub ui_bold_family: FontFamily,
     pub mono_family: FontFamily,
+    pub mono_bold_family: FontFamily,
 }
 
 pub fn codicon_family() -> FontFamily {
@@ -78,9 +88,21 @@ pub fn codicon_family() -> FontFamily {
 pub fn install(ctx: &egui::Context) -> FontSet {
     let dirs = system_font_dirs();
     let mut defs = FontDefinitions::default();
+    let default_prop_fallbacks = defs
+        .families
+        .get(&FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
+    let default_mono_fallbacks = defs
+        .families
+        .get(&FontFamily::Monospace)
+        .cloned()
+        .unwrap_or_default();
+
     let mut ui_family = FontFamily::Proportional;
     let mut ui_bold_family = FontFamily::Proportional;
     let mut mono_family = FontFamily::Monospace;
+    let mut mono_bold_family = FontFamily::Monospace;
 
     // Install embedded VSCode Codicons in an isolated font family so its glyphs
     // never interfere with UI or monospace text layout.
@@ -98,10 +120,10 @@ pub fn install(ctx: &egui::Context) -> FontSet {
         let family = FontFamily::Name(format!("app-{name}").into());
         defs.font_data
             .insert(name.clone(), Arc::new(FontData::from_owned(bytes)));
-        defs.families
-            .entry(family.clone())
-            .or_default()
-            .insert(0, name.clone());
+        let mut chain = Vec::with_capacity(1 + default_prop_fallbacks.len());
+        chain.push(name.clone());
+        chain.extend(default_prop_fallbacks.iter().cloned());
+        defs.families.insert(family.clone(), chain);
         defs.families
             .entry(FontFamily::Proportional)
             .or_default()
@@ -113,11 +135,12 @@ pub fn install(ctx: &egui::Context) -> FontSet {
     if let Some((name, bytes)) = load_first(&dirs, UI_BOLD_FONTS) {
         let family = FontFamily::Name(format!("app-bold-{name}").into());
         defs.font_data
-            .insert(name.clone(), Arc::new(FontData::from_owned(bytes)));
-        defs.families
-            .entry(family.clone())
-            .or_default()
-            .insert(0, name);
+            .entry(name.clone())
+            .or_insert_with(|| Arc::new(FontData::from_owned(bytes)));
+        let mut chain = Vec::with_capacity(1 + default_prop_fallbacks.len());
+        chain.push(name);
+        chain.extend(default_prop_fallbacks.iter().cloned());
+        defs.families.insert(family.clone(), chain);
         ui_bold_family = family;
     }
 
@@ -125,15 +148,28 @@ pub fn install(ctx: &egui::Context) -> FontSet {
         let family = FontFamily::Name(format!("app-{name}").into());
         defs.font_data
             .insert(name.clone(), Arc::new(FontData::from_owned(bytes)));
-        defs.families
-            .entry(family.clone())
-            .or_default()
-            .insert(0, name.clone());
+        let mut chain = Vec::with_capacity(1 + default_mono_fallbacks.len());
+        chain.push(name.clone());
+        chain.extend(default_mono_fallbacks.iter().cloned());
+        defs.families.insert(family.clone(), chain);
         defs.families
             .entry(FontFamily::Monospace)
             .or_default()
             .insert(0, name);
-        mono_family = family;
+        mono_family = family.clone();
+        mono_bold_family = family;
+    }
+
+    if let Some((name, bytes)) = load_first(&dirs, MONO_BOLD_FONTS) {
+        let family = FontFamily::Name(format!("app-mono-bold-{name}").into());
+        defs.font_data
+            .entry(name.clone())
+            .or_insert_with(|| Arc::new(FontData::from_owned(bytes)));
+        let mut chain = Vec::with_capacity(1 + default_mono_fallbacks.len());
+        chain.push(name);
+        chain.extend(default_mono_fallbacks.iter().cloned());
+        defs.families.insert(family.clone(), chain);
+        mono_bold_family = family;
     }
 
     ctx.set_fonts(defs);
@@ -141,5 +177,6 @@ pub fn install(ctx: &egui::Context) -> FontSet {
         ui_family,
         ui_bold_family,
         mono_family,
+        mono_bold_family,
     }
 }

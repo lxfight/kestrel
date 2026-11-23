@@ -70,7 +70,11 @@ pub struct DocxViewer {
 
 impl DocxViewer {
     pub fn load(path: &Path) -> Self {
+        const MAX_DOCX_BYTES: u64 = 64 * 1024 * 1024;
         let file_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        if file_bytes > MAX_DOCX_BYTES {
+            return Self::with_error(path, file_bytes, "文档体积超过 64 MB 预览限制".to_string());
+        }
         let bytes = match std::fs::read(path) {
             Ok(b) => b,
             Err(err) => {

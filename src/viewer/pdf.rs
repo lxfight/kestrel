@@ -62,7 +62,11 @@ pub struct PdfViewer {
 
 impl PdfViewer {
     pub fn load(path: &Path) -> Self {
+        const MAX_PDF_BYTES: u64 = 128 * 1024 * 1024;
         let file_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        if file_bytes > MAX_PDF_BYTES {
+            return Self::with_error(path, file_bytes, "PDF 体积超过 128 MB 预览限制".to_string());
+        }
         let bytes = match std::fs::read(path) {
             Ok(b) => b,
             Err(err) => {
@@ -417,7 +421,7 @@ impl PdfViewer {
                         .color(theme.text_dim),
                 );
             });
-            ui.ctx().request_repaint();
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(32));
             return events;
         }
 
@@ -426,6 +430,25 @@ impl PdfViewer {
             let dy = ui.input(|i| i.smooth_scroll_delta.y);
             self.fit_width = false;
             self.zoom = (self.zoom * if dy > 0.0 { 1.1 } else { 1.0 / 1.1 }).clamp(0.4, 3.0);
+        }
+        if !ui.ctx().egui_wants_keyboard_input() {
+            let page_delta = ui.input(|i| {
+                if i.key_pressed(egui::Key::PageDown) {
+                    1i32
+                } else if i.key_pressed(egui::Key::PageUp) {
+                    -1i32
+                } else {
+                    0
+                }
+            });
+            if page_delta != 0 {
+                let next = (self.current_page as i32 + page_delta)
+                    .clamp(0, self.page_count.saturating_sub(1) as i32) as u32;
+                if next != self.current_page {
+                    self.current_page = next;
+                    self.page_input = (next + 1).to_string();
+                }
+            }
         }
 
         let avail_w = ui.available_width().max(240.0);
@@ -493,7 +516,10 @@ impl PdfViewer {
                                 .color(theme.text_dim),
                         );
                     });
-                    ui.ctx().request_repaint();
+                }
+                if self.pending_request.is_some() {
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(32));
                 }
                 ui.add_space(24.0);
             });

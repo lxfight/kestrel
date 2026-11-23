@@ -247,12 +247,12 @@ fn load_error_section(
     let (header, _) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), 22.0), Sense::hover());
     ui.painter()
-        .rect_filled(header, 0.0, theme.panel_bg.gamma_multiply(0.7));
+        .rect_filled(header, 0.0, theme.surface_subtle);
     ui.painter().text(
         Pos2::new(header.left() + 14.0, header.center().y),
         Align2::LEFT_CENTER,
         format!("加载失败 · {}", errors.len()),
-        style.tiny(),
+        style.bold(10.5),
         theme.error,
     );
     for error in errors {
@@ -261,8 +261,8 @@ fn load_error_section(
         if resp.hovered() {
             ui.painter().rect_filled(
                 rect.shrink2(Vec2::new(6.0, 0.0)),
-                CornerRadius::same(4),
-                theme.hover.gamma_multiply(0.55),
+                CornerRadius::same(crate::theme::R_SM),
+                theme.hover,
             );
         }
         let text_clip = Rect::from_min_max(
@@ -310,9 +310,9 @@ fn plugin_row(
     );
     if resp.hovered() {
         ui.painter().rect_filled(
-            rect.shrink2(Vec2::new(6.0, 0.0)),
-            CornerRadius::same(4),
-            theme.hover.gamma_multiply(0.55),
+            rect.shrink2(Vec2::new(6.0, 1.0)),
+            CornerRadius::same(crate::theme::R_SM),
+            theme.hover,
         );
     }
 
@@ -322,12 +322,12 @@ fn plugin_row(
     );
     ui.painter().rect_filled(
         tile,
-        CornerRadius::same(6),
-        theme.accent.gamma_multiply(0.08),
+        CornerRadius::same(crate::theme::R_MD),
+        theme.accent_subtle,
     );
     ui.painter().rect_stroke(
         tile,
-        CornerRadius::same(6),
+        CornerRadius::same(crate::theme::R_MD),
         Stroke::new(1.0, theme.border),
         StrokeKind::Inside,
     );
@@ -341,7 +341,7 @@ fn plugin_row(
 
     let text_x = rect.left() + 58.0;
     let text_right = rect.right() - 10.0;
-    let name_font = style.font(12.5);
+    let name_font = style.bold(12.5);
     let name_clip = Rect::from_min_max(
         Pos2::new(text_x, rect.top() + 4.0),
         Pos2::new(text_right, rect.top() + 26.0),
@@ -360,27 +360,26 @@ fn plugin_row(
             Align2::LEFT_CENTER,
             &info.version,
             style.tiny(),
-            theme.text_faint,
+            theme.text_muted,
         );
     }
 
-    let desc_width = (text_right - 80.0 - text_x).max(40.0);
+    let action_reserve = if resp.hovered() { 80.0 } else { 4.0 };
+    let desc_width = (text_right - action_reserve - text_x).max(40.0);
     if !info.description.is_empty() {
-        let galley = ui.ctx().fonts_mut(|fonts| {
-            fonts.layout(
-                info.description.clone(),
-                style.small(),
-                theme.text_dim,
-                desc_width,
-            )
-        });
-        let clip = Rect::from_min_max(
-            Pos2::new(text_x, rect.top() + 22.0),
-            Pos2::new(text_x + desc_width, rect.top() + 52.0),
+        let (desc_g, desc_cut) = crate::ui::widgets::ellipsize_mode(
+            ui,
+            &info.description,
+            style.small(),
+            theme.text_dim,
+            desc_width,
+            crate::ui::widgets::EllipsizeMode::End,
         );
         ui.painter()
-            .with_clip_rect(clip)
-            .galley(Pos2::new(text_x, rect.top() + 24.0), galley, theme.text_dim);
+            .galley(Pos2::new(text_x, rect.top() + 30.0), desc_g, theme.text_dim);
+        if desc_cut {
+            resp.clone().on_hover_text(&info.description);
+        }
     }
 
     let state = if info.error.is_some() {

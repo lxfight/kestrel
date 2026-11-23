@@ -90,11 +90,17 @@ pub struct Document {
     pub rope: Rope,
     pub path: Option<PathBuf>,
     pub eol: Eol,
+    /// Line ending as of the last load/save; toggling EOL back clears dirty state.
+    pub saved_eol: Eol,
     pub bom: bool,
     pub encoding: Encoding,
     pub version: u64,
     /// FNV-1a of the text at the last successful load/save; dirty means hash mismatch.
     pub saved_text_hash: u64,
+    /// Document version as of the last load/save (O(1) clean fast-path).
+    saved_version: u64,
+    /// Undo stack depth at the last load/save (O(1) dirty check on >256 KB files).
+    saved_undo_depth: Option<usize>,
     /// mtime of the file as of the last load/save, used to spot external edits.
     pub disk_modified_at: Option<SystemTime>,
     /// `(version, hash)` cache so `content_hash` only walks the rope after an edit.
@@ -107,6 +113,8 @@ pub struct Document {
     /// Snapshot of saved/HEAD text (capped at 512 KB) used for gutter line-diff markers.
     /// Shared so a loaded/saved buffer can hand its text over instead of cloning it.
     pub baseline_text: Option<Arc<str>>,
+    /// True when `baseline_text` came from Git `HEAD`, so saving to disk preserves gutter diffs.
+    pub baseline_is_git: bool,
     /// Scratch buffers reused by `save`, so repeated autosaves do not allocate the
     /// whole document (and its CRLF/encoding copy) again every time.
     save_text_buf: String,
@@ -116,6 +124,7 @@ pub struct Document {
 const MAX_UNDO_GROUPS: usize = 800;
 const COALESCE_WINDOW_MS: u128 = 600;
 const MAX_BASELINE_BYTES: usize = 512 * 1024;
+const FAST_DIRTY_THRESHOLD_BYTES: usize = 256 * 1024;
 
 /// Append `text` with `\n` rewritten to `\r\n`, straight into `out`.
 /// Saves the second full-size string that `str::replace` would allocate.
@@ -142,10 +151,13 @@ impl Document {
             rope,
             path: None,
             eol: Eol::Lf,
+            saved_eol: Eol::Lf,
             bom: false,
             encoding: Encoding::Utf8,
             version: 1,
             saved_text_hash,
+            saved_version: 1,
+            saved_undo_depth: Some(0),
             disk_modified_at: None,
             hash_cache: std::cell::Cell::new((1, saved_text_hash)),
             undo: Vec::new(),
@@ -153,8 +165,17 @@ impl Document {
             readonly: false,
             lossy: false,
             baseline_text: baseline,
+            baseline_is_git: false,
             save_text_buf: String::new(),
             save_bytes_buf: Vec::new(),
+        }
+    }
+
+    pub fn set_git_baseline(&mut self, text: impl Into<Arc<str>>) {
+        let text: Arc<str> = text.into();
+        if text.len() <= MAX_BASELINE_BYTES {
+            self.baseline_text = Some(text);
+            self.baseline_is_git = true;
         }
     }
 
@@ -174,7 +195,7 @@ impl Document {
                         true,
                         Encoding::LossyUtf8,
                         true,
-                        false,
+                        true,
                     ),
                 }
             }
@@ -212,7 +233,7 @@ impl Document {
                     false,
                     Encoding::LossyUtf8,
                     true,
-                    false,
+                    true,
                 ),
             }
         };
@@ -232,14 +253,18 @@ impl Document {
             (encoding != Encoding::Binary && normalized.len() <= MAX_BASELINE_BYTES)
                 .then(|| Arc::from(normalized));
         let saved_text_hash = hash_rope(&rope);
+        let eol = if crlf { Eol::CrLf } else { Eol::Lf };
         Ok(Self {
             rope,
             path: Some(path.to_path_buf()),
-            eol: if crlf { Eol::CrLf } else { Eol::Lf },
+            eol,
+            saved_eol: eol,
             bom,
             encoding,
             version: 1,
             saved_text_hash,
+            saved_version: 1,
+            saved_undo_depth: Some(0),
             disk_modified_at: modified_time,
             hash_cache: std::cell::Cell::new((1, saved_text_hash)),
             undo: Vec::new(),
@@ -247,6 +272,7 @@ impl Document {
             readonly,
             lossy,
             baseline_text: baseline,
+            baseline_is_git: false,
             save_text_buf: String::new(),
             save_bytes_buf: Vec::new(),
         })
@@ -259,13 +285,18 @@ impl Document {
         let fresh = Self::load(&path)?;
         self.rope = fresh.rope;
         self.eol = fresh.eol;
+        self.saved_eol = fresh.saved_eol;
         self.bom = fresh.bom;
         self.encoding = fresh.encoding;
         self.readonly = fresh.readonly;
         self.lossy = fresh.lossy;
-        self.baseline_text = fresh.baseline_text;
+        if !self.baseline_is_git {
+            self.baseline_text = fresh.baseline_text;
+        }
         self.version += 1;
         self.saved_text_hash = fresh.saved_text_hash;
+        self.saved_version = self.version;
+        self.saved_undo_depth = Some(0);
         self.disk_modified_at = fresh.disk_modified_at;
         self.hash_cache.set((self.version, fresh.saved_text_hash));
         self.undo.clear();
@@ -291,7 +322,7 @@ impl Document {
         for chunk in self.rope.chunks() {
             text.push_str(chunk);
         }
-        if text.len() <= MAX_BASELINE_BYTES {
+        if !self.baseline_is_git && text.len() <= MAX_BASELINE_BYTES {
             self.baseline_text = Some(Arc::from(text.as_str()));
         }
         let crlf = self.eol == Eol::CrLf;
@@ -353,14 +384,31 @@ impl Document {
             };
         }
         self.saved_text_hash = self.content_hash();
+        self.saved_version = self.version;
+        self.saved_undo_depth = Some(self.undo.len());
+        self.saved_eol = self.eol;
         self.disk_modified_at = disk_mtime(&path);
         SaveOutcome::Saved
     }
 
     pub fn save_as(&mut self, path: PathBuf) -> SaveOutcome {
+        let prev_path = self.path.clone();
+        let prev_mtime = self.disk_modified_at;
+        let prev_readonly = self.readonly;
         self.disk_modified_at = disk_mtime(&path);
         self.path = Some(path);
-        self.save()
+        // Explicit Save As to a new path is allowed even from a lossy/readonly preview
+        // unless the encoding is Binary.
+        if self.encoding != Encoding::Binary {
+            self.readonly = false;
+        }
+        let outcome = self.save();
+        if !matches!(outcome, SaveOutcome::Saved) {
+            self.path = prev_path;
+            self.disk_modified_at = prev_mtime;
+            self.readonly = prev_readonly;
+        }
+        outcome
     }
 
     /// Re-decode the file on disk with an explicitly chosen encoding.
@@ -378,16 +426,23 @@ impl Document {
         };
         let rope = Rope::from_str(&normalized);
         let hash = hash_rope(&rope);
+        let eol = if crlf { Eol::CrLf } else { Eol::Lf };
         self.rope = rope;
-        self.eol = if crlf { Eol::CrLf } else { Eol::Lf };
+        self.eol = eol;
+        self.saved_eol = eol;
         self.encoding = encoding;
         self.bom = encoding == Encoding::Utf8Bom;
         self.lossy = encoding == Encoding::LossyUtf8;
-        self.readonly = false;
+        self.readonly = encoding == Encoding::LossyUtf8;
         self.version += 1;
         self.saved_text_hash = hash;
+        self.saved_version = self.version;
+        self.saved_undo_depth = Some(0);
         self.hash_cache.set((self.version, hash));
-        self.baseline_text = (normalized.len() <= MAX_BASELINE_BYTES).then(|| Arc::from(normalized));
+        if !self.baseline_is_git {
+            self.baseline_text =
+                (normalized.len() <= MAX_BASELINE_BYTES).then(|| Arc::from(normalized));
+        }
         self.disk_modified_at = disk_mtime(&path);
         self.undo.clear();
         self.redo.clear();
@@ -396,18 +451,24 @@ impl Document {
 
     /// Write the buffer with a new line ending; the file itself changes on save.
     pub fn set_eol(&mut self, eol: Eol) {
-        if self.eol != eol {
-            self.eol = eol;
-            self.mark_dirty();
-        }
+        self.eol = eol;
     }
 
     /// Apply an explicit encoding and save under a new path.
     pub fn save_as_with_encoding(&mut self, path: PathBuf, encoding: Encoding) -> SaveOutcome {
+        let prev_encoding = self.encoding;
+        let prev_bom = self.bom;
+        let prev_lossy = self.lossy;
         self.encoding = encoding;
         self.bom = encoding == Encoding::Utf8Bom;
         self.lossy = encoding == Encoding::LossyUtf8;
-        self.save_as(path)
+        let outcome = self.save_as(path);
+        if !matches!(outcome, SaveOutcome::Saved) {
+            self.encoding = prev_encoding;
+            self.bom = prev_bom;
+            self.lossy = prev_lossy;
+        }
+        outcome
     }
 
     /// FNV-1a fingerprint of the whole buffer, cached by document version.
@@ -422,11 +483,22 @@ impl Document {
     }
 
     pub fn is_dirty(&self) -> bool {
+        if self.eol != self.saved_eol {
+            return true;
+        }
+        if self.version == self.saved_version {
+            return false;
+        }
+        if self.rope.len_bytes() > FAST_DIRTY_THRESHOLD_BYTES {
+            return self.saved_undo_depth != Some(self.undo.len());
+        }
         self.content_hash() != self.saved_text_hash
     }
 
     /// Mark the buffer as unsaved content that has no file to fall back to.
     pub fn mark_dirty(&mut self) {
+        self.saved_version = 0;
+        self.saved_undo_depth = None;
         self.saved_text_hash = !self.content_hash();
     }
 
@@ -647,9 +719,16 @@ impl Document {
         after: (usize, usize),
     ) {
         self.redo.clear();
+        if self
+            .saved_undo_depth
+            .is_some_and(|depth| depth > self.undo.len())
+        {
+            self.saved_undo_depth = None;
+        }
         let now = Instant::now();
         let single = records.len() == 1;
         if single
+            && self.saved_undo_depth != Some(self.undo.len())
             && let Some(group) = self.undo.last_mut()
             && group.kind == kind
             && kind != EditKind::Other
@@ -669,6 +748,7 @@ impl Document {
         });
         if self.undo.len() > MAX_UNDO_GROUPS {
             self.undo.remove(0);
+            self.saved_undo_depth = self.saved_undo_depth.and_then(|d| d.checked_sub(1));
         }
     }
 
@@ -1066,6 +1146,29 @@ mod tests {
         assert!(matches!(doc.save(), SaveOutcome::Saved));
         assert_eq!(std::fs::read(&path).unwrap(), b"aX\r\nb\r\n");
         assert_eq!(doc.save_bytes_buf, b"aX\r\nb\r\n");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn large_document_fast_dirty_tracks_savepoint_and_undo() {
+        let big = "a".repeat(FAST_DIRTY_THRESHOLD_BYTES + 1024);
+        let path = temp_path("large_dirty.txt");
+        std::fs::write(&path, &big).unwrap();
+        let mut doc = Document::load(&path).unwrap();
+        assert!(!doc.is_dirty());
+        doc.edit(0, 0, "X", EditKind::Typing, (0, 0), (1, 1));
+        assert!(doc.is_dirty());
+        doc.undo();
+        assert!(!doc.is_dirty());
+        doc.redo();
+        assert!(doc.is_dirty());
+        assert!(matches!(doc.save(), SaveOutcome::Saved));
+        assert!(!doc.is_dirty());
+        // Typing right after save must not coalesce across the savepoint.
+        doc.edit(1, 1, "Y", EditKind::Typing, (1, 1), (2, 2));
+        assert!(doc.is_dirty());
+        doc.undo();
+        assert!(!doc.is_dirty());
         let _ = std::fs::remove_file(&path);
     }
 }

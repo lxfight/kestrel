@@ -1240,7 +1240,7 @@ fn stash_ref(index: usize) -> String {
 
 fn git_cmd(root: &Path) -> Command {
     let mut cmd = Command::new("git");
-    cmd.current_dir(root);
+    cmd.arg("-c").arg("core.quotepath=false").current_dir(root);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -1574,9 +1574,8 @@ fn collect_git_snapshot(root: &Path, cancel: &AtomicBool) -> GitSnapshot {
         .output()
         && b_out.status.success()
     {
-        snap.branches = String::from_utf8_lossy(&b_out.stderr)
+        snap.branches = String::from_utf8_lossy(&b_out.stdout)
             .lines()
-            .chain(String::from_utf8_lossy(&b_out.stdout).lines())
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string)

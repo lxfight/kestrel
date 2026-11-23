@@ -87,9 +87,30 @@ impl KestrelApp {
             PaletteMode::Branches => "选择要切换的 Git 分支…",
         };
 
+        // Subtle dimmed backdrop behind the palette; clicking outside closes it.
+        let screen = ctx.content_rect();
+        let mut close_backdrop = false;
+        Area::new(egui::Id::unique("kestrel_palette_backdrop"))
+            .order(Order::Middle)
+            .fixed_pos(screen.min)
+            .interactable(true)
+            .show(ctx, |ui| {
+                let (bg_rect, bg_resp) =
+                    ui.allocate_exact_size(screen.size(), Sense::click());
+                ui.painter().rect_filled(
+                    bg_rect,
+                    0.0,
+                    egui::Color32::from_black_alpha(if theme.kind.is_dark() { 110 } else { 48 }),
+                );
+                if bg_resp.clicked() {
+                    close_backdrop = true;
+                }
+            });
+
+        let palette_w = (screen.width() - 48.0).clamp(320.0, 620.0);
         let area = Area::new(egui::Id::unique("kestrel_palette"))
             .order(Order::Foreground)
-            .anchor(Align2::CENTER_TOP, Vec2::new(0.0, 82.0))
+            .anchor(Align2::CENTER_TOP, Vec2::new(0.0, 74.0))
             .interactable(true);
 
         let mut clicked_row: Option<usize> = None;
@@ -97,20 +118,22 @@ impl KestrelApp {
             Frame::new()
                 .fill(theme.overlay_bg)
                 .stroke(Stroke::new(1.0, theme.border_strong))
-                .corner_radius(CornerRadius::same(10))
+                .corner_radius(CornerRadius::same(crate::theme::R_LG))
                 .shadow(egui::epaint::Shadow {
-                    offset: [0, 12],
-                    blur: 32,
+                    offset: [0, 14],
+                    blur: 36,
                     spread: 0,
                     color: theme.shadow,
                 })
                 .inner_margin(Margin::same(0))
                 .show(ui, |ui| {
-                    ui.set_width(620.0);
+                    ui.set_width(palette_w);
                     ui.horizontal(|ui| {
                         ui.add_space(12.0);
-                        let (rect, _) =
-                            ui.allocate_exact_size(Vec2::new(596.0, 42.0), Sense::hover());
+                        let (rect, _) = ui.allocate_exact_size(
+                            Vec2::new((palette_w - 24.0).max(200.0), 42.0),
+                            Sense::hover(),
+                        );
                         let icon_rect = Rect::from_center_size(
                             Pos2::new(rect.left() + 16.0, rect.center().y),
                             Vec2::splat(16.0),
@@ -159,8 +182,8 @@ impl KestrelApp {
                     });
                     ui.painter().line_segment(
                         [
-                            Pos2::new(ui.min_rect().left(), ui.min_rect().top() + 40.0),
-                            Pos2::new(ui.min_rect().right(), ui.min_rect().top() + 40.0),
+                            Pos2::new(ui.min_rect().left(), ui.min_rect().top() + 42.0),
+                            Pos2::new(ui.min_rect().right(), ui.min_rect().top() + 42.0),
                         ],
                         Stroke::new(1.0, theme.border),
                     );
@@ -243,21 +266,35 @@ impl KestrelApp {
                         return;
                     }
 
-                    ui.add_space(2.0);
+                    // Mouse wheel scrolls the palette window cleanly.
+                    if count > MAX_ROWS {
+                        let wheel = ui.input(|i| i.smooth_scroll_delta.y);
+                        if wheel.abs() > 1.0 {
+                            let step = if wheel > 0.0 { -2isize } else { 2isize };
+                            let max_start = count.saturating_sub(MAX_ROWS);
+                            self.palette.window_start =
+                                (self.palette.window_start as isize + step)
+                                    .clamp(0, max_start as isize) as usize;
+                        }
+                    }
+
+                    ui.add_space(4.0);
+                    let list_top = ui.cursor().top();
                     let start = self.palette.window_start;
                     let end = (start + MAX_ROWS).min(count);
+                    let list_w = ui.available_width() - if count > MAX_ROWS { 8.0 } else { 0.0 };
                     for index in start..end {
                         if let Some(header) = self.palette_group_header(index) {
                             let (header_rect, _) = ui.allocate_exact_size(
-                                Vec2::new(ui.available_width(), GROUP_H),
+                                Vec2::new(list_w, GROUP_H),
                                 Sense::hover(),
                             );
                             ui.painter().text(
                                 Pos2::new(header_rect.left() + 16.0, header_rect.bottom() - 5.0),
                                 Align2::LEFT_BOTTOM,
                                 header,
-                                style.font(10.5),
-                                theme.text_faint,
+                                style.bold(10.5),
+                                theme.text_muted,
                             );
                         }
                         let selected = index == self.palette.selected;
@@ -271,7 +308,7 @@ impl KestrelApp {
                             continue;
                         };
                         let (row_rect, _) = ui.allocate_exact_size(
-                            Vec2::new(ui.available_width(), ROW_H),
+                            Vec2::new(list_w, ROW_H),
                             Sense::hover(),
                         );
                         let state = if selected {
@@ -279,9 +316,10 @@ impl KestrelApp {
                         } else {
                             widgets::RowState::idle()
                         };
-                        let row_resp = widgets::paint_row(
+                        let row_resp = widgets::paint_row_with_id(
                             ui,
                             row_rect.shrink2(Vec2::new(6.0, 1.0)),
+                            ("pal_row", index),
                             &theme,
                             state,
                         );
@@ -299,6 +337,21 @@ impl KestrelApp {
                         if row_resp.clicked() {
                             clicked_row = Some(index);
                         }
+                    }
+                    let list_bottom = ui.cursor().top();
+                    if count > MAX_ROWS && list_bottom > list_top + 20.0 {
+                        let track_h = list_bottom - list_top - 4.0;
+                        let thumb_h =
+                            ((MAX_ROWS as f32 / count as f32) * track_h).clamp(24.0, track_h);
+                        let max_start = (count - MAX_ROWS).max(1) as f32;
+                        let thumb_y = list_top
+                            + 2.0
+                            + (self.palette.window_start as f32 / max_start) * (track_h - thumb_h);
+                        let thumb = Rect::from_min_size(
+                            Pos2::new(ui.min_rect().right() - 7.0, thumb_y),
+                            Vec2::new(4.0, thumb_h),
+                        );
+                        ui.painter().rect_filled(thumb, 2.0, theme.scrollbar);
                     }
 
                     ui.painter().line_segment(
@@ -346,6 +399,10 @@ impl KestrelApp {
         if let Some(index) = clicked_row {
             self.palette.selected = index;
             activate = true;
+        }
+        if close_backdrop && !activate {
+            self.palette.open = false;
+            return;
         }
         if !activate
             && std::env::var("KESTREL_DEV_ENTER").is_ok()
@@ -515,13 +572,18 @@ impl KestrelApp {
                     .map(|shortcut| shortcut.display())
                     .or_else(|| command.shortcut_text())
                     .unwrap_or_default();
+                let keycap_reserve = if shortcut_text.is_empty() {
+                    12.0
+                } else {
+                    widgets::measure_keycap_width(ui, &shortcut_text, style.tiny()) + 22.0
+                };
                 let positions = crate::fuzzy::fuzzy_match(&query, command.label())
                     .map(|m| m.positions)
                     .unwrap_or_default();
                 let color = if selected { theme.text } else { theme.text_dim };
                 let clip = Rect::from_min_max(
                     Pos2::new(x, rect.top()),
-                    Pos2::new(rect.right() - 12.0, rect.bottom()),
+                    Pos2::new((rect.right() - keycap_reserve).max(x + 20.0), rect.bottom()),
                 );
                 paint_highlighted(
                     ui,
@@ -555,18 +617,23 @@ impl KestrelApp {
                         .unwrap_or_default()
                         .to_string();
                     let tag_width =
-                        paint_tag(ui, style, &tag, x, rect.center().y, theme.text_faint);
+                        paint_tag(ui, style, &tag, x, rect.center().y, theme.text_muted);
                     x += tag_width + 8.0;
                 }
                 let (primary, secondary) = self.palette_text(item);
                 shortcut_text = secondary;
+                let keycap_reserve = if shortcut_text.is_empty() {
+                    12.0
+                } else {
+                    widgets::measure_keycap_width(ui, &shortcut_text, style.tiny()) + 22.0
+                };
                 let positions = crate::fuzzy::fuzzy_match(&query, &primary)
                     .map(|m| m.positions)
                     .unwrap_or_default();
                 let color = if selected { theme.text } else { theme.text_dim };
                 let clip = Rect::from_min_max(
                     Pos2::new(x, rect.top()),
-                    Pos2::new(rect.right() - 12.0, rect.bottom()),
+                    Pos2::new((rect.right() - keycap_reserve).max(x + 20.0), rect.bottom()),
                 );
                 paint_highlighted(
                     ui,
@@ -590,13 +657,19 @@ impl KestrelApp {
                 );
                 x += 22.0;
                 let (primary, secondary) = self.palette_text(item);
+                shortcut_text = secondary;
+                let keycap_reserve = if shortcut_text.is_empty() {
+                    12.0
+                } else {
+                    widgets::measure_keycap_width(ui, &shortcut_text, style.tiny()) + 22.0
+                };
                 let positions = crate::fuzzy::fuzzy_match(&query, &primary)
                     .map(|m| m.positions)
                     .unwrap_or_default();
                 let color = if selected { theme.text } else { theme.text_dim };
                 let clip = Rect::from_min_max(
                     Pos2::new(x, rect.top()),
-                    Pos2::new(rect.right() - 12.0, rect.bottom()),
+                    Pos2::new((rect.right() - keycap_reserve).max(x + 20.0), rect.bottom()),
                 );
                 paint_highlighted(
                     ui,
@@ -609,24 +682,26 @@ impl KestrelApp {
                     color,
                     theme.accent,
                 );
-                shortcut_text = secondary;
             }
             PaletteItem::Symbol(sym) => {
                 icons::paint(
                     ui.painter(),
                     Rect::from_center_size(Pos2::new(x + 7.0, rect.center().y), Vec2::splat(14.0)),
                     sym.kind.icon(),
-                    theme.accent,
+                    icons::symbol_color(sym.kind, &theme),
                     1.2,
                 );
                 x += 22.0;
+                shortcut_text = format!("第 {} 行", sym.start_line + 1);
+                let keycap_reserve =
+                    widgets::measure_keycap_width(ui, &shortcut_text, style.tiny()) + 22.0;
                 let positions = crate::fuzzy::fuzzy_match(&query, &sym.name)
                     .map(|m| m.positions)
                     .unwrap_or_default();
                 let color = if selected { theme.text } else { theme.text_dim };
                 let clip = Rect::from_min_max(
                     Pos2::new(x, rect.top()),
-                    Pos2::new(rect.right() - 12.0, rect.bottom()),
+                    Pos2::new((rect.right() - keycap_reserve).max(x + 20.0), rect.bottom()),
                 );
                 paint_highlighted(
                     ui,
@@ -639,7 +714,6 @@ impl KestrelApp {
                     color,
                     theme.accent,
                 );
-                shortcut_text = format!("第 {} 行", sym.start_line + 1);
             }
             PaletteItem::Branch(branch) => {
                 icons::paint(
@@ -650,13 +724,21 @@ impl KestrelApp {
                     1.2,
                 );
                 x += 22.0;
+                if *branch == self.git.snapshot.branch {
+                    shortcut_text = "当前分支".to_string();
+                }
+                let keycap_reserve = if shortcut_text.is_empty() {
+                    12.0
+                } else {
+                    widgets::measure_keycap_width(ui, &shortcut_text, style.tiny()) + 22.0
+                };
                 let positions = crate::fuzzy::fuzzy_match(&query, branch)
                     .map(|m| m.positions)
                     .unwrap_or_default();
                 let color = if selected { theme.text } else { theme.text_dim };
                 let clip = Rect::from_min_max(
                     Pos2::new(x, rect.top()),
-                    Pos2::new(rect.right() - 12.0, rect.bottom()),
+                    Pos2::new((rect.right() - keycap_reserve).max(x + 20.0), rect.bottom()),
                 );
                 paint_highlighted(
                     ui,
@@ -669,28 +751,18 @@ impl KestrelApp {
                     color,
                     theme.accent,
                 );
-                if *branch == self.git.snapshot.branch {
-                    shortcut_text = "当前分支".to_string();
-                }
             }
         }
 
         if !shortcut_text.is_empty() {
-            let galley = ui.ctx().fonts_mut(|fonts| {
-                fonts.layout_job(LayoutJob::simple_singleline(
-                    shortcut_text,
-                    style.tiny(),
-                    theme.text_faint,
-                ))
-            });
-            let width = galley.rect.width();
-            ui.painter().galley(
-                Pos2::new(
-                    rect.right() - 14.0 - width,
-                    rect.center().y - galley.rect.height() * 0.5,
-                ),
-                galley,
-                theme.text_faint,
+            widgets::paint_keycap_right(
+                ui,
+                ui.painter(),
+                rect.right() - 12.0,
+                rect.center().y,
+                &shortcut_text,
+                style.tiny(),
+                &theme,
             );
         }
     }
