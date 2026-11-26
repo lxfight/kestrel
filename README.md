@@ -1,124 +1,218 @@
 # Kestrel
 
-轻量、极速、现代的 Rust 代码编辑器。基于 GPU 渲染（`wgpu`）、Rope 文本缓冲、后台增量 `tree-sitter` 语法与符号分析、原生 Git 集成与多会话内置终端构建，常驻内存与启动耗时远低于 Electron 系编辑器。
+轻量、极速、现代的原生 Rust 代码编辑器。基于 GPU 渲染（`eframe` / `egui` + `wgpu`）、Rope 文本缓冲（`ropey`）、增量 `tree-sitter` 语法分析引擎、原生 Git 集成、多模态文件查看器、多会话内置终端与内嵌 Lua 插件系统构建，拥有低常驻内存与接近瞬时的启动速度。
 
-![编辑器](docs/screenshots/editor.png)
+---
 
-## 核心功能
+## 核心特性
 
-- **专业视觉与图标系统**：
-  - 内置 **VSCode Codicons (`codicon.ttf`)** 矢量图标字库 + **Material / Seti 风格专属文件与目录徽标**（支持 Rust、TypeScript、Python、Go、C/C++、C#、Java、JSON、TOML、Markdown、HTML/CSS、Shell、YAML、Git、Lock 等专属彩色造型，以及按目录语义着色的双色调文件夹图标）。
-  - **深色 / 浅色双主题模式**：内置精心调校的 `深色 (Dark)` 与 `浅色 (Light)` 两种视觉模式，支持一键切换与实时无损重绘。
-  - **跨平台 CJK 字体回退链**：自动挂载系统高品質 UI 字体、等宽编程字体与中日韩字体（如 `Segoe UI` + `Cascadia Mono` + `Microsoft YaHei UI` / `PingFang` / `Noto Sans CJK`）。
-  - **可读性对比度**：两套主题的正文、辅助文字与语法注释对各自背景均 ≥ 4.5:1（WCAG AA），面板边界与分隔线使用独立的高对比度色；间距/圆角/字阶收敛到统一 token。
-- **高性能核心编辑器**：
-  - **Rope 文本缓冲与多编码支持**：大文件秒开；自动识别并无损保存 `UTF-8`、`UTF-8 with BOM`、`UTF-16 LE/BE`、`ANSI/GBK`，对二进制文件自动启用只读保护；超过 8MB 的文件以只读模式打开并关闭语法高亮与小地图。
-  - **数据安全（保存冲突即停）**：保存前比对磁盘 mtime，文件被外部改动时停下并提示，绝不覆盖别人的修改；自身写入通过 mtime 抑制回环，自动保存不再清空撤销栈；退出或崩溃后可恢复未命名缓冲区与上次会话（分屏、面板、终端、搜索词）。
-  - **原生 IME 输入**：中文 / 日文 / 韩文输入法组合文本内联显示、候选窗跟随光标，编辑区与内置终端均可直接输入中文，输入法不再被切回英文。
-  - **多光标与列编辑**：支持 `Alt+Click` 添加/移除光标、`Ctrl+D` 增量选中下一个相同词、`Ctrl+Shift+L` 选中文档内全部匹配项、`Ctrl+Alt+↑/↓` 上下添加光标，多光标同步输入/退格/编辑。
-  - **代码折叠（Code Folding）与粘性滚动（Sticky Scroll）**：基于 `tree-sitter` 语法树与 Markdown 标题自动计算可折叠代码块，Gutter 支持折叠箭头与 `⋯` 折叠徽标；滚动长函数时顶部自动固定显示当前所属函数/结构体签名。
-  - **自动换行（Soft Word Wrap）与编辑器分屏（Split View）**：支持 `Alt+Z` 一键切换自动换行；`Ctrl+\` 将当前标签拆到右侧新分屏；每个分屏拥有独立标签栏与面包屑，标签跟随所在分屏；拖动标签页或文件树文件到编辑器左右边缘可新建分屏，拖到分屏内则在其中打开；拖动中缝平滑调整分屏宽度，分屏标签栏的关闭按钮把标签并入相邻分屏。
-  - **增强型小地图（Minimap）**：按语法 Token 色彩渲染微缩代码结构，叠加显示当前行、选区、查找匹配高亮及 Git 变更标记。
-- **代码智能与大纲导航（LSP & Tree-sitter Intelligence）**：
-  - **自动代码补全（Autocomplete）**：输入时实时弹出跟随光标的补全浮层（合并当前文档符号、语言关键字/代码片段与上下文标识符，`Tab`/`Enter` 确认，`Ctrl+Space` 手动触发）；输入 `.` 或 `::` 立即给出成员候选，可见条数与可导航条数一致，中文输入法组合期不打扰。
-  - **侧边栏区块**：打开的编辑器、文件树、大纲等区块均可折叠，区块之间可上下拖动调整高度，双击分隔条恢复默认。
-  - **符号大纲（Outline）与面包屑层级**：侧边栏集成可折叠 `大纲 (OUTLINE)` 视图与独立大纲面板，层级子项可逐级展开/折叠，顶部面包屑实时显示当前光标所在的函数/结构体并支持点击跳转（`Ctrl+Shift+.`）。
-  - **转到定义（Go to Definition）与悬停提示**：支持 `F12` 或 `Ctrl+Click` 跨文件跳转到符号定义；支持语法错误波浪线（Squiggly Underlines）与悬停详情提示；支持 `Shift+Alt+F` 格式化文档。
-- **Markdown 预览与同步分屏**：
-  - **预览 / 分屏 / 源码三种模式**：面包屑一键切换，`Alt+V` 直接进入左右分屏预览；分屏模式下左源码与右侧渲染实时双向滚动同步，输入即时刷新，标签栏与面包屑始终可见。
-  - **GFM 渲染**：表格、任务列表、代码高亮与复制、图片、脚注、Callout、数学公式、定义列表等。
-- **原生 Git 版本控制集成**：
-  - **活动栏源代码管理（SCM）面板**：实时显示已暂存更改（Staged Changes）与工作区更改（Changes），支持单文件与分组的暂存、取消暂存、放弃更改（丢弃全部需两步确认）；多行提交说明、`Ctrl+Enter` 提交、`Amend` 修订提交。
-  - **分支管理**：分支栏展示当前分支与 `↑ahead ↓behind`；内联分支面板支持过滤、切换、新建、合并、删除。
-  - **提交历史**：后台加载最近 20 条提交（短哈希、作者、相对时间、说明），点击按需展开该提交的改动文件（A/M/D/R）；点击文件直接以只读标签页浏览该提交中的历史版本（删除的文件读取父提交版本）。历史区可折叠、可拖动高度。
-  - **提交操作增强**：提交说明多行输入、`Ctrl+Enter` 提交、`Amend` 修订、复用最近提交说明、撤销上次提交（soft reset，二次确认）。
-  - **储藏（Stash）**：一键储藏当前更改（含未跟踪文件），展开列出全部储藏，支持应用（pop）与删除（drop）。
-  - **编辑器 Gutter 行内 Diff 指示条**：实时对比 `HEAD`/基线版本，在行号旁绘制新增（绿条）、修改（蓝条）、删除（红三角）标记。
-  - **文件树与状态栏 Git 感知**：文件树与标签页自动按修改/未跟踪状态着色并显示 `M`/`U`/`A`/`D` 徽标；状态栏显示当前分支与领先/落后提交数。
-  - **SCM 面板交互**：暂存/更改/储藏/提交历史各区块均可折叠，更改列表与提交历史之间可拖动分隔条调整高度（双击恢复默认）。
-  - **可视化差异（Diff）**：单击更改文件打开差异标签，支持并排 / 内联两种视图；按 HEAD / 索引 / 工作区三种基准分别对比暂存与未暂存改动；语法高亮、行级红绿区块与词级高亮、空行占位、变更导航（上一处/下一处 + 概览标尺）、刷新与打开源文件；标签内可右键复制差异内容或相对路径，文件在磁盘变化后自动重新计算；SCM 行右键可打开源文件；差异视图内支持按 hunk 逐个暂存 / 取消暂存 / 丢弃，失败时给出 git 报错摘要。
-- **极速查找与跨文件全局替换**：
-  - **文件内查找/替换**：重构的专业图标化浮层，支持展开/收起替换栏、区分大小写、全词匹配、正则表达式、实时匹配计数。
-  - **工作区全局搜索与替换（Replace in Files）**：后台多线程扫描，搜索结果行内高亮匹配关键词，支持一键跨文件全部替换并自动同步刷新已打开的编辑器标签页。
-- **多会话内置终端与综合底部面板**：
-  - **多终端实例管理**：基于 ConPTY + `vt100`，支持同时创建与切换多个 `PowerShell` / `Command Prompt` 终端会话，支持鼠标滚轮回看 5,000 行历史缓冲区（Scrollback）；支持鼠标选中与 `Ctrl+Shift+C/V` 复制粘贴、`Ctrl+F` 搜索回滚缓冲、按 Shell 类型清屏。
-  - **问题（Problems）与输出（Output）面板**：底部面板集成 `终端`、`问题`（汇总所有语法/诊断错误，点击直达对应行列）、`输出`（记录 Git、工作区与插件日志）三大视图。
-- **后台任务与重绘**：文件索引、全局搜索、Git 扫描/写操作、查看器解析全部在后台线程执行；Git 刷新 400ms 去抖且同一时刻单飞，结果完成即触发重绘，窗口空闲时不做无意义计算（状态栏/标签栏字符串按值缓存、可视行 galley 与小地图按版本缓存、折叠区间二分、快捷键表静态化）。
-- **插件系统**：
-  - 清单驱动 + 内嵌 Lua 5.4：命令、快捷键、状态栏、打开/保存/关闭/内容变化事件、文档读写、异步外部命令、插件私有配置。
-  - 插件管理器支持启用、禁用、重载、重新扫描，全部即时生效，不重启编辑器；禁用立即释放插件内存。
-  - 沙箱只给基础库，单次回调 500 万条指令预算；插件内存占用在管理器里逐插件可见。
-  - 开发说明见 [docs/plugins.md](docs/plugins.md)，示例见 [docs/plugins/demo](docs/plugins/demo)。
-- **工作台交互**：
-  - 标签栏支持溢出滚动、中键关闭、双击空白新建标签、右键关闭右侧/固定/复制路径；状态栏每一段都可点击（Git 分支、诊断计数、行/列、缩进、编码、行尾、语言、缩放）。
-  - 面包屑路径分段可点击定位，长路径自动省略并带完整路径提示；欢迎页并列「最近打开的项目」与「最近打开的文件」。
-  - 命令面板按分类分组、最近使用置顶、快捷键右对齐；快速打开支持 `文件:行号` 直达；侧栏与面板的 hover 统一 120ms 过渡。
-- **编辑器能力**：
-  - 自动闭合括号 / 引号（可在设置里关闭）、括号匹配高亮与 `Ctrl+Shift+\` 跳转、`Alt+Shift+→/←` 选择扩展与收缩、`Alt+拖拽` 列选、拖拽选中文本移动或复制。
-  - 查找替换支持「仅选区内」、正则捕获组 `$1` 替换、查找历史（↑/↓）；`Alt+←/→` 在跳转历史中前进后退；命令面板提供切换行尾、以指定编码重开 / 另存、清理行尾空白。
-- **版本控制**：SCM 面板支持 fetch / pull / push / 发布分支，冲突文件带徽标并可「使用我的 / 对方的版本」一键解决，提交历史支持分页加载更多。
-- **搜索与侧栏**：文件树多选与批量删除、右键菜单补全、新建 / 重命名内联校验；全局搜索支持「仅文件名」模式、include/exclude 持久化、搜索历史与单条替换。
-- **终端与查看器**：终端支持左右分屏双 pty、自动探测 PowerShell 7 / cmd / Git Bash / WSL、跟随活动文件目录、`Ctrl+点击` 打开链接、拖入文件插入路径；ZIP 内文件双击打开、xlsx 冻结表头。
-- **设置与快捷键**：设置面板分区导航 + 搜索过滤；快捷键对话框支持搜索与录制改键（写入 `keybindings.json` 并立即生效）。
+### 高性能核心编辑器
+- **Rope 缓冲与大文件保护**：基于 `ropey` 实现高效编辑；超过 8 MB 的文件自动以只读模式打开并关闭语法高亮与小地图；二进制文件自动启用只读保护。
+- **多编码与行尾支持**：自动识别并无损保存 `UTF-8`、`UTF-8 with BOM`、`UTF-16 LE/BE`、`ANSI/GBK`，命令面板支持以指定编码重开/另存及 `LF`/`CRLF` 切换。
+- **保存安全与会话恢复**：保存前校验磁盘 `mtime`，检测到外部修改时立即停止并提示防止误覆盖；支持自动保存（不清空撤销栈）以及崩溃/重启后的未命名缓冲区与工作台会话恢复。
+- **原生 IME 支持**：完整支持中/日/韩输入法内联组合文本与候选窗跟随，编辑区与内置终端均可流畅输入中文。
+- **多光标与高效编辑**：支持 `Alt+Click` 增删光标、`Ctrl+D` 增量选中、`Ctrl+Shift+L` 全选匹配、`Ctrl+Alt+↑/↓` 纵向多光标、`Alt+拖拽` 列选；提供自动闭合括号/引号、括号匹配高亮与跳转、选区智能扩展/收缩、拖拽移动或复制选区、跳转历史回退与前进。
+- **现代视图能力**：代码折叠、粘性滚动（Sticky Scroll）、自动换行（Soft Word Wrap）、按语法着色的增强小地图（叠加当前行、选区、查找命中与 Git 变更）。
 
-## 界面预览
+### 代码智能与多语言支持
+- **内置 17 种语言语法引擎**：基于 `tree-sitter` 增量解析（Rust、Python、JavaScript、TypeScript、TSX、JSON、TOML、C、C++、Go、Java、C#、HTML、CSS、Shell/Bash、YAML）与独立 Markdown 语法扫描器。
+- **补全与导航**：实时上下文与成员补全（输入 `.` / `::` 自动触发，`Ctrl+Space` 手动触发）；可折叠符号大纲（Outline）与面包屑层级定位；`F12` / `Ctrl+Click` 跨文件转到定义；语法诊断波浪线与悬停提示；`Shift+Alt+F` 格式化文档。
 
-| 命令面板 | 快速打开 |
+### 工作台与视觉体验
+- **双主题与可读性设计**：内置深色（Dark）与浅色（Light）双主题，正文、注释与辅助文字均满足 WCAG AA（≥ 4.5:1）对比度；内置 VSCode Codicons 矢量图标库与按语言/目录语义着色的文件树图标；跨平台 CJK 字体回退链。
+- **灵活布局**：支持向右拆分编辑器与拖拽标签/文件至边缘分屏，中缝可拖动调宽；标签栏支持溢出滚动、中键关闭、双击新建、固定与右键菜单；侧栏区块高度可拖动调整。
+- **高效检索与配置**：命令面板按分类分组并置顶最近使用项；快速打开支持 `文件:行号` 直达；工作区多线程全局搜索与替换（支持仅文件名模式、正则与 `$1` 捕获组、include/exclude 持久化、单条替换与历史记录）；设置面板支持分区导航与搜索，快捷键面板支持实时录制改键。
+
+### 原生 Git 集成与可视化 Diff
+- **源代码管理（SCM）**：单文件/分组暂存、取消暂存、放弃更改（全量丢弃二次确认）；多行提交、`Ctrl+Enter` 提交、`Amend` 修订与撤销上次提交；分支过滤/切换/新建/合并/删除；`fetch` / `pull` / `push` / 发布分支；储藏（Stash）管理；冲突文件一键采用当前/对方版本；提交历史分页加载与历史版本只读浏览。
+- **实时状态感知**：编辑器 Gutter 行内 Diff 指示条（新增/修改/删除），文件树、标签页与状态栏同步展示变更标记及分支 `↑ahead ↓behind`。
+- **增强型 Diff 视图**：支持并排与内联双模式、语法高亮与词级差异；支持视图内文本选中与复制、查找匹配（`Ctrl+F`）、工作区行内直接编辑、Diff 小地图与概览标尺、横向滚动，以及按 Hunk 逐块暂存 / 取消暂存 / 丢弃。
+
+### Markdown 与网页预览
+- **三模式实时联动**：支持纯源码、纯预览与左右分屏三种模式（`Ctrl+Shift+V` / `Alt+V`），分屏模式下源码与渲染视图实时双向滚动同步。
+- **完整 GFM 与扩展语法**：表格、任务列表、代码高亮与一键复制、Callout 提示框、脚注、数学公式、定义列表，以及常见 HTML 容器与内联样式。
+- **远程图片、SVG 与浏览器预览**：内置异步远程图片加载与本地临时缓存；内置轻量原生 SVG 渲染引擎，无需外部浏览器即可直接呈现徽标与矢量图表；支持导出独立 HTML5 页面并在系统默认浏览器中预览。
+
+### 多模态文件查看器
+后台线程异步解析，避免阻塞 UI 渲染：
+- **图片**：PNG、JPG/JPEG、GIF、WebP、BMP、ICO、TIFF
+- **办公与文档**：PDF（Windows WinRT 渲染）、Word（`.docx`）、Excel（`.xlsx` / `.xlsm`，支持冻结表头）
+- **结构化数据**：CSV / TSV 表格视图，支持与源码视图一键切换
+- **压缩归档**：ZIP / JAR / WHL / APK / NUPKG / VSIX / XPI 目录浏览，支持双击解压查看归档内文件
+
+### 多会话内置终端与底部面板
+- 基于 `portable-pty` + `vt100`，自动探测 PowerShell / PowerShell 7 / CMD / Git Bash / WSL。
+- 支持多终端实例切换与左右分屏双 PTY、5,000 行回滚缓冲、鼠标选中与 `Ctrl+Shift+C/V` 复制粘贴、回滚缓冲搜索、`Ctrl+Click` 打开链接、拖入文件插入路径，以及可选跟随活动文件目录。
+- 底部面板统一集成 **终端（Terminal）**、**问题（Problems）** 与 **输出（Output）** 三大视图。
+
+### Lua 插件系统
+- 清单驱动（`plugin.json`）+ 内嵌 Lua 5.4（`mlua` vendored），在沙箱环境中运行（无 `io`/`os`/`package`/`debug` 库，单次回调限制 500 万条指令）。
+- 支持注册命令与快捷键、状态栏交互项、文档读写、生命周期钩子、异步外部进程调用与插件私有配置持久化。
+- 插件视图（`Ctrl+Shift+X`）支持免重启热启用、禁用、重载与重新扫描，实时展示各插件 Lua 内存占用并在禁用时立即回收。
+
+---
+
+## 技术栈与项目结构
+
+| 领域 | 核心依赖 |
 | --- | --- |
-| ![命令面板](docs/screenshots/palette.png) | ![快速打开](docs/screenshots/quickopen.png) |
+| GUI 与渲染 | `eframe` 0.37、`egui` 0.37（`wgpu` 后端） |
+| 文本与检索 | `ropey`、`regex`、`ignore`、`notify` |
+| 语法引擎 | `tree-sitter` 0.27 及 15 个语言语法包（覆盖 16 种代码语言） |
+| 终端与插件 | `portable-pty`、`vt100`、`mlua`（Lua 5.4 vendored） |
+| 多模态解析 | `image`、`flate2`、`roxmltree`、`windows`（WinRT PDF） |
 
-| 查找替换 | 全局搜索与替换 |
-| --- | --- |
-| ![查找替换](docs/screenshots/find.png) | ![项目搜索](docs/screenshots/search.png) |
+```text
+src/
+├── main.rs            # 入口与窗口配置
+├── app.rs             # 应用主状态、事件调度与工作台编排
+├── commands.rs        # 命令注册表与快捷键解析
+├── doc.rs             # Rope 文档模型、编码识别、保存冲突校验与撤销栈
+├── editor/            # 编辑器视图、输入/IME、语法缓存、折叠、小地图
+├── highlight/         # tree-sitter 增量高亮与 Markdown 词法扫描
+├── lsp.rs             # 符号大纲、代码折叠、语法诊断与补全/跳转辅助
+├── diff.rs            # 可视化 Diff 视图（并排/内联、行内编辑、Hunk 操作、小地图）
+├── git.rs             # 原生 Git 命令封装、后台防抖扫描与写操作队列
+├── markdown/          # Markdown/HTML 解析、egui 渲染、远程图片、原生 SVG、HTML 导出
+├── viewer/            # 图片、PDF、DOCX、XLSX/CSV、ZIP 归档查看器
+├── workspace/         # 文件树、后台文件索引、多线程全局搜索、文件监听
+├── terminal.rs        # ConPTY / PTY 会话管理与 vt100 终端缓冲
+├── plugin/            # Lua 5.4 插件宿主、清单解析、API 绑定与插件管理面板
+├── ui/                # 顶栏、侧边栏、命令面板、弹窗、终端面板与基础控件
+├── settings.rs        # 配置、自定义快捷键与会话状态持久化
+├── theme.rs           # 深色/浅色设计系统 Token
+├── fonts.rs           # 字体与 CJK 回退链加载
+├── icons.rs           # Codicons 与文件/目录矢量图标绘制
+└── fuzzy.rs           # 模糊匹配打分器
+```
 
-| 多会话终端与问题面板 | 偏好设置 |
-| --- | --- |
-| ![终端](docs/screenshots/terminal.png) | ![设置](docs/screenshots/settings.png) |
-
-| 浅色模式 (Light) | 欢迎页 |
-| --- | --- |
-| ![浅色主题](docs/screenshots/light.png) | ![欢迎页](docs/screenshots/welcome.png) |
+---
 
 ## 构建与运行
 
-已构建版本：直接双击运行仓库根目录下的 `Kestrel.exe`（Windows x64，单文件内置图标字库，无需安装）。
+### 环境要求
+- Rust 工具链（支持 **Rust 2024 Edition**，建议使用最新 stable 版本）
+- 推荐平台：Windows x64（PDF 预览依赖 Windows WinRT API；其余模块基于跨平台 crate 构建）
 
-从源码构建：
+### 从源码构建
 
 ```bash
+# Release 构建并运行
 cargo build --release
-./target/release/kestrel.exe
+./target/release/kestrel
+
+# 或直接运行
+cargo run --release
+
+# 运行单元测试
+cargo test
 ```
 
-## 插件
+Windows 下也可以使用仓库自带的构建脚本（会构建 Release 并将可执行文件复制到仓库根目录）：
 
-插件目录默认在 `%APPDATA%\Kestrel\plugins\<id>\`，开发和调试时用 `KESTREL_PLUGINS` 指向其它根目录。点活动栏的插件图标或按 `Ctrl+Shift+X` 打开插件视图，命令面板搜索「管理插件」也能进入。
+```bash
+bash scripts/build.sh          # Release 构建 -> ./Kestrel.exe
+bash scripts/build.sh --debug  # Debug 构建
+```
 
-清单格式、Lua API、事件与约束见 [docs/plugins.md](docs/plugins.md)。
+### 常用环境变量
+
+| 变量 | 说明 |
+| --- | --- |
+| `KESTREL_OPEN=<path>` | 启动时直接打开指定文件或目录 |
+| `KESTREL_THEME=dark\|light` | 覆盖启动主题 |
+| `KESTREL_WINDOW=<W>x<H>` | 覆盖初始窗口尺寸（如 `1280x800`） |
+| `KESTREL_PLUGINS=<dir>` | 指定自定义插件根目录（便于本地插件开发调试） |
+| `KESTREL_TRACE=1` | 在输出面板记录插件加载、内存与命令耗时日志 |
+| `KESTREL_PROFILE=1` | 输出启动与帧耗时诊断信息 |
+
+### 配置与数据目录
+- **Windows**：`%APPDATA%\Kestrel\`
+- **macOS**：`~/Library/Application Support/Kestrel/`
+- **Linux**：`$XDG_CONFIG_HOME/kestrel/` 或 `~/.config/kestrel/`
+
+包含配置文件 `settings.json`、自定义快捷键 `keybindings.json`、会话恢复数据与默认插件目录 `plugins/`。
+
+---
+
+## 插件开发速览
+
+在插件目录下新建文件夹 `<插件id>/`，放入 `plugin.json` 与 `main.lua`：
+
+```json
+{
+  "id": "hello",
+  "name": "Hello Plugin",
+  "version": "0.1.0",
+  "description": "示例插件",
+  "apiVersion": 1,
+  "main": "main.lua",
+  "events": ["changed"]
+}
+```
+
+```lua
+kestrel.command("hello.greet", "向当前文档问好", function()
+  local doc = kestrel.active_doc()
+  if not doc then
+    kestrel.notify("当前没有打开的文档", "warning")
+    return
+  end
+  kestrel.notify("当前文件：" .. (doc:path() or "未命名"), "info")
+end, "ctrl+alt+h")
+
+kestrel.on("saved", function(ev)
+  kestrel.log("已保存: " .. (ev.doc:path() or ""))
+end)
+```
+
+常用宿主 API（全局表 `kestrel`）：
+- **交互与命令**：`kestrel.command(id, title, fn, key?)`、`kestrel.run_command(id)`、`kestrel.status_item(key, text, command_id?)`、`kestrel.notify(text, level?)`、`kestrel.log(text)`
+- **事件订阅**：`kestrel.on(event, fn)`，支持 `startup`、`opened`、`before_save`、`saved`、`closed`、`changed`（需在清单 `events` 声明）、`shutdown`
+- **文档与工作区**：`kestrel.active_doc()`（提供 `path`、`language`、`is_dirty`、`text`、`text_range`、`line`、`line_count`、`caret`、`selection`、`set_text`、`insert`、`replace`、`set_selection`、`save`）、`kestrel.root()`、`kestrel.open_file(path)`、`kestrel.read_file(path)` / `kestrel.write_file(path, text)`
+- **扩展与持久化**：`kestrel.exec{ program, args?, stdin?, on_done }`（异步执行外部进程）、`kestrel.config(key, default)` / `kestrel.set_config(key, value)`
+
+在编辑器中按 `Ctrl+Shift+X` 打开插件面板，即可随时「重新扫描」或「重载」调试中的插件。
+
+---
 
 ## 常用快捷键
 
+> 以下为 Windows / Linux 默认快捷键；macOS 下 `Ctrl` 自动对应 `Cmd`。可在快捷键面板（`Ctrl+K`）中检索并直接录制修改。
+
+### 导航与工作台
 | 操作 | 快捷键 |
 | --- | --- |
-| 快速打开文件 | `Ctrl+P` |
+| 快速打开文件（支持 `文件:行号`） | `Ctrl+P` |
 | 命令面板 | `Ctrl+Shift+P` |
-| 转到文件中的符号 (Outline) | `Ctrl+Shift+.` |
-| 转到定义 | `F12` / `Ctrl+Click` |
-| 触发代码补全 | `Ctrl+Space` |
-| 格式化文档 | `Shift+Alt+F` |
-| 选中下一个相同词 (多光标) | `Ctrl+D` |
-| 选中所有相同词 (多光标) | `Ctrl+Shift+L` |
-| 在上/下方添加光标 | `Ctrl+Alt+↑` / `Ctrl+Alt+↓` |
-| 任意位置添加/移除光标 | `Alt+Click` |
-| 拆分编辑器到右侧 (分屏) | `Ctrl+\` |
-| 切换自动换行 | `Alt+Z` |
-| 切换代码折叠 | `Ctrl+Shift+[` |
+| 切换侧边栏 | `Ctrl+B` |
+| 资源管理器 / 全局搜索 / 插件视图 | `Ctrl+Shift+E` / `Ctrl+Shift+F` / `Ctrl+Shift+X` |
+| 切换底部终端 / 新建终端 | `Ctrl+J` / `` Ctrl+Shift+` `` |
+| 问题面板 / 输出面板 | `Ctrl+Shift+M` / `Ctrl+Shift+U` |
+| 向右拆分编辑器（分屏） | `Ctrl+\` |
+| 切换下一个 / 上一个标签页 | `Ctrl+Tab` / `Ctrl+Shift+Tab` |
+| 偏好设置 / 快捷键总览 | `Ctrl+,` / `Ctrl+K` |
+| 放大 / 缩小 / 重置界面缩放 | `Ctrl++` / `Ctrl+-` / `Ctrl+0` |
+
+### 编辑与代码导航
+| 操作 | 快捷键 |
+| --- | --- |
 | 查找 / 替换 | `Ctrl+F` / `Ctrl+H` |
-| 全局搜索与替换 | `Ctrl+Shift+F` |
-| 侧边栏 / 终端 / 问题面板 | `Ctrl+B` / `Ctrl+J` / `Ctrl+Shift+M` |
-| 插件视图 | `Ctrl+Shift+X` |
-| 键盘快捷键总览 | `Ctrl+K` |
+| 跳转到行 / 跳转到符号（Outline） | `Ctrl+G` / `Ctrl+Shift+.` |
+| 转到定义 | `F12` / `Ctrl+Click` |
+| 触发代码补全 / 格式化文档 | `Ctrl+Space` / `Shift+Alt+F` |
+| 选中下一个相同词 / 全部相同词 | `Ctrl+D` / `Ctrl+Shift+L` |
+| 上/下方添加光标 / 任意位置添加光标 | `Ctrl+Alt+↑` / `Ctrl+Alt+↓` / `Alt+Click` |
+| 扩展 / 收缩选区 | `Shift+Alt+→` / `Shift+Alt+←` |
+| 跳转匹配括号 / 切换代码折叠 | `Ctrl+Shift+\` / `Ctrl+Shift+[` |
+| 切换注释 / 复制行 / 删除行 | `Ctrl+/` / `Ctrl+Shift+D` / `Ctrl+Shift+K` |
+| 上移 / 下移当前行 | `Alt+↑` / `Alt+↓` |
+| 跳转历史后退 / 前进 | `Alt+←` / `Alt+→` |
+| 切换自动换行 / 切换小地图 | `Alt+Z` / `Alt+M` |
+| Markdown 预览 / 侧边分屏预览 | `Ctrl+Shift+V` / `Alt+V` |
 
-## License
+---
 
-MIT，见 [LICENSE](LICENSE)。
+## 许可证
+
+本项目基于 [MIT License](LICENSE) 开源。
