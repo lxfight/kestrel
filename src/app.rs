@@ -285,6 +285,9 @@ impl BottomTab {
         }
     }
 }
+/// Maximum simultaneous side-by-side split terminal panes.
+pub const MAX_TERMINAL_PANES: usize = 4;
+
 pub struct BottomPanel {
     pub visible: bool,
     pub tab: BottomTab,
@@ -299,10 +302,16 @@ pub struct BottomPanel {
 
     /// Kept from the last frame so global shortcuts skip keys the terminal owns.
     pub terminal_has_focus: bool,
-    /// Two terminals side by side in the same bottom panel.
-    pub split: bool,
-    /// Right-hand terminal when `split` is on.
-    pub secondary_terminal: usize,
+    /// Indices into `terminals` currently visible side-by-side (1..=MAX_TERMINAL_PANES).
+    pub panes: Vec<usize>,
+    /// Relative horizontal weights matching `panes`.
+    pub pane_weights: Vec<f32>,
+    /// Index into `panes` identifying the currently focused pane slot.
+    pub focused_pane: usize,
+    /// Maximize the bottom panel height to fill most of the window.
+    pub maximized: bool,
+    /// Active inline rename state: `(terminal_id, draft_name, needs_focus)`.
+    pub renaming_terminal: Option<(u64, String, bool)>,
     /// New terminals start in the active editor's directory instead of the project root.
     pub follow_active_dir: bool,
 }
@@ -319,10 +328,63 @@ impl BottomPanel {
             terminal_size: (0, 0),
             terminal_focus: false,
             terminal_has_focus: false,
-            split: false,
-            secondary_terminal: 1,
+            panes: Vec::new(),
+            pane_weights: Vec::new(),
+            focused_pane: 0,
+            maximized: false,
+            renaming_terminal: None,
             follow_active_dir: false,
         }
+    }
+
+    pub fn is_split(&self) -> bool {
+        self.panes.len() >= 2
+    }
+
+    /// Ensure `panes`, `pane_weights`, `focused_pane`, and `active_terminal` stay consistent.
+    pub fn normalize_panes(&mut self) {
+        let len = self.terminals.len();
+        if len == 0 {
+            self.panes.clear();
+            self.pane_weights.clear();
+            self.focused_pane = 0;
+            self.active_terminal = 0;
+            return;
+        }
+        let mut seen = Vec::new();
+        let mut next_panes = Vec::new();
+        let mut next_weights = Vec::new();
+        for (slot, &idx) in self.panes.iter().enumerate() {
+            if idx < len && !seen.contains(&idx) && next_panes.len() < MAX_TERMINAL_PANES {
+                seen.push(idx);
+                next_panes.push(idx);
+                let w = self.pane_weights.get(slot).copied().unwrap_or(1.0);
+                next_weights.push(if w.is_finite() && w > 0.1 { w } else { 1.0 });
+            }
+        }
+        if next_panes.is_empty() {
+            let fallback = self.active_terminal.min(len - 1);
+            next_panes.push(fallback);
+            next_weights.push(1.0);
+        }
+        self.panes = next_panes;
+        self.pane_weights = next_weights;
+        self.focused_pane = self.focused_pane.min(self.panes.len() - 1);
+        self.active_terminal = self.panes[self.focused_pane];
+    }
+
+    /// Index of the terminal session that currently owns focus.
+    pub fn focused_terminal_idx(&self) -> Option<usize> {
+        let len = self.terminals.len();
+        if len == 0 {
+            return None;
+        }
+        if let Some(&idx) = self.panes.get(self.focused_pane)
+            && idx < len
+        {
+            return Some(idx);
+        }
+        Some(self.active_terminal.min(len - 1))
     }
 }
 
@@ -725,6 +787,8 @@ pub struct KestrelApp {
     pub ui_bold_family: FontFamily,
     pub mono_family: FontFamily,
     pub mono_bold_family: FontFamily,
+    pub term_mono_family: FontFamily,
+    pub term_mono_bold_family: FontFamily,
 
     pub tabs: Vec<Editor>,
     pub active: usize,
@@ -811,7 +875,8 @@ impl KestrelApp {
         cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
         cc.egui_ctx
             .set_zoom_factor(settings.ui_zoom.clamp(0.7, 1.8));
-        let font_set = crate::fonts::install(&cc.egui_ctx);
+        let font_set =
+            crate::fonts::install_with_terminal_font(&cc.egui_ctx, &settings.terminal_font_family);
         let theme = Theme::by_kind(ThemeKind::from_str(&settings.theme));
         theme.apply(&cc.egui_ctx);
         let ui_ready_ms = startup_started.elapsed().as_secs_f64() * 1000.0;
@@ -850,6 +915,8 @@ impl KestrelApp {
             ui_bold_family: font_set.ui_bold_family,
             mono_family: font_set.mono_family,
             mono_bold_family: font_set.mono_bold_family,
+            term_mono_family: font_set.term_mono_family,
+            term_mono_bold_family: font_set.term_mono_bold_family,
             tabs: Vec::new(),
             active: 0,
             groups: vec![EditorGroup::new()],
@@ -1078,6 +1145,17 @@ impl KestrelApp {
         self.sidebar.mode = SidebarMode::from_str(&session.sidebar_mode);
         self.bottom.height = session.bottom_height.max(120.0);
         self.bottom.tab = BottomTab::from_str(&session.bottom_tab);
+        if !session.bottom_panes.is_empty() {
+            self.bottom.panes = session.bottom_panes.clone();
+            self.bottom.pane_weights = session.bottom_pane_weights.clone();
+        } else if session.bottom_split {
+            let ratio = session.bottom_split_ratio.clamp(0.2, 0.8);
+            self.bottom.panes = vec![session.active_terminal, session.secondary_terminal];
+            self.bottom.pane_weights = vec![ratio, 1.0 - ratio];
+        } else {
+            self.bottom.panes = vec![session.active_terminal];
+            self.bottom.pane_weights = vec![1.0];
+        }
         let specs: Vec<(ShellKind, PathBuf)> = session
             .terminals
             .iter()
@@ -1213,9 +1291,12 @@ impl KestrelApp {
                 if self.bottom.terminals.len() < 2 {
                     self.new_terminal();
                 }
-                self.bottom.split = true;
-                self.bottom.active_terminal = 0;
-                self.bottom.secondary_terminal = 1.min(self.bottom.terminals.len() - 1);
+                if self.bottom.terminals.len() >= 2 {
+                    self.bottom.panes = vec![0, 1];
+                    self.bottom.pane_weights = vec![1.0, 1.0];
+                    self.bottom.focused_pane = 0;
+                    self.bottom.active_terminal = 0;
+                }
             }
             "output" => {
                 self.bottom.visible = true;
@@ -1384,6 +1465,19 @@ impl KestrelApp {
             bottom_height: self.bottom.height,
             terminals,
             active_terminal: self.bottom.active_terminal,
+            bottom_split: self.bottom.is_split(),
+            secondary_terminal: self.bottom.panes.get(1).copied().unwrap_or(1),
+            bottom_split_ratio: {
+                let sum: f32 = self.bottom.pane_weights.iter().take(2).sum();
+                if sum > 0.01 {
+                    (self.bottom.pane_weights.first().copied().unwrap_or(0.5) / sum)
+                        .clamp(0.2, 0.8)
+                } else {
+                    0.5
+                }
+            },
+            bottom_panes: self.bottom.panes.clone(),
+            bottom_pane_weights: self.bottom.pane_weights.clone(),
             search_query: self.workspace.search_panel.query.clone(),
             recent_files: self
                 .recent_files
@@ -1530,8 +1624,24 @@ impl KestrelApp {
             ui_bold_family: self.ui_bold_family.clone(),
             mono_family: self.mono_family.clone(),
             mono_bold_family: self.mono_bold_family.clone(),
+            term_mono_family: self.term_mono_family.clone(),
+            term_mono_bold_family: self.term_mono_bold_family.clone(),
             ui_size: 13.0,
         }
+    }
+
+    /// Hot-reload UI, editor, and custom terminal font definitions.
+    pub fn reload_fonts(&mut self, ctx: &egui::Context) {
+        let font_set = crate::fonts::install_with_terminal_font(
+            ctx,
+            &self.settings.terminal_font_family,
+        );
+        self.ui_family = font_set.ui_family;
+        self.ui_bold_family = font_set.ui_bold_family;
+        self.mono_family = font_set.mono_family;
+        self.mono_bold_family = font_set.mono_bold_family;
+        self.term_mono_family = font_set.term_mono_family;
+        self.term_mono_bold_family = font_set.term_mono_bold_family;
     }
 
     pub fn editor_style(&self) -> EditorStyle {
@@ -2382,9 +2492,28 @@ impl KestrelApp {
 
     /// Open `path` and jump directly to a 1-based line number.
     pub fn open_file_at_line(&mut self, path: PathBuf, line: usize) {
+        self.open_file_at_line_col(path, line, None);
+    }
+
+    /// Open `path` and jump directly to a 1-based line and optional 1-based column.
+    pub fn open_file_at_line_col(&mut self, path: PathBuf, line: usize, col: Option<usize>) {
         let path = self.canonical(path);
         self.open_file(path);
-        self.goto_line(line.max(1));
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        let line_idx = line
+            .max(1)
+            .min(tab.doc.line_count().max(1))
+            .saturating_sub(1);
+        let line_start = tab.doc.line_to_char(line_idx);
+        let line_len = tab.doc.line_content(line_idx).chars().count();
+        let col_off = col.unwrap_or(1).saturating_sub(1).min(line_len);
+        let caret = (line_start + col_off).min(tab.doc.len_chars());
+        tab.caret = caret;
+        tab.anchor = caret;
+        tab.ensure_visible = true;
+        tab.focus_requested = true;
     }
 
     /// Synchronize open editor tabs, Git status, and the diff view after saving
@@ -3975,9 +4104,8 @@ impl KestrelApp {
     // Terminal (Multi-Session)
     // ------------------------------------------------------------------
 
-    pub fn toggle_terminal(&mut self) {
-        self.bottom.visible = !self.bottom.visible;
-        if self.bottom.visible && self.bottom.terminals.is_empty() {
+    fn ensure_terminal_ready(&mut self) {
+        if self.bottom.terminals.is_empty() {
             let pending = std::mem::take(&mut self.bottom.pending_terminals);
             for (shell, cwd) in pending.into_iter().take(4) {
                 self.open_terminal_in(cwd, shell);
@@ -3986,6 +4114,39 @@ impl KestrelApp {
                 self.new_terminal();
             }
         }
+    }
+
+    pub fn toggle_terminal(&mut self) {
+        if self.bottom.visible && self.bottom.tab != BottomTab::Terminal {
+            self.bottom.tab = BottomTab::Terminal;
+            self.ensure_terminal_ready();
+            self.bottom.terminal_focus = true;
+            return;
+        }
+        self.bottom.visible = !self.bottom.visible;
+        if self.bottom.visible {
+            self.bottom.tab = BottomTab::Terminal;
+            self.ensure_terminal_ready();
+            self.bottom.terminal_focus = true;
+        } else if let Some(tab) = self.tabs.get_mut(self.active) {
+            tab.focus_requested = true;
+        }
+    }
+
+    /// Focus the integrated terminal (opening the panel/session if needed), or
+    /// return focus to the editor if the terminal is already focused.
+    pub fn focus_terminal(&mut self) {
+        if self.bottom.visible && self.bottom.tab == BottomTab::Terminal && self.bottom.terminal_has_focus {
+            if let Some(tab) = self.tabs.get_mut(self.active) {
+                tab.focus_requested = true;
+                self.bottom.terminal_focus = false;
+                return;
+            }
+        }
+        self.bottom.visible = true;
+        self.bottom.tab = BottomTab::Terminal;
+        self.ensure_terminal_ready();
+        self.bottom.terminal_focus = true;
     }
 
     pub fn new_terminal(&mut self) {
@@ -4018,41 +4179,235 @@ impl KestrelApp {
         self.open_terminal_in(dir, ShellKind::Default);
     }
 
-    fn open_terminal_in(&mut self, cwd: PathBuf, shell: ShellKind) {
+    fn estimated_initial_terminal_size(&self) -> (u16, u16) {
         let (cols, rows) = self.bottom.terminal_size;
-        let cols = cols.max(20);
-        let rows = rows.max(4);
-        if let Some(session) =
-            crate::terminal::TerminalSession::new_with_shell(&cwd, cols, rows, shell)
-        {
-            self.bottom.terminals.push(session);
-            self.bottom.active_terminal = self.bottom.terminals.len() - 1;
-            self.bottom.terminal_size = (cols, rows);
-            self.bottom.terminal_focus = true;
-            self.bottom.visible = true;
-            self.bottom.tab = BottomTab::Terminal;
+        if cols >= 20 && rows >= 4 {
+            return (cols, rows);
+        }
+        let font_size = self.settings.terminal_font_size.clamp(9.0, 28.0);
+        let cell_h = (font_size * 1.45).max(12.0);
+        let est_rows = (((self.bottom.height - 36.0) / cell_h).floor() as u16).clamp(8, 60);
+        let est_cols = 100u16;
+        (est_cols, est_rows)
+    }
+
+    fn open_terminal_in(&mut self, cwd: PathBuf, shell: ShellKind) {
+        self.open_terminal_internal(cwd, shell, false);
+    }
+
+    fn open_terminal_internal(&mut self, cwd: PathBuf, shell: ShellKind, add_pane: bool) {
+        let resolved_shell = if shell == ShellKind::Default {
+            ShellKind::from_str(&self.settings.terminal_default_shell)
+        } else {
+            shell
+        };
+        let custom_shell = crate::terminal::CustomShellConfig::from_settings(
+            &self.settings.terminal_custom_shell_path,
+            &self.settings.terminal_custom_shell_args,
+        );
+        let (cols, rows) = self.estimated_initial_terminal_size();
+        let mut session = crate::terminal::TerminalSession::spawn_async(
+            &cwd,
+            cols,
+            rows,
+            resolved_shell,
+            custom_shell,
+            Some(self.egui_ctx.clone()),
+        );
+        let fg = self.theme.text;
+        let bg = self.theme.terminal_bg;
+        session.set_theme_colors((fg.r(), fg.g(), fg.b()), (bg.r(), bg.g(), bg.b()));
+        self.bottom.terminals.push(session);
+        let new_idx = self.bottom.terminals.len() - 1;
+
+        if add_pane && self.bottom.panes.len() < MAX_TERMINAL_PANES {
+            let insert_at = (self.bottom.focused_pane + 1).min(self.bottom.panes.len());
+            self.bottom.panes.insert(insert_at, new_idx);
+            let avg_weight = if self.bottom.pane_weights.is_empty() {
+                1.0
+            } else {
+                self.bottom.pane_weights.iter().sum::<f32>()
+                    / self.bottom.pane_weights.len() as f32
+            };
+            self.bottom
+                .pane_weights
+                .insert(insert_at, avg_weight.max(0.25));
+            self.bottom.focused_pane = insert_at;
+        } else if self.bottom.panes.is_empty() {
+            self.bottom.panes.push(new_idx);
+            self.bottom.pane_weights.push(1.0);
+            self.bottom.focused_pane = 0;
+        } else {
+            let slot = self.bottom.focused_pane.min(self.bottom.panes.len() - 1);
+            self.bottom.panes[slot] = new_idx;
+        }
+        self.bottom.active_terminal = new_idx;
+        self.bottom.normalize_panes();
+        self.bottom.terminal_size = (cols, rows);
+        self.bottom.terminal_focus = true;
+        self.bottom.visible = true;
+        self.bottom.tab = BottomTab::Terminal;
+    }
+
+    pub fn focus_terminal_index(&mut self, idx: usize) {
+        if idx >= self.bottom.terminals.len() {
+            return;
+        }
+        self.bottom.normalize_panes();
+        if let Some(slot) = self.bottom.panes.iter().position(|&p| p == idx) {
+            self.bottom.focused_pane = slot;
+        } else if !self.bottom.panes.is_empty() {
+            let slot = self.bottom.focused_pane.min(self.bottom.panes.len() - 1);
+            self.bottom.panes[slot] = idx;
+        } else {
+            self.bottom.panes = vec![idx];
+            self.bottom.pane_weights = vec![1.0];
+            self.bottom.focused_pane = 0;
+        }
+        self.bottom.active_terminal = idx;
+        self.bottom.terminal_focus = true;
+        for term in &mut self.bottom.terminals {
+            term.ime_preedit.clear();
         }
     }
 
-    pub fn close_active_terminal(&mut self) {
-        if self.bottom.terminals.is_empty() {
+    pub fn add_terminal_to_split(&mut self, idx: usize) {
+        if idx >= self.bottom.terminals.len() {
             return;
         }
-        let idx = self
+        self.bottom.normalize_panes();
+        if let Some(slot) = self.bottom.panes.iter().position(|&p| p == idx) {
+            self.bottom.focused_pane = slot;
+            self.bottom.active_terminal = idx;
+            self.bottom.terminal_focus = true;
+            return;
+        }
+        if self.bottom.panes.len() >= MAX_TERMINAL_PANES {
+            self.toast(
+                format!("最多同时并排显示 {MAX_TERMINAL_PANES} 个终端窗格"),
+                ToastKind::Info,
+            );
+            return;
+        }
+        let insert_at = (self.bottom.focused_pane + 1).min(self.bottom.panes.len());
+        self.bottom.panes.insert(insert_at, idx);
+        self.bottom.pane_weights.insert(insert_at, 1.0);
+        self.bottom.focused_pane = insert_at;
+        self.bottom.active_terminal = idx;
+        self.bottom.terminal_focus = true;
+    }
+
+    pub fn close_active_terminal(&mut self) {
+        if let Some(idx) = self.bottom.focused_terminal_idx() {
+            self.close_terminal_at(idx);
+        }
+    }
+
+    pub fn close_terminal_at(&mut self, idx: usize) {
+        if idx >= self.bottom.terminals.len() {
+            return;
+        }
+        let removed_id = self.bottom.terminals[idx].id;
+        if self
             .bottom
-            .active_terminal
-            .min(self.bottom.terminals.len() - 1);
+            .renaming_terminal
+            .as_ref()
+            .is_some_and(|(id, _, _)| *id == removed_id)
+        {
+            self.bottom.renaming_terminal = None;
+        }
         self.bottom.terminals.remove(idx);
-        self.bottom.active_terminal = self
-            .bottom
-            .active_terminal
-            .min(self.bottom.terminals.len().saturating_sub(1));
-        let secondary = if self.bottom.secondary_terminal >= self.bottom.terminals.len() {
-            0
+
+        let mut next_panes = Vec::new();
+        let mut next_weights = Vec::new();
+        for (slot, &pane_idx) in self.bottom.panes.iter().enumerate() {
+            if pane_idx == idx {
+                continue;
+            }
+            let shifted = if pane_idx > idx { pane_idx - 1 } else { pane_idx };
+            next_panes.push(shifted);
+            next_weights.push(self.bottom.pane_weights.get(slot).copied().unwrap_or(1.0));
+        }
+        self.bottom.panes = next_panes;
+        self.bottom.pane_weights = next_weights;
+        self.bottom.normalize_panes();
+        if !self.bottom.terminals.is_empty() {
+            self.bottom.terminal_focus = true;
+        }
+    }
+
+    /// Split a new terminal pane side-by-side (up to MAX_TERMINAL_PANES).
+    pub fn split_terminal_pane(&mut self) {
+        self.bottom.visible = true;
+        self.bottom.tab = BottomTab::Terminal;
+        if self.bottom.terminals.is_empty() {
+            self.new_terminal();
+        }
+        self.bottom.normalize_panes();
+        if self.bottom.panes.len() >= MAX_TERMINAL_PANES {
+            self.toast(
+                format!("最多同时并排显示 {MAX_TERMINAL_PANES} 个终端窗格"),
+                ToastKind::Info,
+            );
+            return;
+        }
+        let follow_dir = if self.bottom.follow_active_dir {
+            self.active_path()
+                .and_then(|path| path.parent().map(Path::to_path_buf))
         } else {
-            self.bottom.secondary_terminal
+            None
         };
-        self.bottom.secondary_terminal = secondary.min(self.bottom.terminals.len().saturating_sub(1));
+        let cwd = follow_dir
+            .or_else(|| {
+                self.bottom
+                    .focused_terminal_idx()
+                    .and_then(|i| self.bottom.terminals.get(i))
+                    .map(|t| t.cwd.clone())
+            })
+            .or_else(|| self.workspace.root.clone())
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_default();
+        self.open_terminal_internal(cwd, ShellKind::Default, true);
+    }
+
+    /// Collapse multi-pane split back to a single pane showing the focused terminal.
+    pub fn unsplit_terminals(&mut self) {
+        if let Some(focused) = self.bottom.focused_terminal_idx() {
+            self.bottom.panes = vec![focused];
+            self.bottom.pane_weights = vec![1.0];
+            self.bottom.focused_pane = 0;
+            self.bottom.active_terminal = focused;
+            self.bottom.terminal_focus = true;
+        }
+    }
+
+    pub fn switch_terminal_step(&mut self, forward: bool) {
+        let len = self.bottom.terminals.len();
+        if len <= 1 {
+            return;
+        }
+        let cur = self.bottom.focused_terminal_idx().unwrap_or(0);
+        let next = if forward {
+            (cur + 1) % len
+        } else {
+            (cur + len - 1) % len
+        };
+        self.focus_terminal_index(next);
+        self.bottom.visible = true;
+        self.bottom.tab = BottomTab::Terminal;
+    }
+
+    pub fn clear_focused_terminal(&mut self) {
+        if let Some(idx) = self.bottom.focused_terminal_idx()
+            && let Some(term) = self.bottom.terminals.get_mut(idx)
+        {
+            term.clear_screen();
+        }
+    }
+
+    pub fn toggle_terminal_maximize(&mut self) {
+        self.bottom.visible = true;
+        self.bottom.maximized = !self.bottom.maximized;
     }
 
     // ------------------------------------------------------------------
@@ -4401,7 +4756,15 @@ impl KestrelApp {
             Command::QuickOpen => self.open_palette(PaletteMode::QuickOpen),
             Command::ToggleSidebar => self.sidebar.visible = !self.sidebar.visible,
             Command::ToggleTerminal => self.toggle_terminal(),
+            Command::FocusTerminal => self.focus_terminal(),
             Command::NewTerminal => self.new_terminal(),
+            Command::TerminalClose => self.close_active_terminal(),
+            Command::TerminalClear => self.clear_focused_terminal(),
+            Command::TerminalSplit => self.split_terminal_pane(),
+            Command::TerminalUnsplit => self.unsplit_terminals(),
+            Command::TerminalNext => self.switch_terminal_step(true),
+            Command::TerminalPrev => self.switch_terminal_step(false),
+            Command::TerminalMaximize => self.toggle_terminal_maximize(),
             Command::ShowProblems => {
                 self.bottom.visible = true;
                 self.bottom.tab = BottomTab::Problems;
@@ -4653,53 +5016,52 @@ impl KestrelApp {
         if self.palette.open || self.dialog.is_some() {
             return;
         }
-        // Handle UI zoom shortcuts (Ctrl + = / + / - / 0), including Shift+= for '+'
-        let zoom_cmd = ctx.input_mut(|i| {
-            let command = (i.modifiers.ctrl || i.modifiers.command) && !i.modifiers.alt;
-            if !command {
-                return None;
+        let terminal_focused = self.bottom.visible && self.bottom.terminal_has_focus;
+        // Handle UI zoom shortcuts (Ctrl + = / + / - / 0), including Shift+= for '+',
+        // unless the terminal owns keyboard focus (where Ctrl+-/=/0 belong to the shell).
+        if !terminal_focused {
+            let zoom_cmd = ctx.input_mut(|i| {
+                let command = (i.modifiers.ctrl || i.modifiers.command) && !i.modifiers.alt;
+                if !command {
+                    return None;
+                }
+                if i.consume_key(egui::Modifiers::COMMAND, egui::Key::Equals)
+                    || i.consume_key(egui::Modifiers::COMMAND, egui::Key::Plus)
+                    || (i.modifiers.shift
+                        && (i.consume_key(
+                            egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                            egui::Key::Plus,
+                        ) || i.consume_key(
+                            egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                            egui::Key::Equals,
+                        )))
+                {
+                    Some(Command::ZoomIn)
+                } else if i.consume_key(egui::Modifiers::COMMAND, egui::Key::Minus) {
+                    Some(Command::ZoomOut)
+                } else if i.consume_key(egui::Modifiers::COMMAND, egui::Key::Num0) {
+                    Some(Command::ZoomReset)
+                } else {
+                    None
+                }
+            });
+            if let Some(cmd) = zoom_cmd {
+                self.dispatch(cmd, ctx);
+                return;
             }
-            if i.consume_key(egui::Modifiers::COMMAND, egui::Key::Equals)
-                || i.consume_key(egui::Modifiers::COMMAND, egui::Key::Plus)
-                || (i.modifiers.shift
-                    && (i.consume_key(
-                        egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
-                        egui::Key::Plus,
-                    ) || i.consume_key(
-                        egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
-                        egui::Key::Equals,
-                    )))
-            {
-                Some(Command::ZoomIn)
-            } else if i.consume_key(egui::Modifiers::COMMAND, egui::Key::Minus) {
-                Some(Command::ZoomOut)
-            } else if i.consume_key(egui::Modifiers::COMMAND, egui::Key::Num0) {
-                Some(Command::ZoomReset)
-            } else {
-                None
-            }
-        });
-        if let Some(cmd) = zoom_cmd {
-            self.dispatch(cmd, ctx);
-            return;
         }
-        // Editor commands usually run inside the canvas. They are matched here too
-        // while that canvas owns the keyboard, so keybindings.json overrides apply
-        // to them; text fields and the terminal keep their own Ctrl+C/X/Z handling
-        // because their keyboards are not the editor's.
+        // Editor commands usually run inside the canvas. While the terminal owns
+        // keyboard focus, only explicit workbench-level commands bypass the shell.
         let editor_focused = self
             .active_editor()
             .is_some_and(|tab| tab.has_focus && tab.ime_preedit.is_empty());
-        let terminal_focused = self.bottom.visible && self.bottom.terminal_has_focus;
         let mut handled = false;
         let bindings = effective_shortcut_bindings(&self.custom_shortcuts);
         for (command, shortcut) in bindings {
             if command.is_editor_command() && !editor_focused {
                 continue;
             }
-            // Ctrl+Shift+V is both markdown-preview toggle and terminal paste; the
-            // focused terminal owns it so paste never swaps in a preview.
-            if terminal_focused && command == Command::ToggleMarkdownPreview {
+            if terminal_focused && !command.skip_shell_in_terminal() {
                 continue;
             }
             if !pressed
@@ -4714,7 +5076,7 @@ impl KestrelApp {
                 break;
             }
         }
-        if handled {
+        if handled || terminal_focused {
             return;
         }
         for (index, shortcut) in self.plugins.shortcut_candidates() {
@@ -4754,12 +5116,26 @@ impl KestrelApp {
         if self.deferred_terminal_restore && self.frame >= 1 {
             self.deferred_terminal_restore = false;
             let specs = std::mem::take(&mut self.bottom.pending_terminals);
+            let want_panes = self.bottom.panes.clone();
+            let want_weights = self.bottom.pane_weights.clone();
             for (shell, cwd) in specs {
                 self.open_terminal_in(cwd, shell);
             }
+            let len = self.bottom.terminals.len();
             self.bottom.active_terminal = self
                 .deferred_terminal_active
-                .min(self.bottom.terminals.len().saturating_sub(1));
+                .min(len.saturating_sub(1));
+            if !want_panes.is_empty() && len > 0 {
+                self.bottom.panes = want_panes;
+                self.bottom.pane_weights = want_weights;
+                self.bottom.focused_pane = self
+                    .bottom
+                    .panes
+                    .iter()
+                    .position(|&idx| idx == self.bottom.active_terminal)
+                    .unwrap_or(0);
+            }
+            self.bottom.normalize_panes();
             repaint = true;
         }
         while let Ok((tab_id, head_text)) = self.baseline_rx.try_recv() {
@@ -4850,7 +5226,12 @@ impl KestrelApp {
         }
 
         for term in &mut self.bottom.terminals {
-            term.update();
+            if term.update() {
+                repaint = true;
+            }
+            if let Some(clip) = term.take_pending_clipboard() {
+                copy_to_clipboard(clip);
+            }
         }
 
         // Hunk buttons in diff tabs park a Git command on the tab; apply it

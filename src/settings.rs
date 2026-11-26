@@ -53,6 +53,16 @@ pub struct Settings {
     pub search_exclude: String,
     /// New terminals start in the active editor's directory.
     pub terminal_follow_active_dir: bool,
+    /// Preferred default shell profile (`"default"`, `"pwsh"`, `"powershell"`, `"cmd"`, `"gitbash"`, `"wsl"`, `"custom"`, etc.).
+    pub terminal_default_shell: String,
+    /// Custom terminal monospace font name or path (empty = follow editor monospace font).
+    pub terminal_font_family: String,
+    /// Automatically copy terminal text to clipboard when finishing a selection.
+    pub terminal_copy_on_select: bool,
+    /// Custom shell executable path (used when `ShellKind::Custom` is selected).
+    pub terminal_custom_shell_path: String,
+    /// Space/quote-delimited arguments passed to the custom shell executable.
+    pub terminal_custom_shell_args: String,
 }
 
 impl Default for Settings {
@@ -95,6 +105,11 @@ impl Default for Settings {
             search_include: String::new(),
             search_exclude: String::new(),
             terminal_follow_active_dir: false,
+            terminal_default_shell: "default".to_string(),
+            terminal_font_family: String::new(),
+            terminal_copy_on_select: false,
+            terminal_custom_shell_path: String::new(),
+            terminal_custom_shell_args: String::new(),
         }
     }
 }
@@ -306,6 +321,13 @@ pub struct Session {
     pub bottom_height: f32,
     pub terminals: Vec<TerminalSessionState>,
     pub active_terminal: usize,
+    pub bottom_split: bool,
+    pub secondary_terminal: usize,
+    pub bottom_split_ratio: f32,
+    /// Multi-pane horizontal split layout (terminal indices shown simultaneously).
+    pub bottom_panes: Vec<usize>,
+    /// Relative horizontal weights matching `bottom_panes`.
+    pub bottom_pane_weights: Vec<f32>,
     /// Last project-search query, restored into the search sidebar.
     pub search_query: String,
     /// Files opened recently, newest first; feeds the welcome page.
@@ -329,6 +351,11 @@ impl Default for Session {
             bottom_height: 240.0,
             terminals: Vec::new(),
             active_terminal: 0,
+            bottom_split: false,
+            secondary_terminal: 1,
+            bottom_split_ratio: 0.5,
+            bottom_panes: Vec::new(),
+            bottom_pane_weights: Vec::new(),
             search_query: String::new(),
             recent_files: Vec::new(),
         }

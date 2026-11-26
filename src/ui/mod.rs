@@ -27,6 +27,8 @@ pub struct UiStyle {
     pub ui_bold_family: FontFamily,
     pub mono_family: FontFamily,
     pub mono_bold_family: FontFamily,
+    pub term_mono_family: FontFamily,
+    pub term_mono_bold_family: FontFamily,
     pub ui_size: f32,
 }
 
@@ -68,6 +70,12 @@ impl UiStyle {
     }
     pub fn mono_bold(&self, size: f32) -> FontId {
         FontId::new(size, self.mono_bold_family.clone())
+    }
+    pub fn term_mono(&self, size: f32) -> FontId {
+        FontId::new(size, self.term_mono_family.clone())
+    }
+    pub fn term_mono_bold(&self, size: f32) -> FontId {
+        FontId::new(size, self.term_mono_bold_family.clone())
     }
 }
 
@@ -129,17 +137,34 @@ impl KestrelApp {
             });
 
         if self.bottom.visible {
-            let bp_resp = Panel::bottom("kestrel_panel")
-                .default_size(self.bottom.height)
-                .size_range(100.0..=640.0)
-                .resizable(true)
-                .frame(Frame::new().fill(theme.panel_bg).inner_margin(Margin::ZERO))
-                .show(ui, |ui| {
+            let win_h = ui.max_rect().height();
+            let max_h = (win_h - crate::theme::H_TOPBAR - crate::theme::H_STATUS - 60.0)
+                .clamp(120.0, 960.0);
+            let target_h = if self.bottom.maximized {
+                max_h
+            } else {
+                self.bottom.height.clamp(100.0, max_h)
+            };
+            let panel = Panel::bottom("kestrel_panel")
+                .size_range(100.0..=max_h)
+                .frame(Frame::new().fill(theme.panel_bg).inner_margin(Margin::ZERO));
+            let bp_resp = if self.bottom.maximized {
+                panel.exact_size(target_h).show(ui, |ui| {
                     self.terminal_panel_ui(ui, &style);
-                });
-            let new_h = bp_resp.response.rect.height();
-            if new_h >= 100.0 {
-                self.bottom.height = new_h;
+                })
+            } else {
+                panel
+                    .default_size(target_h)
+                    .resizable(true)
+                    .show(ui, |ui| {
+                        self.terminal_panel_ui(ui, &style);
+                    })
+            };
+            if !self.bottom.maximized {
+                let new_h = bp_resp.response.rect.height();
+                if new_h >= 100.0 {
+                    self.bottom.height = new_h.min(max_h);
+                }
             }
         }
 
@@ -616,6 +641,8 @@ impl KestrelApp {
                     Command::PreviewInBrowser,
                     Command::ToggleSidebar,
                     Command::ToggleTerminal,
+                    Command::FocusTerminal,
+                    Command::NewTerminal,
                     Command::ShowProblems,
                     Command::ToggleWordWrap,
                     Command::ToggleStickyScroll,

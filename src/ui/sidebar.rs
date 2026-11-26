@@ -230,7 +230,8 @@ impl KestrelApp {
         let has_clipboard = self.sidebar.clipboard.is_some();
 
         let editor_focused = self.tabs.get(self.active).is_some_and(|t| t.has_focus);
-        let term_focused = self.bottom.visible && self.bottom.terminal_focus;
+        let term_focused = self.bottom.visible
+            && (self.bottom.terminal_has_focus || self.bottom.terminal_focus);
         if !editing
             && !editor_focused
             && !term_focused

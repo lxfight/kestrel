@@ -68,7 +68,15 @@ pub enum Command {
     QuickOpen,
     ToggleSidebar,
     ToggleTerminal,
+    FocusTerminal,
     NewTerminal,
+    TerminalClose,
+    TerminalClear,
+    TerminalSplit,
+    TerminalUnsplit,
+    TerminalNext,
+    TerminalPrev,
+    TerminalMaximize,
     ShowProblems,
     ShowOutput,
     SplitEditor,
@@ -384,7 +392,15 @@ impl Command {
             Command::QuickOpen => "view.quickOpen",
             Command::ToggleSidebar => "view.toggleSidebar",
             Command::ToggleTerminal => "view.toggleTerminal",
+            Command::FocusTerminal => "terminal.focus",
             Command::NewTerminal => "view.newTerminal",
+            Command::TerminalClose => "terminal.close",
+            Command::TerminalClear => "terminal.clear",
+            Command::TerminalSplit => "terminal.split",
+            Command::TerminalUnsplit => "terminal.unsplit",
+            Command::TerminalNext => "terminal.next",
+            Command::TerminalPrev => "terminal.prev",
+            Command::TerminalMaximize => "terminal.toggleMaximize",
             Command::ShowProblems => "view.problems",
             Command::ShowOutput => "view.output",
             Command::SplitEditor => "view.splitEditor",
@@ -484,7 +500,15 @@ impl Command {
         Command::QuickOpen,
         Command::ToggleSidebar,
         Command::ToggleTerminal,
+        Command::FocusTerminal,
         Command::NewTerminal,
+        Command::TerminalClose,
+        Command::TerminalClear,
+        Command::TerminalSplit,
+        Command::TerminalUnsplit,
+        Command::TerminalNext,
+        Command::TerminalPrev,
+        Command::TerminalMaximize,
         Command::ShowProblems,
         Command::ShowOutput,
         Command::SplitEditor,
@@ -579,7 +603,15 @@ impl Command {
             Command::QuickOpen => "快速打开文件",
             Command::ToggleSidebar => "切换侧边栏",
             Command::ToggleTerminal => "切换终端面板",
+            Command::FocusTerminal => "聚焦终端（或打开终端）",
             Command::NewTerminal => "新建终端实例",
+            Command::TerminalClose => "关闭当前终端会话",
+            Command::TerminalClear => "清空当前终端输出",
+            Command::TerminalSplit => "向右拆分终端窗格",
+            Command::TerminalUnsplit => "取消终端分屏（仅保留当前窗格）",
+            Command::TerminalNext => "切换到下一个终端",
+            Command::TerminalPrev => "切换到上一个终端",
+            Command::TerminalMaximize => "最大化 / 还原底部终端面板",
             Command::ShowProblems => "显示问题面板 (Problems)",
             Command::ShowOutput => "显示输出面板 (Output)",
             Command::SplitEditor => "向右拆分编辑器 (分屏)",
@@ -643,7 +675,15 @@ impl Command {
             Command::ToggleFold | Command::FoldAll => Icon::CollapseAll,
             Command::UnfoldAll => Icon::ExpandAll,
             Command::ToggleSidebar | Command::ShowExplorer => Icon::Explorer,
-            Command::ToggleTerminal | Command::NewTerminal => Icon::Terminal,
+            Command::ToggleTerminal
+            | Command::FocusTerminal
+            | Command::NewTerminal
+            | Command::TerminalClose
+            | Command::TerminalNext
+            | Command::TerminalPrev
+            | Command::TerminalMaximize => Icon::Terminal,
+            Command::TerminalClear => Icon::ClearAll,
+            Command::TerminalSplit | Command::TerminalUnsplit => Icon::SplitHorizontal,
             Command::ShowProblems => Icon::Problems,
             Command::ShowOutput => Icon::Output,
             Command::SplitEditor | Command::MarkdownPreviewSide => Icon::SplitHorizontal,
@@ -771,6 +811,7 @@ impl Command {
             Command::QuickOpen => Shortcut::new(CTRL, P),
             Command::ToggleSidebar => Shortcut::new(CTRL, B),
             Command::ToggleTerminal => Shortcut::new(CTRL, J),
+            Command::FocusTerminal => Shortcut::new(CTRL, Backtick),
             Command::NewTerminal => Shortcut::new(ctrl_shift(), Backtick),
             Command::ShowProblems => Shortcut::new(ctrl_shift(), M),
             Command::ShowOutput => Shortcut::new(ctrl_shift(), U),
@@ -833,6 +874,29 @@ impl Command {
                 | Command::JumpForward
         )
     }
+
+    /// Commands that the workbench still handles while a terminal owns keyboard focus.
+    /// Every other key chord (Ctrl+W, Ctrl+P, Ctrl+N, Ctrl+B, Ctrl+K, Ctrl+S, etc.)
+    /// passes straight through to the running shell / TUI application.
+    pub fn skip_shell_in_terminal(self) -> bool {
+        matches!(
+            self,
+            Command::ShowPalette
+                | Command::ToggleTerminal
+                | Command::FocusTerminal
+                | Command::NewTerminal
+                | Command::TerminalClose
+                | Command::TerminalClear
+                | Command::TerminalSplit
+                | Command::TerminalUnsplit
+                | Command::TerminalNext
+                | Command::TerminalPrev
+                | Command::TerminalMaximize
+                | Command::ShowProblems
+                | Command::ShowOutput
+                | Command::OpenSettings
+        )
+    }
 }
 
 #[cfg(test)]
@@ -887,5 +951,45 @@ mod tests {
         assert_eq!(Command::from_id("file.save"), Some(Command::Save));
         assert_eq!(Command::from_id("plugins.manage"), Some(Command::Plugins));
         assert_eq!(Command::from_id("no.such"), None);
+    }
+
+    #[test]
+    fn terminal_skip_shell_blocks_common_shell_chords() {
+        // Common shell editing/navigation chords must pass through to the PTY.
+        for cmd in [
+            Command::CloseTab,      // Ctrl+W
+            Command::QuickOpen,     // Ctrl+P
+            Command::NewFile,       // Ctrl+N
+            Command::ToggleSidebar, // Ctrl+B
+            Command::Shortcuts,     // Ctrl+K
+            Command::Save,          // Ctrl+S
+            Command::OpenFile,      // Ctrl+O
+            Command::GotoLine,      // Ctrl+G
+            Command::ZoomIn,        // Ctrl++
+            Command::ZoomOut,       // Ctrl+-
+            Command::ZoomReset,     // Ctrl+0
+        ] {
+            assert!(
+                !cmd.skip_shell_in_terminal(),
+                "{} must not steal terminal keys",
+                cmd.id()
+            );
+        }
+        // Workbench terminal commands stay reachable while focused in a terminal.
+        for cmd in [
+            Command::ShowPalette,
+            Command::ToggleTerminal,
+            Command::FocusTerminal,
+            Command::NewTerminal,
+            Command::TerminalClose,
+            Command::TerminalClear,
+            Command::TerminalSplit,
+        ] {
+            assert!(
+                cmd.skip_shell_in_terminal(),
+                "{} should remain active in terminal",
+                cmd.id()
+            );
+        }
     }
 }

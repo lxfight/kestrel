@@ -4409,6 +4409,8 @@ mod tests {
             ui_bold_family: egui::FontFamily::Proportional,
             mono_family: egui::FontFamily::Monospace,
             mono_bold_family: egui::FontFamily::Monospace,
+            term_mono_family: egui::FontFamily::Monospace,
+            term_mono_bold_family: egui::FontFamily::Monospace,
             ui_size: 13.0,
         };
         let editor_style = EditorStyle {
@@ -4567,6 +4569,8 @@ mod tests {
             ui_bold_family: egui::FontFamily::Proportional,
             mono_family: egui::FontFamily::Monospace,
             mono_bold_family: egui::FontFamily::Monospace,
+            term_mono_family: egui::FontFamily::Monospace,
+            term_mono_bold_family: egui::FontFamily::Monospace,
             ui_size: 13.0,
         };
         let editor_style = EditorStyle {

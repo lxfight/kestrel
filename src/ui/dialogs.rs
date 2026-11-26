@@ -1108,6 +1108,159 @@ impl KestrelApp {
 
                         if searching || section == "terminal" {
                             let mut shown = false;
+                            if matches("默认终端 shell default profile") {
+                                Self::settings_section_header(ui, style, &mut shown, "终端");
+                                let current_kind =
+                                    crate::terminal::ShellKind::from_str(&settings.terminal_default_shell);
+                                changed |= Self::settings_row(
+                                    ui,
+                                    style,
+                                    "默认 Shell",
+                                    "新建终端时优先启动的 Shell 类型",
+                                    |ui| {
+                                        let mut picked = false;
+                                        let (rect, resp) = ui.allocate_exact_size(
+                                            Vec2::new(152.0, 26.0),
+                                            Sense::click(),
+                                        );
+                                        ui.painter().rect_filled(
+                                            rect,
+                                            CornerRadius::same(5),
+                                            if resp.hovered() {
+                                                style.theme.hover
+                                            } else {
+                                                style.theme.input_bg
+                                            },
+                                        );
+                                        ui.painter().rect_stroke(
+                                            rect,
+                                            CornerRadius::same(5),
+                                            Stroke::new(1.0, style.theme.border),
+                                            egui::StrokeKind::Inside,
+                                        );
+                                        ui.painter().text(
+                                            Pos2::new(rect.left() + 8.0, rect.center().y),
+                                            Align2::LEFT_CENTER,
+                                            current_kind.label(),
+                                            style.tiny(),
+                                            style.theme.text,
+                                        );
+                                        icons::paint(
+                                            ui.painter(),
+                                            Rect::from_center_size(
+                                                Pos2::new(rect.right() - 12.0, rect.center().y),
+                                                Vec2::splat(11.0),
+                                            ),
+                                            Icon::ChevronDown,
+                                            style.theme.text_dim,
+                                            1.2,
+                                        );
+                                        egui::Popup::menu(&resp).width(160.0).show(|ui| {
+                                            if ui.button(crate::terminal::ShellKind::Default.label()).clicked() {
+                                                settings.terminal_default_shell =
+                                                    crate::terminal::ShellKind::Default.as_str().to_string();
+                                                picked = true;
+                                            }
+                                            for profile in crate::terminal::available_profiles() {
+                                                if ui.button(profile.label).clicked() {
+                                                    settings.terminal_default_shell =
+                                                        profile.kind.as_str().to_string();
+                                                    picked = true;
+                                                }
+                                            }
+                                            if !settings.terminal_custom_shell_path.trim().is_empty()
+                                                && ui
+                                                    .button(crate::terminal::ShellKind::Custom.label())
+                                                    .clicked()
+                                            {
+                                                settings.terminal_default_shell =
+                                                    crate::terminal::ShellKind::Custom.as_str().to_string();
+                                                picked = true;
+                                            }
+                                        });
+                                        picked
+                                    },
+                                );
+                            }
+                            if matches("终端字体 nerd font mono terminal font family") {
+                                Self::settings_section_header(ui, style, &mut shown, "终端");
+                                static DISCOVERED_FONTS: std::sync::LazyLock<Vec<String>> =
+                                    std::sync::LazyLock::new(crate::fonts::discover_monospace_fonts);
+                                let label = if settings.terminal_font_family.trim().is_empty() {
+                                    "跟随编辑器等宽字体".to_string()
+                                } else {
+                                    settings.terminal_font_family.clone()
+                                };
+                                changed |= Self::settings_row(
+                                    ui,
+                                    style,
+                                    "终端字体",
+                                    "可选 Nerd Font 或系统等宽字体",
+                                    |ui| {
+                                        let mut picked = false;
+                                        let (rect, resp) = ui.allocate_exact_size(
+                                            Vec2::new(172.0, 26.0),
+                                            Sense::click(),
+                                        );
+                                        ui.painter().rect_filled(
+                                            rect,
+                                            CornerRadius::same(5),
+                                            if resp.hovered() {
+                                                style.theme.hover
+                                            } else {
+                                                style.theme.input_bg
+                                            },
+                                        );
+                                        ui.painter().rect_stroke(
+                                            rect,
+                                            CornerRadius::same(5),
+                                            Stroke::new(1.0, style.theme.border),
+                                            StrokeKind::Inside,
+                                        );
+                                        let (g, _) = crate::ui::widgets::ellipsize(
+                                            ui,
+                                            &label,
+                                            style.tiny(),
+                                            style.theme.text,
+                                            rect.width() - 28.0,
+                                        );
+                                        ui.painter().galley(
+                                            Pos2::new(
+                                                rect.left() + 8.0,
+                                                rect.center().y - g.rect.height() * 0.5,
+                                            ),
+                                            g,
+                                            style.theme.text,
+                                        );
+                                        icons::paint(
+                                            ui.painter(),
+                                            Rect::from_center_size(
+                                                Pos2::new(rect.right() - 12.0, rect.center().y),
+                                                Vec2::splat(11.0),
+                                            ),
+                                            Icon::ChevronDown,
+                                            style.theme.text_dim,
+                                            1.2,
+                                        );
+                                        egui::Popup::menu(&resp).width(210.0).show(|ui| {
+                                            ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                                                if ui.button("跟随编辑器等宽字体").clicked() {
+                                                    settings.terminal_font_family.clear();
+                                                    picked = true;
+                                                }
+                                                for font_name in DISCOVERED_FONTS.iter() {
+                                                    if ui.button(font_name).clicked() {
+                                                        settings.terminal_font_family =
+                                                            font_name.clone();
+                                                        picked = true;
+                                                    }
+                                                }
+                                            });
+                                        });
+                                        picked
+                                    },
+                                );
+                            }
                             if matches("终端字号 terminal font") {
                                 Self::settings_section_header(ui, style, &mut shown, "终端");
                                 let mut value = settings.terminal_font_size.round() as i32;
@@ -1141,6 +1294,59 @@ impl KestrelApp {
                                     settings.terminal_height = value as f32 * 10.0;
                                     changed = true;
                                 }
+                            }
+                            if matches("跟随 活动文件目录 follow dir cwd terminal") {
+                                Self::settings_section_header(ui, style, &mut shown, "终端");
+                                changed |= Self::settings_toggle_row(
+                                    ui,
+                                    style,
+                                    "跟随活动文件目录",
+                                    "新建终端时自动进入当前编辑文件所在目录",
+                                    &mut settings.terminal_follow_active_dir,
+                                );
+                            }
+                            if matches("选中自动复制 copy on select clipboard terminal") {
+                                Self::settings_section_header(ui, style, &mut shown, "终端");
+                                changed |= Self::settings_toggle_row(
+                                    ui,
+                                    style,
+                                    "选中即自动复制",
+                                    "鼠标拖选或双击选词完成后自动写入系统剪贴板",
+                                    &mut settings.terminal_copy_on_select,
+                                );
+                            }
+                            if matches("自定义 shell 路径 custom executable args terminal") {
+                                Self::settings_section_header(ui, style, &mut shown, "终端");
+                                changed |= Self::settings_row(
+                                    ui,
+                                    style,
+                                    "自定义 Shell 路径",
+                                    "如 nu.exe 或自定义 bash 路径",
+                                    |ui| {
+                                        let resp = ui.add_sized(
+                                            Vec2::new(200.0, 24.0),
+                                            TextEdit::singleline(&mut settings.terminal_custom_shell_path)
+                                                .hint_text("例如 C:\\Program Files\\nu\\nu.exe")
+                                                .font(style.tiny()),
+                                        );
+                                        resp.changed()
+                                    },
+                                );
+                                changed |= Self::settings_row(
+                                    ui,
+                                    style,
+                                    "自定义 Shell 参数",
+                                    "空格分隔启动参数（支持引号）",
+                                    |ui| {
+                                        let resp = ui.add_sized(
+                                            Vec2::new(200.0, 24.0),
+                                            TextEdit::singleline(&mut settings.terminal_custom_shell_args)
+                                                .hint_text("例如 --login -i")
+                                                .font(style.tiny()),
+                                        );
+                                        resp.changed()
+                                    },
+                                );
                             }
                         }
 
@@ -1286,8 +1492,19 @@ impl KestrelApp {
                 self.workspace.tree.show_hidden = settings.show_hidden_files;
                 self.workspace.tree.reload();
             }
+            if (self.settings.terminal_height - settings.terminal_height).abs() > 0.5 {
+                self.bottom.height = settings.terminal_height.max(120.0);
+                self.bottom.maximized = false;
+            }
+            if self.settings.terminal_follow_active_dir != settings.terminal_follow_active_dir {
+                self.bottom.follow_active_dir = settings.terminal_follow_active_dir;
+            }
+            let font_changed = self.settings.terminal_font_family != settings.terminal_font_family;
             let zoom = settings.ui_zoom.clamp(0.7, 1.8);
             self.settings = settings;
+            if font_changed {
+                self.reload_fonts(ui.ctx());
+            }
             ui.ctx().set_zoom_factor(zoom);
             self.settings.save();
         }
