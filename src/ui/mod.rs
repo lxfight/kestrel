@@ -613,6 +613,7 @@ impl KestrelApp {
                     Command::SplitEditor,
                     Command::ToggleMarkdownPreview,
                     Command::MarkdownPreviewSide,
+                    Command::PreviewInBrowser,
                     Command::ToggleSidebar,
                     Command::ToggleTerminal,
                     Command::ShowProblems,
@@ -1031,6 +1032,9 @@ impl KestrelApp {
             }
             Some(crate::editor::EditorEvent::GotoDefinition(symbol)) => {
                 self.goto_definition_by_name(&symbol);
+            }
+            Some(crate::editor::EditorEvent::OpenPalette) => {
+                self.open_palette(PaletteMode::Commands);
             }
             None => {}
         }
@@ -1890,7 +1894,11 @@ impl KestrelApp {
         // The language label and the view-mode capsule keep their spots on the
         // right; the crumbs may only use what is left of the row.
         let is_diff = editor.diff.is_some();
-        let is_md = !is_diff && editor.language == crate::highlight::Language::Markdown;
+        let is_md = !is_diff
+            && matches!(
+                editor.language,
+                crate::highlight::Language::Markdown | crate::highlight::Language::Html
+            );
         let cur_md_mode = editor.md_mode;
         let is_tabular = !is_diff
             && editor.multimodal.as_ref().is_some_and(|m| {
@@ -2078,7 +2086,7 @@ impl KestrelApp {
         let lang_w = lang_galley.rect.width();
         let capsule_right = rect.right() - 14.0 - lang_w - 10.0;
         let capsule_w = if (is_md || is_tabular) && rect.width() > 360.0 {
-            if is_md { 116.0 } else { 82.0 }
+            if is_md { 142.0 } else { 82.0 }
         } else {
             0.0
         };
@@ -2188,7 +2196,25 @@ impl KestrelApp {
             mm.set_show_source(flag);
         }
         let mut next_md_mode = None;
+        let mut open_in_browser = false;
         if is_md && rect.width() > 360.0 {
+            let globe_rect = Rect::from_center_size(
+                Pos2::new(capsule_right - 10.0, rect.center().y),
+                Vec2::new(20.0, 18.0),
+            );
+            if widgets::icon_button_with_id(
+                ui,
+                globe_rect,
+                ("bc_md_browser", group_idx),
+                &theme,
+                Icon::Globe,
+                false,
+            )
+            .on_hover_text("在浏览器中预览网页")
+            .clicked()
+            {
+                open_in_browser = true;
+            }
             let items = [
                 (crate::markdown::MarkdownViewMode::Preview, "预览"),
                 (crate::markdown::MarkdownViewMode::Split, "分屏"),
@@ -2199,13 +2225,16 @@ impl KestrelApp {
                 ui,
                 style,
                 &salt,
-                capsule_right,
+                capsule_right - 24.0,
                 rect.center().y,
                 &items,
                 &cur_md_mode,
             ) {
                 next_md_mode = Some(sel);
             }
+        }
+        if open_in_browser {
+            self.preview_tab_in_browser(tab_idx);
         }
         if let Some(mode) = next_md_mode
             && let Some(tab) = self.tabs.get_mut(tab_idx)
@@ -2247,7 +2276,13 @@ impl KestrelApp {
             }
             match action {
                 crate::diff::DiffAction::OpenFile(path) => self.open_file(path),
+                crate::diff::DiffAction::OpenFileAtLine(path, line) => {
+                    self.open_file_at_line(path, line);
+                }
                 crate::diff::DiffAction::Refresh => self.spawn_diff_load(diff_id),
+                crate::diff::DiffAction::SavedWorkingFile { path, line } => {
+                    self.on_diff_working_file_saved(diff_id, path, line);
+                }
                 crate::diff::DiffAction::None => {}
             }
             return None;
@@ -2273,7 +2308,10 @@ impl KestrelApp {
             self.unreadable_binary_ui(ui, style, path.as_deref(), &title);
             return None;
         }
-        let is_md = tab.language == crate::highlight::Language::Markdown;
+        let is_md = matches!(
+            tab.language,
+            crate::highlight::Language::Markdown | crate::highlight::Language::Html
+        );
         let md_mode = if is_md {
             tab.md_mode
         } else {
@@ -3606,7 +3644,12 @@ impl KestrelApp {
     fn command_enabled(&self, command: Command) -> bool {
         let editor = self.tabs.get(self.active);
         let text_editable = editor.is_some_and(tab_is_editable_text);
-        let markdown = editor.is_some_and(|tab| tab.language == crate::highlight::Language::Markdown);
+        let markdown = editor.is_some_and(|tab| {
+            matches!(
+                tab.language,
+                crate::highlight::Language::Markdown | crate::highlight::Language::Html
+            )
+        });
         match command {
             Command::Save | Command::SaveAs | Command::FormatDocument => text_editable,
             Command::SaveAll => self
@@ -3646,7 +3689,9 @@ impl KestrelApp {
             | Command::GotoLine
             | Command::GotoDefinition
             | Command::GotoSymbol => editor.is_some(),
-            Command::ToggleMarkdownPreview | Command::MarkdownPreviewSide => markdown,
+            Command::ToggleMarkdownPreview
+            | Command::MarkdownPreviewSide
+            | Command::PreviewInBrowser => markdown,
             Command::ZoomReset => (self.settings.ui_zoom - 1.0).abs() > 0.001,
             Command::ThemeDark => self.settings.theme != "dark",
             Command::ThemeLight => self.settings.theme != "light",

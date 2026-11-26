@@ -36,6 +36,7 @@ struct RenderContext<'a> {
     state: &'a mut MarkdownPreviewState,
     events: &'a mut Vec<PreviewEvent>,
     scroll_origin_y: f32,
+    inherited_align: Option<Align>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -51,6 +52,29 @@ pub fn preview_ui(
     base_font_size: f32,
 ) -> Vec<PreviewEvent> {
     state.ensure_parsed(doc_version, doc_text);
+    // Collect any remote images / SVGs finished by the background fetch pool.
+    for done in state.remote_images.drain() {
+        let entry = match done.result {
+            Ok(crate::markdown::net_img::DecodedImage::Raster { image, size }) => {
+                let texture = ui.ctx().load_texture(
+                    format!("md_net:{}", done.url),
+                    image,
+                    TextureOptions::LINEAR,
+                );
+                CachedImage::Loaded {
+                    texture,
+                    size,
+                    modified: None,
+                }
+            }
+            Ok(crate::markdown::net_img::DecodedImage::Svg(graphic)) => CachedImage::Svg {
+                cache: crate::markdown::svg::SvgRenderCache::new(ui.ctx(), &done.url, graphic),
+                modified: None,
+            },
+            Err(err) => CachedImage::Failed(err),
+        };
+        state.textures.insert(done.url, entry);
+    }
     let mut events = Vec::new();
     let theme = style.theme;
     let rect = ui.available_rect_before_wrap();
@@ -101,6 +125,7 @@ pub fn preview_ui(
                     state,
                     events: &mut events,
                     scroll_origin_y: origin_y,
+                    inherited_align: None,
                 };
 
                 if let Some(fm) = &doc.front_matter {
@@ -150,6 +175,72 @@ pub fn preview_ui(
     state.scroll_y = out.state.clamped_offset().y;
     state.content_height = out.content_size.y;
     state.viewport_height = out.inner_rect.height();
+
+    // Right-click context menu on the Markdown / HTML preview surface.
+    let bg_resp = ui.interact(
+        rect,
+        ui.scope_id().with(("md_preview_ctx", doc_path)),
+        Sense::click(),
+    );
+    let cur_mode = *_view_mode;
+    bg_resp.context_menu(|ui| {
+        ui.set_width(204.0);
+        let font = style.small();
+        let sc_font = FontId::new(11.0, style.mono_family.clone());
+        if crate::ui::widgets::context_menu_item(
+            ui,
+            &theme,
+            font.clone(),
+            sc_font.clone(),
+            Icon::Copy,
+            "复制文档源码",
+            None,
+            true,
+        ) {
+            events.push(PreviewEvent::CopySource);
+        }
+        crate::ui::widgets::context_menu_sep(ui, &theme);
+        if cur_mode != MarkdownViewMode::Split
+            && crate::ui::widgets::context_menu_item(
+                ui,
+                &theme,
+                font.clone(),
+                sc_font.clone(),
+                Icon::SplitHorizontal,
+                "侧边分屏预览",
+                Some("Alt+V"),
+                true,
+            )
+        {
+            events.push(PreviewEvent::SwitchMode(MarkdownViewMode::Split));
+        }
+        if crate::ui::widgets::context_menu_item(
+            ui,
+            &theme,
+            font.clone(),
+            sc_font.clone(),
+            Icon::FileCode,
+            "切换到源码编辑",
+            Some("Ctrl+Shift+V"),
+            true,
+        ) {
+            events.push(PreviewEvent::SwitchMode(MarkdownViewMode::Source));
+        }
+        crate::ui::widgets::context_menu_sep(ui, &theme);
+        if crate::ui::widgets::context_menu_item(
+            ui,
+            &theme,
+            font,
+            sc_font,
+            Icon::Globe,
+            "在浏览器中预览网页",
+            None,
+            true,
+        ) {
+            events.push(PreviewEvent::OpenInBrowser);
+        }
+    });
+
     events
 }
 
@@ -217,6 +308,7 @@ fn render_blocks(
                 slug,
                 inlines,
                 source_line,
+                align,
             } => {
                 if idx > 0 {
                     ui.add_space(if *level <= 2 { 14.0 } else { 8.0 });
@@ -224,10 +316,12 @@ fn render_blocks(
                 let y = ui.cursor().top() - rctx.scroll_origin_y;
                 rctx.state.anchor_y.insert(slug.clone(), y.max(0.0));
                 rctx.state.line_anchors.push((*source_line, y.max(0.0)));
-                render_heading(ui, rctx, *level, slug, inlines, *source_line, max_w);
+                let eff_align = (*align).or(rctx.inherited_align);
+                render_heading(ui, rctx, *level, slug, inlines, *source_line, max_w, eff_align);
                 ui.add_space(if *level <= 2 { 8.0 } else { 5.0 });
             }
             Block::Paragraph { inlines, align } => {
+                let eff_align = (*align).or(rctx.inherited_align);
                 render_inlines_flow(
                     ui,
                     rctx,
@@ -236,12 +330,38 @@ fn render_blocks(
                     rctx.base_size,
                     false,
                     rctx.theme.text,
-                    *align,
+                    eff_align,
                 );
                 if !tight {
                     ui.add_space(8.0);
                 } else if idx + 1 < blocks.len() {
                     ui.add_space(4.0);
+                }
+            }
+            Block::Container {
+                align,
+                blocks: inner,
+                caption,
+            } => {
+                let prev_align = rctx.inherited_align;
+                rctx.inherited_align = (*align).or(prev_align);
+                render_blocks(ui, rctx, inner, max_w, tight);
+                if let Some(cap) = caption {
+                    render_inlines_flow(
+                        ui,
+                        rctx,
+                        cap,
+                        max_w,
+                        (rctx.base_size * 0.88).round().max(11.0),
+                        false,
+                        rctx.theme.text_dim,
+                        rctx.inherited_align.or(Some(Align::Center)),
+                    );
+                    ui.add_space(6.0);
+                }
+                rctx.inherited_align = prev_align;
+                if !tight {
+                    ui.add_space(6.0);
                 }
             }
             Block::CodeBlock {
@@ -378,6 +498,7 @@ fn render_blocks(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_heading(
     ui: &mut Ui,
     rctx: &mut RenderContext<'_>,
@@ -386,6 +507,7 @@ fn render_heading(
     inlines: &[Inline],
     source_line: usize,
     max_w: f32,
+    align: Option<Align>,
 ) {
     let scale = match level {
         1 => 1.85,
@@ -402,36 +524,41 @@ fn render_heading(
         rctx.theme.text
     };
 
-    let row_resp = ui.horizontal(|ui| {
-        ui.set_max_width(max_w);
-        render_inlines_flow(ui, rctx, inlines, max_w - 24.0, size, true, color, None);
-        let (hash_rect, h_resp) =
-            ui.allocate_exact_size(Vec2::new(18.0, size * 1.15), Sense::click());
-        let pointer_on_row = ui.input(|i| i.pointer.hover_pos()).is_some_and(|p| {
-            let band = Rect::from_min_max(
-                Pos2::new(ui.min_rect().left(), hash_rect.top()),
-                Pos2::new(hash_rect.right() + 4.0, hash_rect.bottom()),
-            );
-            band.contains(p)
+    if matches!(align, Some(Align::Center | Align::Right)) {
+        render_inlines_flow(ui, rctx, inlines, max_w, size, true, color, align);
+    } else {
+        let row_resp = ui.horizontal(|ui| {
+            ui.set_max_width(max_w);
+            render_inlines_flow(ui, rctx, inlines, max_w - 24.0, size, true, color, None);
+            let (hash_rect, h_resp) =
+                ui.allocate_exact_size(Vec2::new(18.0, size * 1.15), Sense::click());
+            let pointer_on_row = ui.input(|i| i.pointer.hover_pos()).is_some_and(|p| {
+                let band = Rect::from_min_max(
+                    Pos2::new(ui.min_rect().left(), hash_rect.top()),
+                    Pos2::new(hash_rect.right() + 4.0, hash_rect.bottom()),
+                );
+                band.contains(p)
+            });
+            if pointer_on_row || h_resp.hovered() {
+                ui.painter().text(
+                    hash_rect.center(),
+                    Align2::CENTER_CENTER,
+                    "#",
+                    FontId::new(size * 0.78, rctx.style.mono_family.clone()),
+                    if h_resp.hovered() {
+                        rctx.theme.accent
+                    } else {
+                        rctx.theme.text_muted
+                    },
+                );
+            }
+            if h_resp.on_hover_text("定位到源码行").clicked() {
+                rctx.events.push(PreviewEvent::JumpSourceLine(source_line));
+            }
         });
-        if pointer_on_row || h_resp.hovered() {
-            ui.painter().text(
-                hash_rect.center(),
-                Align2::CENTER_CENTER,
-                "#",
-                FontId::new(size * 0.78, rctx.style.mono_family.clone()),
-                if h_resp.hovered() {
-                    rctx.theme.accent
-                } else {
-                    rctx.theme.text_muted
-                },
-            );
-        }
-        if h_resp.on_hover_text("定位到源码行").clicked() {
-            rctx.events.push(PreviewEvent::JumpSourceLine(source_line));
-        }
-    });
-    let _ = (row_resp, slug);
+        let _ = row_resp;
+    }
+    let _ = slug;
 
     if level <= 2 {
         ui.add_space(4.0);
@@ -998,24 +1125,135 @@ fn render_inlines_flow(
     default_color: Color32,
     align: Option<Align>,
 ) {
-    // Split into contiguous text chunks vs image chunks so images render cleanly with aspect ratio
-    let mut text_chunk: Vec<Inline> = Vec::new();
+    // Split into contiguous text chunks vs image groups so consecutive inline badges
+    // (`<p align="center"><a><img/></a> <a><img/></a></p>`) flow horizontally instead of stacking.
+    struct PendingImg<'a> {
+        alt: &'a str,
+        url: &'a str,
+        title: Option<&'a str>,
+        width: Option<f32>,
+        link_url: Option<&'a str>,
+    }
 
-    let flush_chunk = |ui: &mut Ui, rctx: &mut RenderContext<'_>, chunk: &mut Vec<Inline>| {
+    let mut text_chunk: Vec<Inline> = Vec::new();
+    let mut img_row: Vec<PendingImg<'_>> = Vec::new();
+
+    let flush_text = |ui: &mut Ui, rctx: &mut RenderContext<'_>, chunk: &mut Vec<Inline>| {
         if chunk.is_empty() {
             return;
         }
-        render_text_chunk(
-            ui,
-            rctx,
-            chunk,
-            max_w,
-            font_size,
-            default_bold,
-            default_color,
-            align,
-        );
+        // Skip whitespace-only separators between consecutive badge images.
+        let only_ws = chunk.iter().all(|item| {
+            matches!(item, Inline::SoftBreak)
+                || matches!(item, Inline::Text(t) if t.trim().is_empty())
+        });
+        if !only_ws {
+            render_text_chunk(
+                ui,
+                rctx,
+                chunk,
+                max_w,
+                font_size,
+                default_bold,
+                default_color,
+                align,
+            );
+        }
         chunk.clear();
+    };
+
+    let flush_images = |ui: &mut Ui, rctx: &mut RenderContext<'_>, imgs: &mut Vec<PendingImg<'_>>| {
+        if imgs.is_empty() {
+            return;
+        }
+        if imgs.len() == 1 {
+            let img = &imgs[0];
+            if matches!(align, Some(Align::Center)) {
+                let est_w = estimate_image_width(rctx, img.url, img.width, max_w, false);
+                let pad = ((max_w - est_w) * 0.5).max(0.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    if pad > 0.5 {
+                        ui.add_space(pad);
+                    }
+                    render_image_card(
+                        ui,
+                        rctx,
+                        img.alt,
+                        img.url,
+                        img.title,
+                        img.width,
+                        img.link_url,
+                        max_w,
+                        false,
+                    );
+                });
+            } else {
+                render_image_card(
+                    ui,
+                    rctx,
+                    img.alt,
+                    img.url,
+                    img.title,
+                    img.width,
+                    img.link_url,
+                    max_w,
+                    false,
+                );
+            }
+            ui.add_space(6.0);
+        } else {
+            // Pack consecutive badges/images into wrapped lines <= max_w, centering each line when aligned.
+            let gap = 6.0f32;
+            let mut rows: Vec<(Vec<usize>, f32)> = Vec::new();
+            let mut cur_row: Vec<usize> = Vec::new();
+            let mut cur_w = 0.0f32;
+            for (idx, img) in imgs.iter().enumerate() {
+                let w = estimate_image_width(rctx, img.url, img.width, max_w, true);
+                let add = if cur_row.is_empty() { w } else { gap + w };
+                if !cur_row.is_empty() && cur_w + add > max_w {
+                    rows.push((std::mem::take(&mut cur_row), cur_w));
+                    cur_w = w;
+                    cur_row.push(idx);
+                } else {
+                    cur_w += add;
+                    cur_row.push(idx);
+                }
+            }
+            if !cur_row.is_empty() {
+                rows.push((cur_row, cur_w));
+            }
+            for (row_indices, row_w) in rows {
+                let pad = match align {
+                    Some(Align::Center) => ((max_w - row_w) * 0.5).max(0.0),
+                    Some(Align::Right) => (max_w - row_w).max(0.0),
+                    _ => 0.0,
+                };
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing = Vec2::new(gap, 4.0);
+                    if pad > 0.5 {
+                        ui.add_space((pad - gap).max(0.0));
+                    }
+                    for idx in row_indices {
+                        let img = &imgs[idx];
+                        render_image_card(
+                            ui,
+                            rctx,
+                            img.alt,
+                            img.url,
+                            img.title,
+                            img.width,
+                            img.link_url,
+                            max_w,
+                            true,
+                        );
+                    }
+                });
+                ui.add_space(4.0);
+            }
+            ui.add_space(4.0);
+        }
+        imgs.clear();
     };
 
     for item in inlines {
@@ -1026,13 +1264,19 @@ fn render_inlines_flow(
                 title,
                 width,
             } => {
-                flush_chunk(ui, rctx, &mut text_chunk);
-                render_image_card(ui, rctx, alt, url, title.as_deref(), *width, None, max_w);
+                flush_text(ui, rctx, &mut text_chunk);
+                img_row.push(PendingImg {
+                    alt,
+                    url,
+                    title: title.as_deref(),
+                    width: *width,
+                    link_url: None,
+                });
             }
             Inline::Link { text, url, title }
                 if text.len() == 1 && matches!(text.first(), Some(Inline::Image { .. })) =>
             {
-                flush_chunk(ui, rctx, &mut text_chunk);
+                flush_text(ui, rctx, &mut text_chunk);
                 if let Some(Inline::Image {
                     alt,
                     url: img_url,
@@ -1040,22 +1284,25 @@ fn render_inlines_flow(
                     width,
                 }) = text.first()
                 {
-                    render_image_card(
-                        ui,
-                        rctx,
+                    img_row.push(PendingImg {
                         alt,
-                        img_url,
-                        img_title.as_deref().or(title.as_deref()),
-                        *width,
-                        Some(url.as_str()),
-                        max_w,
-                    );
+                        url: img_url,
+                        title: img_title.as_deref().or(title.as_deref()),
+                        width: *width,
+                        link_url: Some(url.as_str()),
+                    });
                 }
             }
-            other => text_chunk.push(other.clone()),
+            Inline::SoftBreak if !img_row.is_empty() => {}
+            Inline::Text(t) if !img_row.is_empty() && t.trim().is_empty() => {}
+            other => {
+                flush_images(ui, rctx, &mut img_row);
+                text_chunk.push(other.clone());
+            }
         }
     }
-    flush_chunk(ui, rctx, &mut text_chunk);
+    flush_images(ui, rctx, &mut img_row);
+    flush_text(ui, rctx, &mut text_chunk);
 }
 
 #[derive(Clone, Copy)]
@@ -1069,6 +1316,7 @@ struct InlineStyle {
     sup: bool,
     sub: bool,
     color: Color32,
+    bg: Option<Color32>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1103,6 +1351,7 @@ fn render_text_chunk(
         sup: false,
         sub: false,
         color: default_color,
+        bg: None,
     };
 
     append_inlines(
@@ -1121,14 +1370,16 @@ fn render_text_chunk(
     let galley = ui.ctx().fonts_mut(|f| f.layout_job(job));
     let size = galley.size();
     let alloc_w = if align.is_some() {
-        max_w.max(size.x)
+        max_w.max(40.0)
     } else {
         size.x.min(max_w.max(40.0))
     };
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(alloc_w, size.y), Sense::click());
+    // In egui, `job.halign = Center` places the galley origin at its horizontal center
+    // (`[-w/2, +w/2]`), and `RIGHT` places it at its right edge (`[-w, 0]`).
     let draw_pos = match align {
-        Some(Align::Center) => Pos2::new(rect.left() + (alloc_w - size.x) * 0.5, rect.top()),
-        Some(Align::Right) => Pos2::new(rect.right() - size.x, rect.top()),
+        Some(Align::Center) => Pos2::new(rect.center().x, rect.top()),
+        Some(Align::Right) => Pos2::new(rect.right(), rect.top()),
         _ => rect.min,
     };
     ui.painter().galley(draw_pos, galley.clone(), default_color);
@@ -1143,14 +1394,18 @@ fn render_text_chunk(
             .iter()
             .find(|l| idx >= l.char_start && idx < l.char_end)
         {
-            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-            let tip = if let Some(t) = &link.title {
-                format!("{t}\n{}", link.url)
-            } else {
-                link.url.clone()
+            if !link.url.is_empty() {
+                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+            }
+            let tip = match (&link.title, link.url.is_empty()) {
+                (Some(t), true) => t.clone(),
+                (Some(t), false) => format!("{t}\n{}", link.url),
+                (None, _) => link.url.clone(),
             };
-            resp.clone().on_hover_text(tip);
-            if resp.clicked() {
+            if !tip.is_empty() {
+                resp.clone().on_hover_text(tip);
+            }
+            if resp.clicked() && !link.url.is_empty() {
                 if let Some(fn_id) = &link.is_footnote {
                     rctx.state.pending_scroll_to = Some(format!("fn:{fn_id}"));
                 } else {
@@ -1211,11 +1466,11 @@ fn append_inlines(
                 } else {
                     rctx.style.ui_family.clone()
                 };
-                let bg = if st.highlight {
+                let bg = st.bg.unwrap_or(if st.highlight {
                     theme.find_match
                 } else {
                     Color32::TRANSPARENT
-                };
+                });
                 job.append(text, 0.0, make_fmt(st, family, bg));
                 *char_count += text.chars().count();
             }
@@ -1343,7 +1598,103 @@ fn append_inlines(
                 job.append(label, 0.0, make_fmt(st, family, Color32::TRANSPARENT));
                 *char_count += label.chars().count();
             }
+            Inline::Styled {
+                children,
+                color,
+                bg,
+                scale,
+                bold,
+                italic,
+                underline,
+                strike,
+                title,
+            } => {
+                let start = *char_count;
+                let mut next = st;
+                if let Some(c) = color {
+                    next.color = *c;
+                }
+                if let Some(b) = bg {
+                    next.bg = Some(*b);
+                }
+                if let Some(s) = scale {
+                    next.size = (st.size * *s).round().max(9.0);
+                }
+                next.bold |= *bold;
+                next.italic |= *italic;
+                next.underline |= *underline;
+                next.strike |= *strike;
+                append_inlines(children, next, rctx, job, links, char_count);
+                let end = *char_count;
+                if let Some(tip) = title
+                    && end > start
+                {
+                    links.push(LinkSpan {
+                        char_start: start,
+                        char_end: end,
+                        url: String::new(),
+                        title: Some(tip.clone()),
+                        is_footnote: None,
+                    });
+                }
+            }
         }
+    }
+}
+
+fn fit_image_dims(nat_w: f32, nat_h: f32, explicit_width: Option<f32>, max_w: f32) -> (f32, f32) {
+    let nat_w = nat_w.max(1.0);
+    let nat_h = nat_h.max(1.0);
+    let target_w = explicit_width.unwrap_or(nat_w).min(max_w).max(16.0);
+    let target_h = (target_w * (nat_h / nat_w)).clamp(12.0, 1800.0);
+    let final_w = (target_h * (nat_w / nat_h)).min(max_w);
+    (final_w, target_h)
+}
+
+fn cache_key_for_image(rctx: &RenderContext<'_>, url: &str) -> Option<(String, bool)> {
+    let is_remote =
+        url.starts_with("http://") || url.starts_with("https://") || url.starts_with("data:");
+    if is_remote {
+        Some((url.to_string(), true))
+    } else {
+        resolve_local_path(url, rctx.doc_dir, rctx.workspace_root)
+            .map(|p| (p.to_string_lossy().to_string(), false))
+    }
+}
+
+fn estimate_image_width(
+    rctx: &RenderContext<'_>,
+    url: &str,
+    explicit_width: Option<f32>,
+    max_w: f32,
+    inline_row: bool,
+) -> f32 {
+    if let Some((key, _)) = cache_key_for_image(rctx, url)
+        && let Some(cached) = rctx.state.textures.get(&key)
+    {
+        match cached {
+            CachedImage::Loaded { size, .. } => {
+                return fit_image_dims(size[0] as f32, size[1] as f32, explicit_width, max_w).0;
+            }
+            CachedImage::Svg { cache, .. } => {
+                return fit_image_dims(
+                    cache.graphic.width,
+                    cache.graphic.height,
+                    explicit_width,
+                    max_w,
+                )
+                .0;
+            }
+            CachedImage::Failed(_) => {}
+        }
+    }
+    if let Some(w) = explicit_width {
+        return w.min(max_w);
+    }
+    if inline_row {
+        150.0f32.min(max_w)
+    } else {
+        260.0f32.min(max_w)
     }
 }
 
@@ -1357,34 +1708,46 @@ fn render_image_card(
     explicit_width: Option<f32>,
     link_url: Option<&str>,
     max_w: f32,
+    inline_row: bool,
 ) {
     let theme = rctx.theme;
-    let is_remote = url.starts_with("http://") || url.starts_with("https://") || url.starts_with("data:");
+    let is_remote =
+        url.starts_with("http://") || url.starts_with("https://") || url.starts_with("data:");
 
     let mut fail_reason: Option<String> = None;
-    if !is_remote && let Some(resolved) = resolve_local_path(url, rctx.doc_dir, rctx.workspace_root)
-    {
+    let mut is_loading = false;
+
+    if is_remote {
+        if !rctx.state.textures.contains_key(url) {
+            rctx.state.remote_images.request(url, ui.ctx());
+            is_loading = rctx.state.remote_images.is_loading(url);
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(80));
+        }
+    } else if let Some(resolved) = resolve_local_path(url, rctx.doc_dir, rctx.workspace_root) {
         let key = resolved.to_string_lossy().to_string();
         let disk_mtime = std::fs::metadata(&resolved).and_then(|m| m.modified()).ok();
         let needs_load = match rctx.state.textures.get(&key) {
-            Some(CachedImage::Loaded { modified, .. }) => *modified != disk_mtime,
+            Some(CachedImage::Loaded { modified, .. } | CachedImage::Svg { modified, .. }) => {
+                *modified != disk_mtime
+            }
             Some(CachedImage::Failed(_)) => false,
             None => true,
         };
         if needs_load {
             let entry = load_local_texture(ui.ctx(), &resolved, disk_mtime);
-            rctx.state.textures.insert(key.clone(), entry);
+            rctx.state.textures.insert(key, entry);
         }
+    }
+
+    if let Some((key, _)) = cache_key_for_image(rctx, url) {
         match rctx.state.textures.get(&key) {
             Some(CachedImage::Failed(err)) => {
                 fail_reason = Some(err.clone());
             }
             Some(CachedImage::Loaded { texture, size, .. }) => {
-                let nat_w = size[0].max(1) as f32;
-                let nat_h = size[1].max(1) as f32;
-                let target_w = explicit_width.unwrap_or(nat_w).min(max_w).max(24.0);
-                let target_h = (target_w * (nat_h / nat_w)).min(640.0);
-                let final_w = target_h * (nat_w / nat_h);
+                let (final_w, target_h) =
+                    fit_image_dims(size[0] as f32, size[1] as f32, explicit_width, max_w);
                 let (img_rect, resp) =
                     ui.allocate_exact_size(Vec2::new(final_w, target_h), Sense::click());
                 ui.painter().image(
@@ -1393,11 +1756,45 @@ fn render_image_card(
                     Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
                     Color32::WHITE,
                 );
-                ui.painter().rect_stroke(
+                // Large content images get a subtle hairline border; compact badges stay clean.
+                if target_h > 44.0 {
+                    ui.painter().rect_stroke(
+                        img_rect,
+                        CornerRadius::same(6),
+                        Stroke::new(1.0, theme.border),
+                        StrokeKind::Inside,
+                    );
+                }
+                if let Some(target_link) = link_url {
+                    if resp.hovered() {
+                        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                    }
+                    if resp.clicked() {
+                        dispatch_link(rctx, target_link);
+                    }
+                }
+                if let Some(t) = title {
+                    resp.on_hover_text(t);
+                } else if !alt.is_empty() {
+                    resp.on_hover_text(alt);
+                }
+                return;
+            }
+            Some(CachedImage::Svg { cache, .. }) => {
+                let (final_w, target_h) = fit_image_dims(
+                    cache.graphic.width,
+                    cache.graphic.height,
+                    explicit_width,
+                    max_w,
+                );
+                let (img_rect, resp) =
+                    ui.allocate_exact_size(Vec2::new(final_w, target_h), Sense::click());
+                crate::markdown::svg::paint_svg(
+                    ui,
+                    cache,
                     img_rect,
-                    CornerRadius::same(6),
-                    Stroke::new(1.0, theme.border),
-                    StrokeKind::Inside,
+                    &rctx.style.ui_family,
+                    &rctx.style.ui_bold_family,
                 );
                 if let Some(target_link) = link_url {
                     if resp.hovered() {
@@ -1412,45 +1809,80 @@ fn render_image_card(
                 } else if !alt.is_empty() {
                     resp.on_hover_text(alt);
                 }
-                ui.add_space(6.0);
                 return;
             }
             None => {}
         }
     }
 
-    // Remote or missing image fallback card
-    let label = if alt.is_empty() { url } else { alt };
-    let resp = Frame::new()
-        .fill(theme.panel_bg)
-        .stroke(Stroke::new(1.0, theme.border))
-        .corner_radius(CornerRadius::same(6))
-        .inner_margin(Margin::symmetric(12, 8))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                let (ir, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
-                icons::paint(ui.painter(), ir, Icon::File, theme.accent, 1.3);
-                ui.label(
-                    egui::RichText::new(format!("图片: {label}"))
-                        .font(rctx.style.small())
-                        .color(theme.text_dim),
-                );
-                if let Some(err) = &fail_reason {
-                    ui.label(
-                        egui::RichText::new(format!("({err})"))
-                            .font(rctx.style.tiny())
-                            .color(theme.warning),
-                    );
-                } else if is_remote {
-                    ui.label(
-                        egui::RichText::new(format!("({url})"))
-                            .font(rctx.style.tiny())
-                            .color(theme.text_faint),
-                    );
-                }
-            });
-        })
-        .response;
+    // Compact loading or fallback pill (width-capped so multi-badge rows never overflow).
+    let pill_max_w = if inline_row {
+        150.0f32.min(max_w)
+    } else {
+        260.0f32.min(max_w)
+    };
+    let short_label = if is_loading {
+        if alt.is_empty() {
+            "加载图片…".to_string()
+        } else {
+            format!("加载中: {alt}")
+        }
+    } else if alt.is_empty() {
+        url.to_string()
+    } else {
+        alt.to_string()
+    };
+    let (galley, _) = crate::ui::widgets::ellipsize_mode(
+        ui,
+        &short_label,
+        rctx.style.tiny(),
+        if is_loading {
+            theme.text_muted
+        } else {
+            theme.text_dim
+        },
+        (pill_max_w - 34.0).max(24.0),
+        crate::ui::widgets::EllipsizeMode::End,
+    );
+    let pill_w = (galley.rect.width() + 34.0).min(pill_max_w).max(52.0);
+    let pill_h = if inline_row { 24.0 } else { 28.0 };
+    let (pill_rect, resp) = ui.allocate_exact_size(Vec2::new(pill_w, pill_h), Sense::click());
+    ui.painter()
+        .rect_filled(pill_rect, CornerRadius::same(5), theme.panel_bg);
+    ui.painter().rect_stroke(
+        pill_rect,
+        CornerRadius::same(5),
+        Stroke::new(1.0, theme.border),
+        StrokeKind::Inside,
+    );
+    let icon_r = Rect::from_center_size(
+        Pos2::new(pill_rect.left() + 13.0, pill_rect.center().y),
+        Vec2::splat(13.0),
+    );
+    icons::paint(
+        ui.painter(),
+        icon_r,
+        if is_loading { Icon::Refresh } else { Icon::Globe },
+        if fail_reason.is_some() {
+            theme.warning
+        } else {
+            theme.accent
+        },
+        1.2,
+    );
+    ui.painter().galley(
+        Pos2::new(
+            pill_rect.left() + 24.0,
+            pill_rect.center().y - galley.rect.height() * 0.5,
+        ),
+        galley,
+        theme.text_dim,
+    );
+    let tip = match &fail_reason {
+        Some(err) => format!("{short_label}\n{url}\n({err})"),
+        None => format!("{short_label}\n{url}"),
+    };
+    let resp = resp.on_hover_text(tip);
     if let Some(target_link) = link_url.or(is_remote.then_some(url)) {
         if resp.hovered() {
             ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
@@ -1459,7 +1891,6 @@ fn render_image_card(
             dispatch_link(rctx, target_link);
         }
     }
-    ui.add_space(4.0);
 }
 
 fn load_local_texture(
@@ -1472,6 +1903,19 @@ fn load_local_texture(
     };
     if bytes.len() > 16 * 1024 * 1024 {
         return CachedImage::Failed("图片体积超过 16 MB".to_string());
+    }
+    if crate::markdown::svg::looks_like_svg(&bytes) {
+        return match crate::markdown::svg::parse_svg(&bytes) {
+            Ok(graphic) => CachedImage::Svg {
+                cache: crate::markdown::svg::SvgRenderCache::new(
+                    ctx,
+                    &path.to_string_lossy(),
+                    std::sync::Arc::new(graphic),
+                ),
+                modified,
+            },
+            Err(err) => CachedImage::Failed(err),
+        };
     }
     match image::load_from_memory(&bytes) {
         Ok(img) => {

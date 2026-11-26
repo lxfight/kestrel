@@ -46,6 +46,7 @@ pub enum Icon {
     SplitHorizontal,
     SplitVertical,
     Preview,
+    Globe,
     Pin,
     Pinned,
     WordWrap,
@@ -136,6 +137,7 @@ impl Icon {
             Icon::SplitHorizontal => '\u{eb56}', // split-horizontal
             Icon::SplitVertical => '\u{eb57}',   // split-vertical
             Icon::Preview => '\u{eb2f}',         // open-preview
+            Icon::Globe => '\u{eb01}',           // globe
             Icon::Pin => '\u{eb2b}',             // pin
             Icon::Pinned => '\u{eba0}',          // pinned
             Icon::WordWrap => '\u{eb80}',        // word-wrap

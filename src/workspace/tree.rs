@@ -185,13 +185,163 @@ pub fn rename(path: &Path, new_name: &str) -> io::Result<PathBuf> {
     Ok(new_path)
 }
 
-/// Recycle/move to trash is overkill here: delete recursively.
-pub fn delete(path: &Path) -> io::Result<()> {
-    if path.is_dir() {
+/// How a delete operation removed the target from disk.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DeleteOutcome {
+    /// Moved to the operating system's Recycle Bin / Trash.
+    Trashed,
+    /// Could not be moved to Trash, so it was removed permanently as a fallback.
+    Permanent,
+}
+
+/// Move `path` to the OS Recycle Bin / Trash by default; only fall back to direct
+/// permanent deletion if moving to the Recycle Bin fails (e.g. network shares or
+/// volumes without Trash support).
+pub fn delete_to_trash_or_permanent(path: &Path) -> io::Result<DeleteOutcome> {
+    delete_with_trash_fn(path, move_to_trash)
+}
+
+fn delete_with_trash_fn(
+    path: &Path,
+    trash_fn: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<DeleteOutcome> {
+    // Verify the entry exists (including broken symlinks) before attempting trash.
+    std::fs::symlink_metadata(path)?;
+    if trash_fn(path).is_ok() && std::fs::symlink_metadata(path).is_err() {
+        return Ok(DeleteOutcome::Trashed);
+    }
+    delete_permanently(path)?;
+    Ok(DeleteOutcome::Permanent)
+}
+
+pub fn delete_permanently(path: &Path) -> io::Result<()> {
+    let meta = std::fs::symlink_metadata(path)?;
+    if meta.file_type().is_dir() {
         std::fs::remove_dir_all(path)
     } else {
         std::fs::remove_file(path)
     }
+}
+
+#[cfg(windows)]
+fn normalize_windows_trash_path(path: &Path) -> io::Result<PathBuf> {
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let s = abs.to_string_lossy();
+    let cleaned = if let Some(unc) = s.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        s.into_owned()
+    };
+    Ok(PathBuf::from(cleaned.replace('/', "\\")))
+}
+
+#[cfg(windows)]
+fn move_to_trash(path: &Path) -> io::Result<()> {
+    use std::ffi::c_void;
+    use std::os::windows::ffi::OsStrExt;
+
+    #[cfg_attr(target_pointer_width = "32", repr(C, packed(1)))]
+    #[cfg_attr(target_pointer_width = "64", repr(C))]
+    struct ShFileOpStructW {
+        hwnd: *mut c_void,
+        w_func: u32,
+        p_from: *const u16,
+        p_to: *const u16,
+        f_flags: u16,
+        f_any_operations_aborted: i32,
+        h_name_mappings: *mut c_void,
+        lpsz_progress_title: *const u16,
+    }
+
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        fn SHFileOperationW(lp_file_op: *mut ShFileOpStructW) -> i32;
+    }
+
+    const FO_DELETE: u32 = 0x0003;
+    const FOF_SILENT: u16 = 0x0004;
+    const FOF_NOCONFIRMATION: u16 = 0x0010;
+    const FOF_ALLOWUNDO: u16 = 0x0040;
+    const FOF_NOERRORUI: u16 = 0x0400;
+    const FOF_WANTNUKEWARNING: u16 = 0x4000;
+
+    let abs = normalize_windows_trash_path(path)?;
+    // `SHFileOperationW` requires a double-NUL-terminated UTF-16 path list.
+    let wide: Vec<u16> = abs
+        .as_os_str()
+        .encode_wide()
+        .chain([0u16, 0u16])
+        .collect();
+    let mut op = ShFileOpStructW {
+        hwnd: std::ptr::null_mut(),
+        w_func: FO_DELETE,
+        p_from: wide.as_ptr(),
+        p_to: std::ptr::null(),
+        f_flags: FOF_ALLOWUNDO
+            | FOF_NOCONFIRMATION
+            | FOF_NOERRORUI
+            | FOF_SILENT
+            | FOF_WANTNUKEWARNING,
+        f_any_operations_aborted: 0,
+        h_name_mappings: std::ptr::null_mut(),
+        lpsz_progress_title: std::ptr::null(),
+    };
+    // SAFETY: `wide` stays pinned/alive across the synchronous Win32 call.
+    let rc = unsafe { SHFileOperationW(&mut op) };
+    if rc == 0 && op.f_any_operations_aborted == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!("SHFileOperationW 失败 (code={rc})")))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn move_to_trash(path: &Path) -> io::Result<()> {
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let escaped = abs
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    let script = format!("tell application \"Finder\" to delete POSIX file \"{escaped}\"");
+    let status = std::process::Command::new("osascript")
+        .args(["-e", &script])
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other("osascript trash failed"))
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn move_to_trash(path: &Path) -> io::Result<()> {
+    for (cmd, prefix) in [
+        ("gio", &["trash"][..]),
+        ("trash-put", &[][..]),
+        ("kioclient5", &["move"][..]),
+    ] {
+        let mut command = std::process::Command::new(cmd);
+        command.args(prefix).arg(path);
+        if cmd == "kioclient5" {
+            command.arg("trash:/");
+        }
+        if let Ok(status) = command.status()
+            && status.success()
+        {
+            return Ok(());
+        }
+    }
+    Err(io::Error::other("no system trash utility available"))
 }
 
 pub fn reveal_in_explorer(path: &Path) {
@@ -375,6 +525,50 @@ mod tests {
         let r3 = tree.rows();
         assert!(!std::sync::Arc::ptr_eq(&r1, &r3));
         assert_eq!(r3.len(), 3);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn delete_prefers_trash_and_falls_back_to_permanent_when_trash_fails() {
+        let base = std::env::temp_dir().join(format!("kestrel_trash_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("folder/nested")).unwrap();
+        let file1 = base.join("trashed.txt");
+        let file2 = base.join("fallback.txt");
+        let dir = base.join("folder");
+        std::fs::write(&file1, "a").unwrap();
+        std::fs::write(&file2, "b").unwrap();
+        std::fs::write(dir.join("nested/c.txt"), "c").unwrap();
+
+        // 1. When trash succeeds and removes the path, outcome is Trashed.
+        let outcome = delete_with_trash_fn(&file1, |p| std::fs::remove_file(p)).unwrap();
+        assert_eq!(outcome, DeleteOutcome::Trashed);
+        assert!(!file1.exists());
+
+        // 2. When trash fails (e.g. unsupported volume), falls back to permanent removal.
+        let outcome =
+            delete_with_trash_fn(&file2, |_| Err(io::Error::other("trash unavailable"))).unwrap();
+        assert_eq!(outcome, DeleteOutcome::Permanent);
+        assert!(!file2.exists());
+
+        // 3. Fallback also removes directories recursively.
+        let outcome =
+            delete_with_trash_fn(&dir, |_| Err(io::Error::other("trash unavailable"))).unwrap();
+        assert_eq!(outcome, DeleteOutcome::Permanent);
+        assert!(!dir.exists());
+
+        // 4. Missing path returns NotFound error.
+        let err = delete_with_trash_fn(&base.join("missing.txt"), |_| Ok(())).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+
+        #[cfg(windows)]
+        {
+            let p = normalize_windows_trash_path(Path::new(r"\\?\C:\foo/bar.txt")).unwrap();
+            assert_eq!(p, PathBuf::from(r"C:\foo\bar.txt"));
+            let unc = normalize_windows_trash_path(Path::new(r"\\?\UNC\srv\share\a.txt")).unwrap();
+            assert_eq!(unc, PathBuf::from(r"\\srv\share\a.txt"));
+        }
 
         let _ = std::fs::remove_dir_all(&base);
     }

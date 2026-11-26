@@ -485,6 +485,79 @@ pub fn ellipsize_mode(
     (galley, cut)
 }
 
+/// Draw one sleek right-click context menu item (icon + label + right-aligned shortcut).
+#[allow(clippy::too_many_arguments)]
+pub fn context_menu_item(
+    ui: &mut Ui,
+    theme: &Theme,
+    font: FontId,
+    shortcut_font: FontId,
+    icon: Icon,
+    label: &str,
+    shortcut: Option<&str>,
+    enabled: bool,
+) -> bool {
+    let width = ui.available_width().max(180.0);
+    let (rect, resp) = ui.allocate_exact_size(
+        Vec2::new(width, 26.0),
+        if enabled { Sense::click() } else { Sense::hover() },
+    );
+    if enabled && resp.hovered() {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(R_SM), theme.hover);
+    }
+    let icon_color = if !enabled {
+        theme.text_muted
+    } else if resp.hovered() {
+        theme.accent
+    } else {
+        theme.text_dim
+    };
+    let text_color = if enabled { theme.text } else { theme.text_muted };
+    icons::paint(
+        ui.painter(),
+        Rect::from_center_size(Pos2::new(rect.left() + 14.0, rect.center().y), Vec2::splat(13.0)),
+        icon,
+        icon_color,
+        1.2,
+    );
+    ui.painter().text(
+        Pos2::new(rect.left() + 28.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        font,
+        text_color,
+    );
+    if let Some(sc) = shortcut {
+        ui.painter().text(
+            Pos2::new(rect.right() - 10.0, rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            sc,
+            shortcut_font,
+            theme.text_muted,
+        );
+    }
+    if enabled && resp.clicked() {
+        ui.close();
+        true
+    } else {
+        false
+    }
+}
+
+/// Thin horizontal separator inside a context menu.
+pub fn context_menu_sep(ui: &mut Ui, theme: &Theme) {
+    let width = ui.available_width().max(180.0);
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 7.0), Sense::hover());
+    ui.painter().line_segment(
+        [
+            Pos2::new(rect.left() + 6.0, rect.center().y),
+            Pos2::new(rect.right() - 6.0, rect.center().y),
+        ],
+        Stroke::new(1.0, theme.border),
+    );
+}
+
 fn middle_elided(chars: &[char], head: usize, tail: usize) -> String {
     let mut out = String::with_capacity(chars.len() + 1);
     out.extend(chars.iter().take(head));

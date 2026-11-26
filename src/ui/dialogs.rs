@@ -648,13 +648,13 @@ impl KestrelApp {
                         );
                         ui.add_space(4.0);
                         ui.label(
-                            egui::RichText::new("此操作不可撤销。")
+                            egui::RichText::new("将默认移至系统回收站；若无法移至回收站，则会直接永久删除。")
                                 .font(style.small())
-                                .color(theme.warning),
+                                .color(theme.text_dim),
                         );
                         ui.add_space(16.0);
                         ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
-                            if Self::modal_danger_button(ui, &style, "删除") {
+                            if Self::modal_danger_button(ui, &style, "移至回收站") {
                                 action = Some(true);
                             }
                             if Self::modal_button(ui, &style, "取消", false) {
@@ -706,13 +706,13 @@ impl KestrelApp {
                         }
                         ui.add_space(4.0);
                         ui.label(
-                            egui::RichText::new("此操作不可撤销。")
+                            egui::RichText::new("将默认移至系统回收站；若无法移至回收站，则会直接永久删除。")
                                 .font(style.small())
-                                .color(theme.warning),
+                                .color(theme.text_dim),
                         );
                         ui.add_space(16.0);
                         ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
-                            if Self::modal_danger_button(ui, &style, "删除") {
+                            if Self::modal_danger_button(ui, &style, "移至回收站") {
                                 action = Some(true);
                             }
                             if Self::modal_button(ui, &style, "取消", false) {

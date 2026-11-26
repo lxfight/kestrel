@@ -106,7 +106,7 @@ impl Editor {
             let line = self.doc.char_to_line(self.caret);
             let text = self.doc.line_content(line);
             if !text.is_empty() {
-                ctx.copy_text(format!("{text}\n"));
+                crate::app::copy_to_clipboard(format!("{text}\n"));
             }
             return;
         }
@@ -115,7 +115,8 @@ impl Editor {
             .iter()
             .map(|(start, end)| self.doc.text_range(*start, *end))
             .collect();
-        ctx.copy_text(parts.join("\n"));
+        let _ = ctx;
+        crate::app::copy_to_clipboard(parts.join("\n"));
     }
 
     pub fn delete_selection(&mut self) {

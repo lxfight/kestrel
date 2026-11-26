@@ -386,6 +386,56 @@ impl EditorGroup {
 pub const GROUP_GAP: f32 = 1.0;
 pub const TABBAR_H: f32 = 34.0;
 
+/// Write text to the real OS system clipboard via `arboard` (needed because `eframe` is
+/// built with `default-features = false` without its own clipboard feature).
+pub(crate) fn copy_to_clipboard(text: impl Into<String>) {
+    let text = text.into();
+    if let Ok(mut cb) = arboard::Clipboard::new() {
+        let _ = cb.set_text(text);
+    }
+}
+
+/// Mirror any `egui::OutputCommand::CopyText` emitted by built-in egui widgets
+/// (`TextEdit`, selectable `Label`, etc.) into the real OS clipboard.
+fn sync_egui_copy_to_os_clipboard(ctx: &egui::Context) {
+    let copied: Vec<String> = ctx.output(|o| {
+        o.commands
+            .iter()
+            .filter_map(|cmd| match cmd {
+                egui::OutputCommand::CopyText(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect()
+    });
+    if let Some(last) = copied.into_iter().last() {
+        copy_to_clipboard(last);
+    }
+}
+
+/// When an egui `TextEdit` owns keyboard focus and `eframe` lacks its built-in
+/// clipboard feature, synthesize `Event::Paste` on `Ctrl+V` from `arboard`.
+fn inject_os_paste_for_text_edits(ctx: &egui::Context, editor_focused: bool, terminal_focused: bool) {
+    if editor_focused || terminal_focused || !ctx.egui_wants_keyboard_input() {
+        return;
+    }
+    let needs_paste = ctx.input_mut(|i| {
+        let already_pasting = i.events.iter().any(|e| matches!(e, egui::Event::Paste(_)));
+        if already_pasting {
+            return false;
+        }
+        let mods = i.modifiers;
+        let ctrl = (mods.ctrl || mods.command) && !mods.alt && !mods.shift;
+        ctrl && i.consume_key(egui::Modifiers::COMMAND, egui::Key::V)
+    });
+    if needs_paste
+        && let Ok(mut cb) = arboard::Clipboard::new()
+        && let Ok(text) = cb.get_text()
+        && !text.is_empty()
+    {
+        ctx.input_mut(|i| i.events.push(egui::Event::Paste(text)));
+    }
+}
+
 /// Validate and open an external URL via the OS handler without invoking a shell.
 pub(crate) fn is_safe_external_url(url: &str) -> bool {
     let trimmed = url.trim();
@@ -1127,6 +1177,15 @@ impl KestrelApp {
             "git" => {
                 self.sidebar.visible = true;
                 self.sidebar.mode = SidebarMode::Git;
+            }
+            "diff" => {
+                self.sidebar.visible = true;
+                self.sidebar.mode = SidebarMode::Git;
+                if let Some(root) = self.workspace.root.clone() {
+                    let rel = std::env::var("KESTREL_DEV_DIFF")
+                        .unwrap_or_else(|_| "src/app.rs".to_string());
+                    self.open_file_diff(root.join(rel), false);
+                }
             }
             "outline" => {
                 self.sidebar.visible = true;
@@ -1926,7 +1985,7 @@ impl KestrelApp {
         &mut self,
         tab_idx: usize,
         events: Vec<crate::markdown::PreviewEvent>,
-        ctx: &egui::Context,
+        _ctx: &egui::Context,
     ) {
         use crate::doc::EditKind;
         use crate::markdown::{MarkdownViewMode, PreviewEvent};
@@ -1979,8 +2038,25 @@ impl KestrelApp {
                     }
                 }
                 PreviewEvent::CopyText(text) => {
-                    ctx.copy_text(text);
+                    copy_to_clipboard(text);
                     self.toast("已复制代码块内容", ToastKind::Success);
+                }
+                PreviewEvent::CopySource => {
+                    if let Some(tab) = self.tabs.get(tab_idx) {
+                        copy_to_clipboard(tab.doc.text());
+                        self.toast("已复制文档源码到剪贴板", ToastKind::Success);
+                    }
+                }
+                PreviewEvent::SwitchMode(mode) => {
+                    if let Some(tab) = self.tabs.get_mut(tab_idx) {
+                        if mode == MarkdownViewMode::Split {
+                            tab.md_preview.split_synced = false;
+                        }
+                        tab.md_mode = mode;
+                    }
+                }
+                PreviewEvent::OpenInBrowser => {
+                    self.preview_tab_in_browser(tab_idx);
                 }
                 PreviewEvent::JumpSourceLine(line) => {
                     if let Some(tab) = self.tabs.get_mut(tab_idx) {
@@ -2304,6 +2380,35 @@ impl KestrelApp {
         }
     }
 
+    /// Open `path` and jump directly to a 1-based line number.
+    pub fn open_file_at_line(&mut self, path: PathBuf, line: usize) {
+        let path = self.canonical(path);
+        self.open_file(path);
+        self.goto_line(line.max(1));
+    }
+
+    /// Synchronize open editor tabs, Git status, and the diff view after saving
+    /// an inline working-tree edit from inside a Diff tab.
+    pub fn on_diff_working_file_saved(&mut self, diff_id: u64, path: PathBuf, line: usize) {
+        let canon = self.canonical(path.clone());
+        for tab in &mut self.tabs {
+            if tab.diff.is_none()
+                && tab.doc.path.as_deref() == Some(canon.as_path())
+                && !tab.is_dirty()
+            {
+                let _ = tab.reload();
+            }
+        }
+        if let Some(root) = self.workspace.root.clone() {
+            self.git.refresh(&root);
+        }
+        self.spawn_diff_load(diff_id);
+        self.toast(
+            format!("已保存第 {line} 行附近更改并刷新差异"),
+            ToastKind::Success,
+        );
+    }
+
     /// Open a read-only virtual document (git revision, diff, etc.) in the active group.
     pub fn open_virtual_text(&mut self, title: String, text: String, language: Language) {
         let mut doc = Document::from_text(&text);
@@ -2440,6 +2545,7 @@ impl KestrelApp {
                 .data
                 .as_ref()
                 .and_then(|data| data.hunk_patch(command.hunk()));
+            diff.pending_scroll_y = Some(diff.last_scroll_y);
             commands.push((tab.id, command, patch, diff.staged));
         }
         for (tab_id, command, patch, staged) in commands {
@@ -3134,8 +3240,8 @@ impl KestrelApp {
     }
 
     pub fn delete_path(&mut self, path: PathBuf) {
-        match crate::workspace::tree::delete(&path) {
-            Ok(()) => {
+        match crate::workspace::tree::delete_to_trash_or_permanent(&path) {
+            Ok(outcome) => {
                 if let Some(parent) = path.parent() {
                     self.workspace.tree.reload_dir(parent);
                 }
@@ -3153,7 +3259,14 @@ impl KestrelApp {
                     self.workspace.index.scan(root);
                     self.git.refresh(root);
                 }
-                self.toast("已删除", ToastKind::Info);
+                match outcome {
+                    crate::workspace::tree::DeleteOutcome::Trashed => {
+                        self.toast("已移至回收站", ToastKind::Info);
+                    }
+                    crate::workspace::tree::DeleteOutcome::Permanent => {
+                        self.toast("无法移至回收站，已永久删除", ToastKind::Warning);
+                    }
+                }
             }
             Err(err) => self.toast(format!("删除失败: {err}"), ToastKind::Error),
         }
@@ -3161,14 +3274,18 @@ impl KestrelApp {
 
     /// Batch delete for the Explorer multi-selection context menu.
     pub fn delete_paths(&mut self, paths: &[PathBuf]) {
-        let mut deleted = 0usize;
+        let mut trashed = 0usize;
+        let mut permanent = 0usize;
         let mut failed = 0usize;
         let mut parents: Vec<PathBuf> = Vec::new();
         let mut removed_roots: Vec<(PathBuf, PathBuf)> = Vec::new();
         for path in paths {
-            match crate::workspace::tree::delete(path) {
-                Ok(()) => {
-                    deleted += 1;
+            match crate::workspace::tree::delete_to_trash_or_permanent(path) {
+                Ok(outcome) => {
+                    match outcome {
+                        crate::workspace::tree::DeleteOutcome::Trashed => trashed += 1,
+                        crate::workspace::tree::DeleteOutcome::Permanent => permanent += 1,
+                    }
                     if let Some(parent) = path.parent() {
                         parents.push(parent.to_path_buf());
                     }
@@ -3200,10 +3317,23 @@ impl KestrelApp {
             self.git.refresh(&root);
         }
         if failed == 0 {
-            self.toast(format!("已删除 {deleted} 个项目"), ToastKind::Info);
+            if permanent == 0 {
+                self.toast(format!("已将 {trashed} 个项目移至回收站"), ToastKind::Info);
+            } else if trashed == 0 {
+                self.toast(
+                    format!("无法移至回收站，已永久删除 {permanent} 个项目"),
+                    ToastKind::Warning,
+                );
+            } else {
+                self.toast(
+                    format!("已移至回收站 {trashed} 个，永久删除 {permanent} 个"),
+                    ToastKind::Warning,
+                );
+            }
         } else {
+            let deleted = trashed + permanent;
             self.toast(
-                format!("已删除 {deleted} 个项目，{failed} 个失败"),
+                format!("已删除 {deleted} 个项目（回收站 {trashed} / 永久 {permanent}），{failed} 个失败"),
                 ToastKind::Error,
             );
         }
@@ -3930,29 +4060,101 @@ impl KestrelApp {
     // ------------------------------------------------------------------
 
     pub fn dispatch(&mut self, command: Command, ctx: &egui::Context) {
-        if self
+        if let Some(diff_tab_id) = self
             .active_editor()
-            .is_some_and(|tab| tab.diff.is_some())
-            && (command.is_editor_command()
-                || matches!(
-                    command,
-                    Command::Save
-                        | Command::SaveAs
-                        | Command::SaveAll
-                        | Command::FormatDocument
-                        | Command::ToggleEol
-                        | Command::TrimTrailingWhitespace
-                        | Command::ReopenUtf8
-                        | Command::ReopenUtf8Bom
-                        | Command::ReopenUtf16Le
-                        | Command::ReopenUtf16Be
-                        | Command::SaveAsUtf8
-                        | Command::SaveAsUtf8Bom
-                        | Command::SaveAsUtf16Le
-                        | Command::SaveAsUtf16Be
-                ))
+            .filter(|tab| tab.diff.is_some())
+            .map(|tab| tab.id)
         {
-            return;
+            match command {
+                Command::Save => {
+                    let saved = self
+                        .tabs
+                        .get_mut(self.active)
+                        .and_then(|tab| tab.diff.as_mut())
+                        .and_then(|diff| {
+                            let path = diff.path.clone();
+                            diff.save_inline_edit().map(|res| (path, res))
+                        });
+                    if let Some((path, res)) = saved {
+                        match res {
+                            Ok(line) => self.on_diff_working_file_saved(diff_tab_id, path, line),
+                            Err(err) => self.toast(err, ToastKind::Error),
+                        }
+                    }
+                    return;
+                }
+                Command::Copy => {
+                    if let Some(text) = self
+                        .active_editor()
+                        .and_then(|tab| tab.diff.as_ref())
+                        .and_then(|diff| diff.copy_selection())
+                    {
+                        copy_to_clipboard(text);
+                    }
+                    return;
+                }
+                Command::SelectAll => {
+                    if let Some(diff) = self
+                        .tabs
+                        .get_mut(self.active)
+                        .and_then(|tab| tab.diff.as_mut())
+                    {
+                        diff.select_all_active_side();
+                    }
+                    return;
+                }
+                Command::Find => {
+                    if let Some(diff) = self
+                        .tabs
+                        .get_mut(self.active)
+                        .and_then(|tab| tab.diff.as_mut())
+                    {
+                        diff.open_find();
+                    }
+                    return;
+                }
+                Command::FindNext => {
+                    if let Some(diff) = self
+                        .tabs
+                        .get_mut(self.active)
+                        .and_then(|tab| tab.diff.as_mut())
+                    {
+                        diff.find_step(true);
+                    }
+                    return;
+                }
+                Command::FindPrev => {
+                    if let Some(diff) = self
+                        .tabs
+                        .get_mut(self.active)
+                        .and_then(|tab| tab.diff.as_mut())
+                    {
+                        diff.find_step(false);
+                    }
+                    return;
+                }
+                _ if command.is_editor_command()
+                    || matches!(
+                        command,
+                        Command::SaveAs
+                            | Command::SaveAll
+                            | Command::FormatDocument
+                            | Command::ToggleEol
+                            | Command::TrimTrailingWhitespace
+                            | Command::ReopenUtf8
+                            | Command::ReopenUtf8Bom
+                            | Command::ReopenUtf16Le
+                            | Command::ReopenUtf16Be
+                            | Command::SaveAsUtf8
+                            | Command::SaveAsUtf8Bom
+                            | Command::SaveAsUtf16Le
+                            | Command::SaveAsUtf16Be
+                    ) =>
+                {
+                    return;
+                }
+                _ => {}
+            }
         }
         match command {
             Command::NewFile => self.new_untitled(),
@@ -4211,7 +4413,7 @@ impl KestrelApp {
             Command::SplitEditor => self.split_editor_right(),
             Command::ToggleMarkdownPreview => {
                 if let Some(tab) = self.tabs.get_mut(self.active) {
-                    if tab.language == Language::Markdown {
+                    if matches!(tab.language, Language::Markdown | Language::Html) {
                         tab.md_mode = match tab.md_mode {
                             crate::markdown::MarkdownViewMode::Preview => {
                                 crate::markdown::MarkdownViewMode::Source
@@ -4219,13 +4421,13 @@ impl KestrelApp {
                             _ => crate::markdown::MarkdownViewMode::Preview,
                         };
                     } else {
-                        self.toast("当前文件不是 Markdown 文档", ToastKind::Info);
+                        self.toast("当前文件不是 Markdown 或 HTML 文档", ToastKind::Info);
                     }
                 }
             }
             Command::MarkdownPreviewSide => {
                 if let Some(tab) = self.tabs.get_mut(self.active) {
-                    if tab.language == Language::Markdown {
+                    if matches!(tab.language, Language::Markdown | Language::Html) {
                         let next = match tab.md_mode {
                             crate::markdown::MarkdownViewMode::Split => {
                                 crate::markdown::MarkdownViewMode::Source
@@ -4237,9 +4439,12 @@ impl KestrelApp {
                         }
                         tab.md_mode = next;
                     } else {
-                        self.toast("当前文件不是 Markdown 文档", ToastKind::Info);
+                        self.toast("当前文件不是 Markdown 或 HTML 文档", ToastKind::Info);
                     }
                 }
+            }
+            Command::PreviewInBrowser => {
+                self.preview_active_in_browser();
             }
             Command::ToggleWordWrap => {
                 self.settings.word_wrap = !self.settings.word_wrap;
@@ -4823,6 +5028,60 @@ impl KestrelApp {
         self.toast(format!("界面缩放: {:.0}%", clamped * 100.0), ToastKind::Info);
     }
 
+    pub fn preview_active_in_browser(&mut self) {
+        self.preview_tab_in_browser(self.active);
+    }
+
+    pub fn preview_tab_in_browser(&mut self, tab_idx: usize) {
+        let Some(tab) = self.tabs.get(tab_idx) else {
+            return;
+        };
+        match tab.language {
+            Language::Html => {
+                if !tab.is_dirty()
+                    && let Some(path) = tab.doc.path.clone()
+                {
+                    self.open_in_default_app(&path);
+                    return;
+                }
+                let text = tab.doc.text();
+                let title = tab.title();
+                let dir = std::env::temp_dir().join("kestrel-preview");
+                let safe: String = title
+                    .chars()
+                    .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+                    .take(48)
+                    .collect();
+                let out = dir.join(format!("{}.html", if safe.is_empty() { "preview" } else { &safe }));
+                match std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&out, text)) {
+                    Ok(()) => self.open_in_default_app(&out),
+                    Err(err) => self.toast(format!("生成网页预览失败: {err}"), ToastKind::Error),
+                }
+            }
+            Language::Markdown => {
+                let text = tab.doc.text();
+                let title = tab.title();
+                let path = tab.doc.path.clone();
+                let dark = self.theme.kind.is_dark();
+                match crate::markdown::export_html::write_temp_html_preview(
+                    &title,
+                    &text,
+                    dark,
+                    path.as_deref(),
+                ) {
+                    Ok(out) => {
+                        self.open_in_default_app(&out);
+                        self.toast("已在浏览器中打开网页预览", ToastKind::Info);
+                    }
+                    Err(err) => self.toast(format!("生成网页预览失败: {err}"), ToastKind::Error),
+                }
+            }
+            _ => {
+                self.toast("当前文件不是 Markdown 或 HTML 文档", ToastKind::Info);
+            }
+        }
+    }
+
     pub fn open_in_default_app(&mut self, path: &Path) {
         #[cfg(target_os = "windows")]
         let res = std::process::Command::new("explorer").arg(path).spawn();
@@ -4955,6 +5214,9 @@ impl eframe::App for KestrelApp {
         self.pump_background(&ctx);
         self.plugin_tick(&ctx);
         self.handle_global_shortcuts(&ctx);
+        let editor_focused = self.active_editor().is_some_and(|tab| tab.has_focus);
+        let terminal_focused = self.bottom.visible && self.bottom.terminal_has_focus;
+        inject_os_paste_for_text_edits(&ctx, editor_focused, terminal_focused);
         self.handle_close_request(&ctx);
         self.update_window_title(&ctx);
 
@@ -4965,6 +5227,7 @@ impl eframe::App for KestrelApp {
         self.dialogs_ui(&ctx);
         self.toasts_ui(&ctx);
         self.handle_window_resize(&ctx);
+        sync_egui_copy_to_os_clipboard(&ctx);
         self.schedule_background_wakeup(&ctx);
     }
 

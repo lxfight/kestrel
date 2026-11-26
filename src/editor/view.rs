@@ -580,6 +580,190 @@ impl Editor {
         self.paint_completion_popup(ui, style, rect, text_left, line_h);
         self.paint_find_widget(ui, style, rect);
 
+        // Right-clicking outside an existing selection moves the caret there before opening the menu.
+        if response.secondary_clicked() {
+            response.request_focus();
+            if let Some(pos) = response.interact_pointer_pos()
+                && pos.x >= text_left
+                && pos.y >= view_top
+            {
+                let ch = self.pos_to_char(ui, style, rect, pos, text_left, text_width);
+                let in_sel = self
+                    .selection()
+                    .is_some_and(|(start, end)| ch >= start && ch <= end);
+                if !in_sel {
+                    self.extra_cursors.clear();
+                    self.caret = ch;
+                    self.anchor = ch;
+                    self.desired_col = None;
+                }
+            }
+        }
+
+        let readonly = self.doc.readonly;
+        let can_undo = !readonly && self.doc.can_undo();
+        let can_redo = !readonly && self.doc.can_redo();
+        let ident = self.identifier_at(self.caret);
+        let menu_font = style.ui();
+        let sc_font = egui::FontId::new(11.0, style.mono_family.clone());
+        let theme = style.theme;
+        response.context_menu(|ui| {
+            ui.set_width(218.0);
+            if crate::ui::widgets::context_menu_item(
+                ui,
+                &theme,
+                menu_font.clone(),
+                sc_font.clone(),
+                Icon::Close,
+                "剪切",
+                Some("Ctrl+X"),
+                !readonly,
+            ) {
+                self.copy_selection(ui.ctx());
+                self.delete_selection();
+            }
+            if crate::ui::widgets::context_menu_item(
+                ui,
+                &theme,
+                menu_font.clone(),
+                sc_font.clone(),
+                Icon::Copy,
+                "复制",
+                Some("Ctrl+C"),
+                true,
+            ) {
+                self.copy_selection(ui.ctx());
+            }
+            if crate::ui::widgets::context_menu_item(
+                ui,
+                &theme,
+                menu_font.clone(),
+                sc_font.clone(),
+                Icon::File,
+                "粘贴",
+                Some("Ctrl+V"),
+                !readonly,
+            ) && let Ok(mut cb) = arboard::Clipboard::new()
+                && let Ok(text) = cb.get_text()
+                && !text.is_empty()
+            {
+                self.paste_text(&text);
+            }
+            if crate::ui::widgets::context_menu_item(
+                ui,
+                &theme,
+                menu_font.clone(),
+                sc_font.clone(),
+                Icon::FileCode,
+                "全选",
+                Some("Ctrl+A"),
+                true,
+            ) {
+                self.select_all();
+            }
+            crate::ui::widgets::context_menu_sep(ui, &theme);
+            if crate::ui::widgets::context_menu_item(
+                ui,
+                &theme,
+                menu_font.clone(),
+                sc_font.clone(),
+                Icon::Undo,
+                "撤销",
+                Some("Ctrl+Z"),
+                can_undo,
+            ) {
+                self.undo();
+            }
+            if crate::ui::widgets::context_menu_item(
+                ui,
+                &theme,
+                menu_font.clone(),
+                sc_font.clone(),
+                Icon::Redo,
+                "重做",
+                Some("Ctrl+Y"),
+                can_redo,
+            ) {
+                self.redo();
+            }
+            crate::ui::widgets::context_menu_sep(ui, &theme);
+            if !ident.is_empty()
+                && crate::ui::widgets::context_menu_item(
+                    ui,
+                    &theme,
+                    menu_font.clone(),
+                    sc_font.clone(),
+                    Icon::Goforward,
+                    "转到定义",
+                    Some("F12"),
+                    true,
+                )
+            {
+                event = Some(EditorEvent::GotoDefinition(ident.clone()));
+            }
+            if crate::ui::widgets::context_menu_item(
+                ui,
+                &theme,
+                menu_font.clone(),
+                sc_font.clone(),
+                Icon::Search,
+                "查找",
+                Some("Ctrl+F"),
+                true,
+            ) {
+                self.open_find(false);
+            }
+            if crate::ui::widgets::context_menu_item(
+                ui,
+                &theme,
+                menu_font.clone(),
+                sc_font.clone(),
+                Icon::Replace,
+                "替换",
+                Some("Ctrl+H"),
+                !readonly,
+            ) {
+                self.open_find(true);
+            }
+            if crate::ui::widgets::context_menu_item(
+                ui,
+                &theme,
+                menu_font.clone(),
+                sc_font.clone(),
+                Icon::FileCode,
+                "切换行注释",
+                Some("Ctrl+/"),
+                !readonly,
+            ) {
+                self.toggle_comment();
+            }
+            if crate::ui::widgets::context_menu_item(
+                ui,
+                &theme,
+                menu_font.clone(),
+                sc_font.clone(),
+                Icon::FileCode,
+                "格式化文档",
+                Some("Shift+Alt+F"),
+                !readonly,
+            ) {
+                let _ = self.format_document();
+            }
+            crate::ui::widgets::context_menu_sep(ui, &theme);
+            if crate::ui::widgets::context_menu_item(
+                ui,
+                &theme,
+                menu_font,
+                sc_font,
+                Icon::Search,
+                "命令面板…",
+                Some("Ctrl+Shift+P"),
+                true,
+            ) {
+                event = Some(EditorEvent::OpenPalette);
+            }
+        });
+
         // Hover tooltip for diagnostics or outline symbols
         if response.hovered()
             && !self.dragging_selection

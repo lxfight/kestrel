@@ -504,6 +504,7 @@ fn parse_blocks(lines: &[Line<'_>], ctx: &mut ParseCtx, depth: usize) -> Vec<Blo
                 slug,
                 inlines,
                 source_line: line.line_no,
+                align: None,
             });
             i += 1;
             continue;
@@ -611,13 +612,19 @@ fn parse_blocks(lines: &[Line<'_>], ctx: &mut ParseCtx, depth: usize) -> Vec<Blo
             }
         }
 
-        // 11. Simple HTML Block (`<hr>`, `<p align=...>`, `<h1..h6>`, `<blockquote>`, `<pre>`, `<img>`, `<br>`)
-        if leading <= 3 && no_indent.starts_with('<') && !no_indent.starts_with("<http")
-            && let Some((html_block, next_i)) = try_parse_html_block(lines, i, ctx) {
-                blocks.push(html_block);
-                i = next_i;
-                continue;
+        // 11. Rich HTML / Web Block (`<table>`, `<ul>`, `<ol>`, `<div>`, `<center>`, `<figure>`,
+        //     `<blockquote>`, `<pre>`, `<h1..h6>`, `<p>`, `<hr>`, `<br>`, `<style>`, `<script>`, etc.)
+        if leading <= 3
+            && no_indent.starts_with('<')
+            && !no_indent.starts_with("<http")
+            && let Some((html_block, next_i)) = try_parse_html_block(lines, i, ctx, depth)
+        {
+            if let Some(block) = html_block {
+                blocks.push(block);
             }
+            i = next_i;
+            continue;
+        }
 
         // 12. Definition List (`Term` followed by `: Definition`)
         if i + 1 < lines.len() && lines[i + 1].text.trim_start().starts_with(": ") {
@@ -662,6 +669,7 @@ fn parse_blocks(lines: &[Line<'_>], ctx: &mut ParseCtx, depth: usize) -> Vec<Blo
                 slug,
                 inlines,
                 source_line,
+                align: None,
             });
         } else {
             let inlines = parse_paragraph_inlines(&para_lines, ctx);
@@ -753,136 +761,843 @@ fn parse_details_block(
     ))
 }
 
+fn is_html_tag_boundary(rest: &str) -> bool {
+    rest.is_empty()
+        || rest.starts_with('>')
+        || rest.starts_with('/')
+        || rest.starts_with(char::is_whitespace)
+}
+
+fn starts_with_html_tag(lower: &str, tag: &str) -> bool {
+    lower
+        .strip_prefix('<')
+        .and_then(|s| s.strip_prefix(tag))
+        .is_some_and(is_html_tag_boundary)
+}
+
+fn is_html_block_start(trimmed: &str) -> bool {
+    if !trimmed.starts_with('<') || trimmed.starts_with("<http") {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    lower.starts_with("<!--")
+        || lower.starts_with("<!doctype")
+        || [
+            "table",
+            "ul",
+            "ol",
+            "dl",
+            "div",
+            "center",
+            "section",
+            "article",
+            "header",
+            "footer",
+            "main",
+            "nav",
+            "aside",
+            "figure",
+            "picture",
+            "blockquote",
+            "pre",
+            "details",
+            "hr",
+            "h1",
+            "h2",
+            "h3",
+            "h4",
+            "h5",
+            "h6",
+            "p",
+            "style",
+            "script",
+            "head",
+            "html",
+            "body",
+        ]
+        .iter()
+        .any(|tag| starts_with_html_tag(&lower, tag))
+}
+
+fn extract_style_prop(style: &str, prop: &str) -> Option<String> {
+    let want = prop.to_ascii_lowercase();
+    for decl in style.split(';') {
+        let Some((k, v)) = decl.split_once(':') else {
+            continue;
+        };
+        if k.trim().eq_ignore_ascii_case(&want) {
+            let val = v.trim().trim_end_matches("!important").trim();
+            if !val.is_empty() {
+                return Some(val.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn extract_align(open_tag: &str) -> Option<Align> {
+    let raw = extract_html_attr(open_tag, "align").or_else(|| {
+        extract_html_attr(open_tag, "style").and_then(|st| extract_style_prop(&st, "text-align"))
+    })?;
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "center" => Some(Align::Center),
+        "right" | "end" => Some(Align::Right),
+        "left" | "start" => Some(Align::Left),
+        _ => None,
+    }
+}
+
+pub(crate) fn parse_css_color(raw: &str) -> Option<egui::Color32> {
+    let s = raw.trim().to_ascii_lowercase();
+    if let Some(hex) = s.strip_prefix('#') {
+        let bytes = hex.as_bytes();
+        let nibble = |b: u8| -> Option<u8> {
+            match b {
+                b'0'..=b'9' => Some(b - b'0'),
+                b'a'..=b'f' => Some(10 + b - b'a'),
+                _ => None,
+            }
+        };
+        let byte = |hi: u8, lo: u8| -> Option<u8> { Some((nibble(hi)? << 4) | nibble(lo)?) };
+        return match bytes.len() {
+            3 => {
+                let r = nibble(bytes[0])? * 17;
+                let g = nibble(bytes[1])? * 17;
+                let b = nibble(bytes[2])? * 17;
+                Some(egui::Color32::from_rgb(r, g, b))
+            }
+            6 => Some(egui::Color32::from_rgb(
+                byte(bytes[0], bytes[1])?,
+                byte(bytes[2], bytes[3])?,
+                byte(bytes[4], bytes[5])?,
+            )),
+            8 => Some(egui::Color32::from_rgba_unmultiplied(
+                byte(bytes[0], bytes[1])?,
+                byte(bytes[2], bytes[3])?,
+                byte(bytes[4], bytes[5])?,
+                byte(bytes[6], bytes[7])?,
+            )),
+            _ => None,
+        };
+    }
+    if let Some(inner) = s
+        .strip_prefix("rgb(")
+        .or_else(|| s.strip_prefix("rgba("))
+        .and_then(|r| r.strip_suffix(')'))
+    {
+        let parts: Vec<&str> = inner.split([',', '/']).map(str::trim).filter(|p| !p.is_empty()).collect();
+        if parts.len() >= 3 {
+            let r = parts[0].parse::<f32>().ok()?.clamp(0.0, 255.0) as u8;
+            let g = parts[1].parse::<f32>().ok()?.clamp(0.0, 255.0) as u8;
+            let b = parts[2].parse::<f32>().ok()?.clamp(0.0, 255.0) as u8;
+            let a = if let Some(alpha) = parts.get(3) {
+                let v = alpha.parse::<f32>().ok()?;
+                if v <= 1.0 {
+                    (v.clamp(0.0, 1.0) * 255.0).round() as u8
+                } else {
+                    v.clamp(0.0, 255.0) as u8
+                }
+            } else {
+                255
+            };
+            return Some(egui::Color32::from_rgba_unmultiplied(r, g, b, a));
+        }
+    }
+    let rgb = match s.as_str() {
+        "red" => (220, 38, 38),
+        "crimson" => (220, 20, 60),
+        "tomato" => (255, 99, 71),
+        "coral" => (255, 127, 80),
+        "orange" => (234, 88, 12),
+        "darkorange" => (255, 140, 0),
+        "gold" => (217, 155, 0),
+        "yellow" => (202, 138, 4),
+        "green" => (22, 163, 74),
+        "forestgreen" => (34, 139, 34),
+        "limegreen" | "lime" => (50, 205, 50),
+        "emerald" => (16, 185, 129),
+        "teal" => (13, 148, 136),
+        "cyan" | "aqua" => (6, 182, 212),
+        "blue" => (37, 99, 235),
+        "dodgerblue" => (30, 144, 255),
+        "royalblue" => (65, 105, 225),
+        "navy" => (30, 58, 138),
+        "indigo" => (79, 70, 229),
+        "purple" | "rebeccapurple" => (147, 51, 234),
+        "violet" => (139, 92, 246),
+        "magenta" | "fuchsia" => (217, 70, 239),
+        "pink" | "hotpink" => (236, 72, 153),
+        "brown" | "maroon" => (153, 51, 51),
+        "olive" => (128, 128, 0),
+        "gray" | "grey" => (115, 125, 140),
+        "darkgray" | "darkgrey" => (85, 95, 110),
+        "lightgray" | "lightgrey" | "silver" => (160, 170, 182),
+        "white" => (248, 250, 252),
+        "black" => (17, 24, 39),
+        _ => return None,
+    };
+    Some(egui::Color32::from_rgb(rgb.0, rgb.1, rgb.2))
+}
+
+/// Find the byte offset (relative to `after`) of the matching `</tag>` while skipping
+/// nested `<tag ...> ... </tag>` pairs.
+fn find_balanced_close(after: &str, tag: &str) -> Option<usize> {
+    let lower = after.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let tag_bytes = tag.as_bytes();
+    let mut depth = 1usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'<' {
+            // Skip HTML comments inside tags
+            if lower[i..].starts_with("<!--") {
+                if let Some(end) = lower[i + 4..].find("-->") {
+                    i += 4 + end + 3;
+                    continue;
+                }
+                return None;
+            }
+            if i + 2 + tag_bytes.len() <= bytes.len()
+                && bytes[i + 1] == b'/'
+                && &bytes[i + 2..i + 2 + tag_bytes.len()] == tag_bytes
+            {
+                let rest = &lower[i + 2 + tag_bytes.len()..];
+                if rest.starts_with('>') || rest.starts_with(char::is_whitespace) {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                    if let Some(gt) = rest.find('>') {
+                        i += 2 + tag_bytes.len() + gt + 1;
+                        continue;
+                    }
+                }
+            } else if i + 1 + tag_bytes.len() <= bytes.len()
+                && &bytes[i + 1..i + 1 + tag_bytes.len()] == tag_bytes
+            {
+                let rest = &lower[i + 1 + tag_bytes.len()..];
+                if is_html_tag_boundary(rest)
+                    && let Some(gt) = lower[i..].find('>')
+                {
+                    let tag_slice = &lower[i..i + gt];
+                    if !tag_slice.trim_end().ends_with('/') {
+                        depth += 1;
+                    }
+                    i += gt + 1;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Decode HTML entities inside a plain string (used for `<pre><code>` blocks and attributes).
+fn decode_html_entities_str(s: &str) -> String {
+    if !s.contains('&') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0usize;
+    while i < s.len() {
+        if s.as_bytes()[i] == b'&'
+            && let Some((decoded, next)) = decode_entity(s, i)
+        {
+            out.push_str(&decoded);
+            i = next;
+            continue;
+        }
+        let ch = s[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Collect a multi-line (or single-line) balanced HTML element starting at `lines[start]`
+/// with `<tag ...>`, returning `(open_tag, inner_content, next_line_index)`.
+fn collect_balanced_html_block(
+    lines: &[Line<'_>],
+    start: usize,
+    tag: &str,
+) -> Option<(String, String, usize)> {
+    let mut joined = String::new();
+    let mut j = start;
+    // Limit lookahead so an unclosed tag cannot scan an entire multi-MB document.
+    let limit = (start + 400).min(lines.len());
+    while j < limit {
+        if j > start {
+            joined.push('\n');
+        }
+        joined.push_str(lines[j].text);
+        let trimmed_start = joined.trim_start();
+        if let Some(gt) = trimmed_start.find('>') {
+            let open_tag = &trimmed_start[..=gt];
+            // Self-closing tag `<div />`
+            if open_tag.trim_end().ends_with("/>") {
+                return Some((open_tag.to_string(), String::new(), j + 1));
+            }
+            let after = &trimmed_start[gt + 1..];
+            if let Some(close_rel) = find_balanced_close(after, tag) {
+                let inner = after[..close_rel].to_string();
+                return Some((open_tag.to_string(), inner, j + 1));
+            }
+        }
+        j += 1;
+    }
+    None
+}
+
+/// Parse an HTML snippet as nested Markdown + HTML blocks.
+fn parse_nested_html_blocks(
+    inner: &str,
+    base_line: usize,
+    ctx: &mut ParseCtx,
+    depth: usize,
+) -> Vec<Block> {
+    if depth >= 16 {
+        let trimmed = inner.trim();
+        if trimmed.is_empty() {
+            return Vec::new();
+        }
+        return vec![Block::Paragraph {
+            inlines: parse_inlines(trimmed, ctx),
+            align: None,
+        }];
+    }
+    let sub_lines: Vec<Line<'_>> = inner
+        .lines()
+        .enumerate()
+        .map(|(offset, text)| Line {
+            text,
+            raw_start: 0,
+            line_no: base_line + offset,
+        })
+        .collect();
+    parse_blocks(&sub_lines, ctx, depth + 1)
+}
+
+/// Extract all top-level child `<tag>...</tag>` elements inside `html`.
+fn extract_html_elements(html: &str, tags: &[&str]) -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    let lower = html.to_ascii_lowercase();
+    let mut i = 0usize;
+    while i < html.len() {
+        if html.as_bytes()[i] == b'<' {
+            if lower[i..].starts_with("<!--") {
+                if let Some(end) = lower[i + 4..].find("-->") {
+                    i += 4 + end + 3;
+                    continue;
+                }
+                break;
+            }
+            let matched = tags.iter().copied().find(|t| starts_with_html_tag(&lower[i..], t));
+            if let Some(tag) = matched
+                && let Some(gt_rel) = html[i..].find('>')
+            {
+                let open_tag = &html[i..=i + gt_rel];
+                let after_start = i + gt_rel + 1;
+                if open_tag.trim_end().ends_with("/>") {
+                    out.push((tag.to_string(), open_tag.to_string(), String::new()));
+                    i = after_start;
+                    continue;
+                }
+                let after = &html[after_start..];
+                if let Some(close_rel) = find_balanced_close(after, tag) {
+                    let inner = after[..close_rel].to_string();
+                    out.push((tag.to_string(), open_tag.to_string(), inner));
+                    let after_close = &after[close_rel..];
+                    if let Some(close_gt) = after_close.find('>') {
+                        i = after_start + close_rel + close_gt + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        let ch = html[i..].chars().next().unwrap();
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn parse_html_table(inner: &str, source_line: usize, ctx: &mut ParseCtx) -> Option<Block> {
+    let tr_elems = extract_html_elements(inner, &["tr"]);
+    if tr_elems.is_empty() {
+        return None;
+    }
+    let mut headers: Vec<Vec<Inline>> = Vec::new();
+    let mut rows: Vec<Vec<Vec<Inline>>> = Vec::new();
+    let mut alignments: Vec<Align> = Vec::new();
+
+    for (row_idx, (_, _, tr_inner)) in tr_elems.into_iter().enumerate() {
+        let cells = extract_html_elements(&tr_inner, &["th", "td"]);
+        if cells.is_empty() {
+            continue;
+        }
+        let all_th = cells.iter().all(|(tag, _, _)| tag == "th");
+        let mut parsed_cells = Vec::with_capacity(cells.len());
+        for (col_idx, (_, open_tag, cell_inner)) in cells.into_iter().enumerate() {
+            let align = extract_align(&open_tag);
+            if alignments.len() <= col_idx {
+                alignments.push(align.unwrap_or(Align::Left));
+            } else if let Some(a) = align {
+                alignments[col_idx] = a;
+            }
+            let collapsed = cell_inner
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            parsed_cells.push(parse_inlines(&collapsed, ctx));
+        }
+        if row_idx == 0 && all_th && headers.is_empty() {
+            headers = parsed_cells;
+        } else {
+            rows.push(parsed_cells);
+        }
+    }
+    if headers.is_empty() && rows.is_empty() {
+        return None;
+    }
+    if headers.is_empty() {
+        headers = rows.remove(0);
+    }
+    let cols = headers
+        .len()
+        .max(rows.iter().map(Vec::len).max().unwrap_or(0))
+        .max(1);
+    alignments.resize(cols, Align::Left);
+    headers.resize_with(cols, Vec::new);
+    for row in &mut rows {
+        row.resize_with(cols, Vec::new);
+    }
+    Some(Block::Table {
+        alignments,
+        headers,
+        rows,
+        source_line,
+    })
+}
+
+fn parse_html_list(
+    open_tag: &str,
+    inner: &str,
+    ordered: bool,
+    source_line: usize,
+    ctx: &mut ParseCtx,
+    depth: usize,
+) -> Option<Block> {
+    let li_elems = extract_html_elements(inner, &["li"]);
+    if li_elems.is_empty() {
+        return None;
+    }
+    let start = if ordered {
+        extract_html_attr(open_tag, "start")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1)
+    } else {
+        1
+    };
+    let mut items = Vec::with_capacity(li_elems.len());
+    for (_, _, raw_item) in li_elems {
+        let mut body = raw_item.trim().to_string();
+        let mut checked = None;
+        let lower_body = body.to_ascii_lowercase();
+        if lower_body.starts_with("<input")
+            && let Some(gt) = body.find('>')
+        {
+            let tag = &body[..=gt];
+            if tag.to_ascii_lowercase().contains("checkbox") {
+                checked = Some(tag.to_ascii_lowercase().contains("checked"));
+                body = body[gt + 1..].trim_start().to_string();
+            }
+        }
+        let blocks = if body.contains('\n') || is_html_block_start(body.trim_start()) {
+            parse_nested_html_blocks(&body, source_line, ctx, depth)
+        } else {
+            vec![Block::Paragraph {
+                inlines: parse_inlines(&body, ctx),
+                align: None,
+            }]
+        };
+        items.push(ListItem {
+            checked,
+            checkbox_byte: None,
+            blocks,
+        });
+    }
+    Some(Block::List {
+        ordered,
+        start,
+        tight: true,
+        items,
+    })
+}
+
+fn parse_html_dl(inner: &str, source_line: usize, ctx: &mut ParseCtx, depth: usize) -> Option<Block> {
+    let elems = extract_html_elements(inner, &["dt", "dd"]);
+    if elems.is_empty() {
+        return None;
+    }
+    let mut items: Vec<DefItem> = Vec::new();
+    for (tag, _, body) in elems {
+        if tag == "dt" {
+            items.push(DefItem {
+                term: parse_inlines(body.trim(), ctx),
+                definitions: Vec::new(),
+            });
+        } else if tag == "dd" {
+            let def_blocks = parse_nested_html_blocks(body.trim(), source_line, ctx, depth);
+            if let Some(last) = items.last_mut() {
+                last.definitions.push(def_blocks);
+            } else {
+                items.push(DefItem {
+                    term: Vec::new(),
+                    definitions: vec![def_blocks],
+                });
+            }
+        }
+    }
+    (!items.is_empty()).then_some(Block::DefinitionList { items })
+}
+
 fn try_parse_html_block(
     lines: &[Line<'_>],
     start: usize,
     ctx: &mut ParseCtx,
-) -> Option<(Block, usize)> {
+    depth: usize,
+) -> Option<(Option<Block>, usize)> {
     let source_line = lines[start].line_no;
     let raw = lines[start].text.trim();
     let lower = raw.to_ascii_lowercase();
 
-    if lower == "<hr>" || lower == "<hr/>" || lower == "<hr />" {
-        return Some((Block::ThematicBreak, start + 1));
+    // Document wrappers & non-visual web metadata: unwrap or skip cleanly.
+    if lower.starts_with("<!doctype")
+        || starts_with_html_tag(&lower, "html")
+        || lower.starts_with("</html>")
+        || starts_with_html_tag(&lower, "body")
+        || lower.starts_with("</body>")
+        || starts_with_html_tag(&lower, "meta")
+        || starts_with_html_tag(&lower, "link")
+    {
+        return Some((None, start + 1));
     }
 
-    // Single-line `<p align="center">...</p>` or `<div align="center">...</div>`
-    for tag in ["p", "div"] {
-        let open_prefix = format!("<{tag}");
-        let close_tag = format!("</{tag}>");
-        if lower.starts_with(&open_prefix)
-            && let Some(gt) = raw.find('>')
-        {
-            let attrs = &lower[..gt];
-            let align = if attrs.contains("center") {
-                Some(Align::Center)
-            } else if attrs.contains("right") {
-                Some(Align::Right)
-            } else if attrs.contains("left") {
-                Some(Align::Left)
-            } else {
-                None
-            };
-            if let Some(close_pos) = lower.rfind(&close_tag)
-                && close_pos > gt
-            {
-                let inner = raw[gt + 1..close_pos].trim();
-                let inlines = parse_inlines(inner, ctx);
-                return Some((Block::Paragraph { inlines, align }, start + 1));
+    // Strip `<style>`, `<script>`, `<head>` blocks completely so raw CSS/JS never leaks into preview.
+    for skip_tag in ["style", "script", "head"] {
+        if starts_with_html_tag(&lower, skip_tag) {
+            if let Some((_, _, next_i)) = collect_balanced_html_block(lines, start, skip_tag) {
+                return Some((None, next_i));
             }
-            // Multi-line `<div align="center"> ... </div>`
-            let mut j = start + 1;
-            let mut inner_parts = Vec::new();
-            let tail = raw[gt + 1..].trim();
-            if !tail.is_empty() {
-                inner_parts.push(tail);
-            }
-            while j < lines.len() {
-                let t = lines[j].text.trim();
-                if let Some(pos) = t.to_ascii_lowercase().find(&close_tag) {
-                    let before = t[..pos].trim();
-                    if !before.is_empty() {
-                        inner_parts.push(before);
-                    }
-                    let joined = inner_parts.join(" ");
-                    let inlines = parse_inlines(&joined, ctx);
-                    return Some((Block::Paragraph { inlines, align }, j + 1));
-                }
-                if !t.is_empty() {
-                    inner_parts.push(t);
-                }
-                j += 1;
-            }
+            return Some((None, start + 1));
         }
     }
 
-    // Single-line `<img ...>`
-    if lower.starts_with("<img ")
-        && let Some(img) = parse_html_img_tag(raw)
-    {
+    // `<hr>` / `<hr ... />`
+    if starts_with_html_tag(&lower, "hr") {
+        return Some((Some(Block::ThematicBreak), start + 1));
+    }
+
+    // `<br>` / `<br/>`
+    if starts_with_html_tag(&lower, "br") && raw.ends_with('>') && !raw[1..].contains('<') {
         return Some((
-            Block::Paragraph {
-                inlines: vec![img],
+            Some(Block::Paragraph {
+                inlines: vec![Inline::HardBreak],
                 align: None,
-            },
+            }),
             start + 1,
         ));
     }
 
-    // Single-line `<h1>..</h1>` .. `<h6>..</h6>`
-    for lvl in 1u8..=6 {
-        let open = format!("<h{lvl}");
-        let close = format!("</h{lvl}>");
-        if lower.starts_with(&open)
-            && let Some(gt) = raw.find('>')
-            && let Some(end) = lower.rfind(&close)
-            && end > gt
+    // `<table>...</table>` -> native Table
+    if starts_with_html_tag(&lower, "table")
+        && let Some((_, inner, next_i)) = collect_balanced_html_block(lines, start, "table")
+        && let Some(table) = parse_html_table(&inner, source_line, ctx)
+    {
+        return Some((Some(table), next_i));
+    }
+
+    // `<ul>...</ul>` / `<ol>...</ol>` -> native List
+    for (tag, ordered) in [("ul", false), ("ol", true)] {
+        if starts_with_html_tag(&lower, tag)
+            && let Some((open_tag, inner, next_i)) = collect_balanced_html_block(lines, start, tag)
+            && let Some(list) = parse_html_list(&open_tag, &inner, ordered, source_line, ctx, depth)
         {
-            let inner = raw[gt + 1..end].trim();
-            let inlines = parse_inlines(inner, ctx);
-            let slug = ctx.register_heading(&inlines);
+            return Some((Some(list), next_i));
+        }
+    }
+
+    // `<dl>...</dl>` -> DefinitionList
+    if starts_with_html_tag(&lower, "dl")
+        && let Some((_, inner, next_i)) = collect_balanced_html_block(lines, start, "dl")
+        && let Some(dl) = parse_html_dl(&inner, source_line, ctx, depth)
+    {
+        return Some((Some(dl), next_i));
+    }
+
+    // `<blockquote>...</blockquote>` -> Blockquote
+    if starts_with_html_tag(&lower, "blockquote")
+        && let Some((_, inner, next_i)) = collect_balanced_html_block(lines, start, "blockquote")
+    {
+        let blocks = parse_nested_html_blocks(&inner, source_line, ctx, depth);
+        return Some((
+            Some(Block::Blockquote {
+                callout: None,
+                blocks,
+            }),
+            next_i,
+        ));
+    }
+
+    // `<pre>...</pre>` (with optional nested `<code class="language-...">`) -> CodeBlock
+    if starts_with_html_tag(&lower, "pre")
+        && let Some((open_tag, mut inner, next_i)) = collect_balanced_html_block(lines, start, "pre")
+    {
+        let mut lang = extract_html_attr(&open_tag, "data-lang").unwrap_or_default();
+        let trimmed_inner = inner.trim();
+        let inner_lower = trimmed_inner.to_ascii_lowercase();
+        if starts_with_html_tag(&inner_lower, "code")
+            && let Some(gt) = trimmed_inner.find('>')
+        {
+            let code_open = &trimmed_inner[..=gt];
+            if lang.is_empty()
+                && let Some(cls) = extract_html_attr(code_open, "class")
+            {
+                for tok in cls.split_whitespace() {
+                    if let Some(l) = tok
+                        .strip_prefix("language-")
+                        .or_else(|| tok.strip_prefix("lang-"))
+                    {
+                        lang = l.to_string();
+                        break;
+                    }
+                }
+            }
+            let after = &trimmed_inner[gt + 1..];
+            if let Some(close_rel) = find_balanced_close(after, "code") {
+                inner = after[..close_rel].to_string();
+            }
+        }
+        let code = decode_html_entities_str(inner.trim_matches('\n'));
+        let spans = highlight_code_block(&lang, &code);
+        return Some((
+            Some(Block::CodeBlock {
+                lang,
+                meta: String::new(),
+                code,
+                spans,
+                source_line,
+            }),
+            next_i,
+        ));
+    }
+
+    // `<figure>...</figure>` with optional `<figcaption>`
+    if starts_with_html_tag(&lower, "figure")
+        && let Some((open_tag, inner, next_i)) = collect_balanced_html_block(lines, start, "figure")
+    {
+        let align = extract_align(&open_tag).or(Some(Align::Center));
+        let mut caption: Option<Vec<Inline>> = None;
+        let mut body = inner.clone();
+        let lower_in = inner.to_ascii_lowercase();
+        if let Some(cap_start) = lower_in.find("<figcaption")
+            && let Some(gt_rel) = inner[cap_start..].find('>')
+        {
+            let after_start = cap_start + gt_rel + 1;
+            if let Some(close_rel) = find_balanced_close(&inner[after_start..], "figcaption") {
+                let cap_text = inner[after_start..after_start + close_rel].trim();
+                caption = Some(parse_inlines(cap_text, ctx));
+                let after_close = &inner[after_start + close_rel..];
+                let close_end = after_close
+                    .find('>')
+                    .map(|g| after_start + close_rel + g + 1)
+                    .unwrap_or(inner.len());
+                body = format!("{}{}", &inner[..cap_start], &inner[close_end..]);
+            }
+        }
+        let blocks = parse_nested_html_blocks(&body, source_line, ctx, depth);
+        return Some((
+            Some(Block::Container {
+                align,
+                blocks,
+                caption,
+            }),
+            next_i,
+        ));
+    }
+
+    // `<picture>...</picture>` -> extract inner `<img>`
+    if starts_with_html_tag(&lower, "picture")
+        && let Some((_, inner, next_i)) = collect_balanced_html_block(lines, start, "picture")
+    {
+        let inlines = parse_inlines(&inner, ctx);
+        if !inlines.is_empty() {
             return Some((
-                Block::Heading {
-                    level: lvl,
-                    slug,
+                Some(Block::Paragraph {
                     inlines,
-                    source_line,
-                },
-                start + 1,
+                    align: None,
+                }),
+                next_i,
+            ));
+        }
+        return Some((None, next_i));
+    }
+
+    // Container blocks: `<div>`, `<center>`, `<section>`, `<article>`, `<header>`, `<footer>`, `<main>`, `<nav>`, `<aside>`
+    for tag in [
+        "div", "center", "section", "article", "header", "footer", "main", "nav", "aside",
+    ] {
+        if starts_with_html_tag(&lower, tag)
+            && let Some((open_tag, inner, next_i)) = collect_balanced_html_block(lines, start, tag)
+        {
+            let align = if tag == "center" {
+                Some(Align::Center)
+            } else {
+                extract_align(&open_tag)
+            };
+            let mut blocks = parse_nested_html_blocks(&inner, source_line, ctx, depth);
+            if blocks.is_empty() {
+                return Some((None, next_i));
+            }
+            if blocks.len() == 1
+                && matches!(blocks.first(), Some(Block::Paragraph { .. }))
+                && let Some(Block::Paragraph {
+                    inlines,
+                    align: p_align,
+                }) = blocks.pop()
+            {
+                return Some((
+                    Some(Block::Paragraph {
+                        inlines,
+                        align: p_align.or(align),
+                    }),
+                    next_i,
+                ));
+            }
+            return Some((
+                Some(Block::Container {
+                    align,
+                    blocks,
+                    caption: None,
+                }),
+                next_i,
             ));
         }
     }
 
-    // Single-line `<br>` / `<br/>` -> blank break
-    if lower == "<br>" || lower == "<br/>" || lower == "<br />" {
+    // `<p ...>...</p>` (single-line or multi-line)
+    if starts_with_html_tag(&lower, "p")
+        && let Some((open_tag, inner, next_i)) = collect_balanced_html_block(lines, start, "p")
+    {
+        let align = extract_align(&open_tag);
+        let joined = inner
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let inlines = parse_inlines(&joined, ctx);
+        return Some((Some(Block::Paragraph { inlines, align }), next_i));
+    }
+
+    // `<h1>..</h1>` .. `<h6>..</h6>` (single-line or multi-line, with optional align & id)
+    for lvl in 1u8..=6 {
+        let tag = match lvl {
+            1 => "h1",
+            2 => "h2",
+            3 => "h3",
+            4 => "h4",
+            5 => "h5",
+            _ => "h6",
+        };
+        if starts_with_html_tag(&lower, tag)
+            && let Some((open_tag, inner, next_i)) = collect_balanced_html_block(lines, start, tag)
+        {
+            let align = extract_align(&open_tag);
+            let inlines = parse_inlines(inner.trim(), ctx);
+            let slug = extract_html_attr(&open_tag, "id")
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| ctx.register_heading(&inlines));
+            return Some((
+                Some(Block::Heading {
+                    level: lvl,
+                    slug,
+                    inlines,
+                    source_line,
+                    align,
+                }),
+                next_i,
+            ));
+        }
+    }
+
+    // Multi-line `<a href="...">\n  <img ... />\n</a>` block (e.g. contributor graphs / banners)
+    if starts_with_html_tag(&lower, "a")
+        && !lower.contains("</a>")
+        && let Some((open_tag, inner, next_i)) = collect_balanced_html_block(lines, start, "a")
+    {
+        let href = extract_html_attr(&open_tag, "href")
+            .map(|h| decode_html_entities_str(&h))
+            .unwrap_or_default();
+        let title = extract_html_attr(&open_tag, "title").map(|t| decode_html_entities_str(&t));
+        let collapsed = inner
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let children = parse_inlines(&collapsed, ctx);
+        if href.is_empty() && children.is_empty() {
+            return Some((None, next_i));
+        }
+        let inlines = if href.is_empty() {
+            children
+        } else {
+            vec![Inline::Link {
+                text: children,
+                url: href,
+                title,
+            }]
+        };
         return Some((
-            Block::Paragraph {
-                inlines: vec![Inline::HardBreak],
+            Some(Block::Paragraph {
+                inlines,
                 align: None,
-            },
+            }),
+            next_i,
+        ));
+    }
+
+    // Single-line `<img ...>`
+    if starts_with_html_tag(&lower, "img")
+        && raw.ends_with('>')
+        && !raw[1..].contains('<')
+        && let Some(img) = parse_html_img_tag(raw)
+    {
+        return Some((
+            Some(Block::Paragraph {
+                inlines: vec![img],
+                align: None,
+            }),
             start + 1,
         ));
     }
 
-    // Multi-line or single-line raw HTML block fallback
-    if lower.starts_with("<table")
-        || lower.starts_with("<pre")
-        || lower.starts_with("<blockquote")
-        || lower.starts_with("<style")
-        || lower.starts_with("<script")
-    {
-        let mut collected = vec![lines[start].text];
-        let mut j = start + 1;
-        while j < lines.len() && !lines[j].text.trim().is_empty() {
-            collected.push(lines[j].text);
-            j += 1;
+    // Embedded raw web widgets (`<svg>`, `<iframe>`, `<video>`, `<audio>`, `<form>`) preserved
+    // cleanly as `HtmlBlock` (rendered as code preview in-app and verbatim in browser HTML export).
+    for raw_tag in ["svg", "iframe", "video", "audio", "canvas", "form"] {
+        if starts_with_html_tag(&lower, raw_tag)
+            && let Some((open_tag, inner, next_i)) = collect_balanced_html_block(lines, start, raw_tag)
+        {
+            let html = if open_tag.trim_end().ends_with("/>") {
+                open_tag
+            } else {
+                format!("{open_tag}{inner}</{raw_tag}>")
+            };
+            return Some((Some(Block::HtmlBlock { html }), next_i));
         }
-        return Some((
-            Block::HtmlBlock {
-                html: collected.join("\n"),
-            },
-            j,
-        ));
     }
 
     None
@@ -1313,6 +2028,7 @@ fn is_paragraph_interrupt(line: &str) -> bool {
         || trimmed.starts_with("$$")
         || is_thematic_break(trimmed)
         || parse_list_marker(line, 0).is_some()
+        || is_html_block_start(trimmed)
 }
 
 fn parse_table_delimiter(line: &str) -> Option<Vec<Align>> {
@@ -2036,6 +2752,13 @@ fn parse_angle_or_html(
     ctx: &mut ParseCtx,
     depth: usize,
 ) -> Option<(Option<Inline>, usize)> {
+    // Inline HTML comments `<!-- ... -->`
+    if input[start..].starts_with("<!--")
+        && let Some(end_rel) = input[start + 4..].find("-->")
+    {
+        return Some((None, start + 4 + end_rel + 3));
+    }
+
     let rest = &input[start + 1..];
     let gt_rel = rest.find('>')?;
     let tag_inner = &rest[..gt_rel];
@@ -2072,18 +2795,37 @@ fn parse_angle_or_html(
 
     let tag_trim = tag_inner.trim();
     let tag_lower = tag_trim.to_ascii_lowercase();
-    if tag_lower == "br" || tag_lower == "br/" || tag_lower == "br /" {
+    if tag_lower == "br"
+        || tag_lower == "br/"
+        || tag_lower == "br /"
+        || tag_lower.starts_with("br ")
+    {
         return Some((Some(Inline::HardBreak), tag_end));
     }
+    if tag_lower == "wbr"
+        || tag_lower == "wbr/"
+        || tag_lower.starts_with("source ")
+        || tag_lower.starts_with("source\t")
+    {
+        return Some((None, tag_end));
+    }
     if (tag_lower.starts_with("img ") || tag_lower.starts_with("img\t"))
-        && let Some(img) = parse_html_img_tag(&input[start..tag_end]) {
-            return Some((Some(img), tag_end));
-        }
+        && let Some(img) = parse_html_img_tag(&input[start..tag_end])
+    {
+        return Some((Some(img), tag_end));
+    }
 
-    let tag_name = tag_lower
-        .split([' ', '\t', '/'])
-        .next()
-        .unwrap_or("");
+    let tag_name = tag_lower.split([' ', '\t', '/']).next().unwrap_or("");
+    if matches!(tag_name, "style" | "script") {
+        let after = &input[tag_end..];
+        if let Some(close_rel) = find_balanced_close(after, tag_name)
+            && let Some(close_gt) = after[close_rel..].find('>')
+        {
+            return Some((None, tag_end + close_rel + close_gt + 1));
+        }
+        return Some((None, tag_end));
+    }
+
     if matches!(
         tag_name,
         "b" | "strong"
@@ -2095,23 +2837,39 @@ fn parse_angle_or_html(
             | "del"
             | "strike"
             | "code"
+            | "samp"
             | "kbd"
             | "mark"
             | "sup"
             | "sub"
             | "a"
             | "span"
+            | "font"
+            | "small"
+            | "big"
+            | "abbr"
+            | "cite"
+            | "q"
+            | "var"
     ) {
-        let close_needle = format!("</{tag_name}>");
         let after = &input[tag_end..];
-        if let Some(close_rel) = after.to_ascii_lowercase().find(&close_needle) {
+        if let Some(close_rel) = find_balanced_close(after, tag_name)
+            && let Some(close_gt) = after[close_rel..].find('>')
+        {
             let inner = &after[..close_rel];
-            let end = tag_end + close_rel + close_needle.len();
+            let end = tag_end + close_rel + close_gt + 1;
+            let open_tag = &input[start..tag_end];
+            if tag_name == "a" && inner.trim().is_empty() && extract_html_attr(open_tag, "href").is_none()
+            {
+                return Some((None, end));
+            }
             let node = match tag_name {
-                "code" => Inline::Code(inner.to_string()),
-                "kbd" => Inline::Kbd(inner.trim().to_string()),
+                "code" | "samp" => Inline::Code(decode_html_entities_str(inner)),
+                "kbd" => Inline::Kbd(decode_html_entities_str(inner.trim())),
                 "b" | "strong" => Inline::Strong(parse_inlines_depth(inner, ctx, depth + 1)),
-                "i" | "em" => Inline::Emphasis(parse_inlines_depth(inner, ctx, depth + 1)),
+                "i" | "em" | "cite" | "var" => {
+                    Inline::Emphasis(parse_inlines_depth(inner, ctx, depth + 1))
+                }
                 "u" | "ins" => Inline::Underline(parse_inlines_depth(inner, ctx, depth + 1)),
                 "s" | "del" | "strike" => {
                     Inline::Strikethrough(parse_inlines_depth(inner, ctx, depth + 1))
@@ -2119,12 +2877,108 @@ fn parse_angle_or_html(
                 "mark" => Inline::Highlight(parse_inlines_depth(inner, ctx, depth + 1)),
                 "sup" => Inline::Superscript(parse_inlines_depth(inner, ctx, depth + 1)),
                 "sub" => Inline::Subscript(parse_inlines_depth(inner, ctx, depth + 1)),
+                "q" => {
+                    let mut children = vec![Inline::Text("“".to_string())];
+                    children.extend(parse_inlines_depth(inner, ctx, depth + 1));
+                    children.push(Inline::Text("”".to_string()));
+                    Inline::Emphasis(children)
+                }
+                "small" => Inline::Styled {
+                    children: parse_inlines_depth(inner, ctx, depth + 1),
+                    color: None,
+                    bg: None,
+                    scale: Some(0.84),
+                    bold: false,
+                    italic: false,
+                    underline: false,
+                    strike: false,
+                    title: extract_html_attr(open_tag, "title"),
+                },
+                "big" => Inline::Styled {
+                    children: parse_inlines_depth(inner, ctx, depth + 1),
+                    color: None,
+                    bg: None,
+                    scale: Some(1.18),
+                    bold: false,
+                    italic: false,
+                    underline: false,
+                    strike: false,
+                    title: extract_html_attr(open_tag, "title"),
+                },
+                "abbr" => Inline::Styled {
+                    children: parse_inlines_depth(inner, ctx, depth + 1),
+                    color: None,
+                    bg: None,
+                    scale: None,
+                    bold: false,
+                    italic: false,
+                    underline: true,
+                    strike: false,
+                    title: extract_html_attr(open_tag, "title"),
+                },
                 "a" => {
-                    let href = extract_html_attr(tag_trim, "href").unwrap_or_default();
-                    let title = extract_html_attr(tag_trim, "title");
+                    let href = extract_html_attr(open_tag, "href").unwrap_or_default();
+                    let title = extract_html_attr(open_tag, "title");
                     Inline::Link {
                         text: parse_inlines_depth(inner, ctx, depth + 1),
-                        url: href,
+                        url: decode_html_entities_str(&href),
+                        title,
+                    }
+                }
+                "span" | "font" => {
+                    let children = parse_inlines_depth(inner, ctx, depth + 1);
+                    let style_str = extract_html_attr(open_tag, "style").unwrap_or_default();
+                    let color = extract_style_prop(&style_str, "color")
+                        .or_else(|| extract_html_attr(open_tag, "color"))
+                        .and_then(|c| parse_css_color(&c));
+                    let bg = extract_style_prop(&style_str, "background-color")
+                        .or_else(|| extract_style_prop(&style_str, "background"))
+                        .and_then(|c| parse_css_color(&c));
+                    let bold = extract_style_prop(&style_str, "font-weight").is_some_and(|w| {
+                        let wl = w.to_ascii_lowercase();
+                        wl == "bold"
+                            || wl == "bolder"
+                            || wl.parse::<u16>().is_ok_and(|n| n >= 600)
+                    });
+                    let italic = extract_style_prop(&style_str, "font-style")
+                        .is_some_and(|s| s.eq_ignore_ascii_case("italic") || s.eq_ignore_ascii_case("oblique"));
+                    let deco = extract_style_prop(&style_str, "text-decoration")
+                        .unwrap_or_default()
+                        .to_ascii_lowercase();
+                    let underline = deco.contains("underline");
+                    let strike = deco.contains("line-through");
+                    let scale = extract_style_prop(&style_str, "font-size")
+                        .and_then(|fs| {
+                            let fsl = fs.trim().to_ascii_lowercase();
+                            if let Some(pct) = fsl.strip_suffix('%') {
+                                pct.trim().parse::<f32>().ok().map(|p| (p / 100.0).clamp(0.7, 2.0))
+                            } else if let Some(em) = fsl.strip_suffix("em").or_else(|| fsl.strip_suffix("rem")) {
+                                em.trim().parse::<f32>().ok().map(|v| v.clamp(0.7, 2.0))
+                            } else if let Some(px) = fsl.strip_suffix("px") {
+                                px.trim().parse::<f32>().ok().map(|p| (p / 14.0).clamp(0.7, 2.0))
+                            } else {
+                                None
+                            }
+                        })
+                        .or_else(|| {
+                            extract_html_attr(open_tag, "size").and_then(|s| match s.trim() {
+                                "1" | "2" => Some(0.85),
+                                "4" => Some(1.15),
+                                "5" => Some(1.35),
+                                "6" | "7" => Some(1.6),
+                                _ => None,
+                            })
+                        });
+                    let title = extract_html_attr(open_tag, "title");
+                    Inline::Styled {
+                        children,
+                        color,
+                        bg,
+                        scale,
+                        bold,
+                        italic,
+                        underline,
+                        strike,
                         title,
                     }
                 }
@@ -2142,16 +2996,22 @@ fn parse_angle_or_html(
 }
 
 fn parse_html_img_tag(tag: &str) -> Option<Inline> {
-    let url = extract_html_attr(tag, "src")?;
-    let alt = extract_html_attr(tag, "alt").unwrap_or_default();
-    let title = extract_html_attr(tag, "title");
-    let width = extract_html_attr(tag, "width").and_then(|w| {
-        w.trim_end_matches("px")
-            .trim()
-            .parse::<f32>()
-            .ok()
-            .filter(|v| *v > 0.0)
-    });
+    let url = decode_html_entities_str(&extract_html_attr(tag, "src")?);
+    let alt = extract_html_attr(tag, "alt")
+        .map(|s| decode_html_entities_str(&s))
+        .unwrap_or_default();
+    let title = extract_html_attr(tag, "title").map(|s| decode_html_entities_str(&s));
+    let width = extract_html_attr(tag, "width")
+        .or_else(|| {
+            extract_html_attr(tag, "style").and_then(|st| extract_style_prop(&st, "width"))
+        })
+        .and_then(|w| {
+            w.trim_end_matches("px")
+                .trim()
+                .parse::<f32>()
+                .ok()
+                .filter(|v| *v > 0.0)
+        });
     Some(Inline::Image {
         alt,
         url,
@@ -2221,6 +3081,23 @@ fn decode_entity(input: &str, amp: usize) -> Option<(String, usize)> {
             "ge" => "≥",
             "middot" => "·",
             "bull" => "•",
+            "ensp" => "\u{2002}",
+            "emsp" => "\u{2003}",
+            "lsquo" => "‘",
+            "rsquo" => "’",
+            "ldquo" => "“",
+            "rdquo" => "”",
+            "laquo" => "«",
+            "raquo" => "»",
+            "check" => "✓",
+            "cross" => "✗",
+            "hearts" => "♥",
+            "spades" => "♠",
+            "clubs" => "♣",
+            "diams" => "♦",
+            "deg" => "°",
+            "sect" => "§",
+            "para" => "¶",
             _ => return None,
         }
         .to_string()
@@ -2328,7 +3205,8 @@ pub fn plain_text_of_inlines(inlines: &[Inline]) -> String {
             | Inline::Underline(c)
             | Inline::Superscript(c)
             | Inline::Subscript(c)
-            | Inline::Link { text: c, .. } => out.push_str(&plain_text_of_inlines(c)),
+            | Inline::Link { text: c, .. }
+            | Inline::Styled { children: c, .. } => out.push_str(&plain_text_of_inlines(c)),
             Inline::Image { alt, .. } => out.push_str(alt),
             Inline::FootnoteRef { number, .. } => out.push_str(&format!("[{number}]")),
         }
@@ -2550,5 +3428,87 @@ Term
         } else {
             panic!("expected paragraph");
         }
+    }
+
+    #[test]
+    fn parses_web_html_blocks_styles_and_exports_html() {
+        let md = r#"<!DOCTYPE html>
+<style>.hidden { display: none; }</style>
+<script>alert('xss')</script>
+<div align="center">
+  <h1 id="hero">Kestrel Web</h1>
+  <p><span style="color: #2563eb; font-weight: bold;">高速</span> <font color="orange">编辑器</font> <abbr title="HyperText Markup Language">HTML</abbr></p>
+</div>
+
+<table>
+  <thead>
+    <tr><th align="left">模块</th><th align="center">状态</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>渲染器</td><td><b>就绪</b></td></tr>
+  </tbody>
+</table>
+
+<ul>
+  <li>第一项</li>
+  <li><input type="checkbox" checked> 已完成任务</li>
+</ul>
+
+<pre><code class="language-rust">fn main() { println!("&lt;ok&gt;"); }</code></pre>
+
+<figure>
+  <img src="demo.png" alt="示例图" width="320" />
+  <figcaption>图 1：网页格式渲染</figcaption>
+</figure>
+"#;
+        let doc = parse(md);
+        // style/script/doctype stripped cleanly; remaining 5 rich semantic blocks:
+        assert_eq!(doc.blocks.len(), 5, "blocks: {:?}", doc.blocks);
+        assert!(matches!(
+            &doc.blocks[0],
+            Block::Container {
+                align: Some(Align::Center),
+                blocks,
+                caption: None,
+            } if blocks.len() == 2
+        ));
+        assert!(matches!(
+            &doc.blocks[1],
+            Block::Table {
+                alignments,
+                headers,
+                rows,
+                ..
+            } if alignments == &[Align::Left, Align::Center]
+                && headers.len() == 2
+                && rows.len() == 1
+        ));
+        assert!(matches!(
+            &doc.blocks[2],
+            Block::List {
+                ordered: false,
+                items,
+                ..
+            } if items.len() == 2 && items[1].checked == Some(true)
+        ));
+        assert!(matches!(
+            &doc.blocks[3],
+            Block::CodeBlock { lang, code, .. } if lang == "rust" && code.contains("<ok>")
+        ));
+        assert!(matches!(
+            &doc.blocks[4],
+            Block::Container {
+                align: Some(Align::Center),
+                caption: Some(_),
+                ..
+            }
+        ));
+
+        let html = crate::markdown::export_html::render_doc_to_html("测试", &doc, true, None);
+        assert!(html.contains("<!DOCTYPE html>"));
+        assert!(html.contains("id=\"hero\""));
+        assert!(html.contains("color:#2563eb"));
+        assert!(html.contains("<figcaption>图 1：网页格式渲染</figcaption>"));
+        assert!(!html.contains("alert('xss')"));
     }
 }

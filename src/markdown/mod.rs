@@ -1,7 +1,10 @@
 //! Complete CommonMark + GFM + Extended Markdown parser and rich egui renderer.
 
+pub mod export_html;
+pub mod net_img;
 pub mod parser;
 pub mod render;
+pub mod svg;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -114,10 +117,18 @@ pub enum Block {
         slug: String,
         inlines: Vec<Inline>,
         source_line: usize,
+        align: Option<Align>,
     },
     Paragraph {
         inlines: Vec<Inline>,
         align: Option<Align>,
+    },
+    /// HTML layout container (`<div>`, `<center>`, `<section>`, `<figure>`, etc.)
+    /// carrying alignment and optional `<figcaption>` across nested blocks.
+    Container {
+        align: Option<Align>,
+        blocks: Vec<Block>,
+        caption: Option<Vec<Inline>>,
     },
     CodeBlock {
         lang: String,
@@ -191,6 +202,18 @@ pub enum Inline {
         id: String,
         number: usize,
     },
+    /// Web/HTML inline styling (`<span style="...">`, `<font>`, `<small>`, `<abbr>`, etc.).
+    Styled {
+        children: Vec<Inline>,
+        color: Option<egui::Color32>,
+        bg: Option<egui::Color32>,
+        scale: Option<f32>,
+        bold: bool,
+        italic: bool,
+        underline: bool,
+        strike: bool,
+        title: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, Default)]
@@ -204,6 +227,10 @@ pub enum CachedImage {
     Loaded {
         texture: egui::TextureHandle,
         size: [usize; 2],
+        modified: Option<SystemTime>,
+    },
+    Svg {
+        cache: svg::SvgRenderCache,
         modified: Option<SystemTime>,
     },
     Failed(String),
@@ -227,6 +254,7 @@ pub struct MarkdownPreviewState {
     /// First paint of split mode should align the preview with the source scroll.
     pub split_synced: bool,
     pub textures: HashMap<String, CachedImage>,
+    pub remote_images: net_img::RemoteImageQueue,
 }
 
 impl MarkdownPreviewState {
@@ -254,5 +282,8 @@ pub enum PreviewEvent {
         anchor: Option<String>,
     },
     CopyText(String),
+    CopySource,
+    SwitchMode(MarkdownViewMode),
+    OpenInBrowser,
     JumpSourceLine(usize),
 }

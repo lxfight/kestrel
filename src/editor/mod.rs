@@ -2953,6 +2953,7 @@ fn return_quote_pair(ch: char) -> &'static str {
 pub enum EditorEvent {
     Zoom(i32),
     GotoDefinition(String),
+    OpenPalette,
 }
 
 #[cfg(test)]
