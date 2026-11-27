@@ -244,6 +244,59 @@ pub fn preview_ui(
     events
 }
 
+/// Render Markdown blocks inline inside an existing container (such as a plugin
+/// view or chat bubble) without painting a full-page backdrop or outer ScrollArea.
+pub fn embedded_ui(
+    ui: &mut Ui,
+    style: &UiStyle,
+    state: &mut MarkdownPreviewState,
+    version: u64,
+    text: &str,
+    workspace_root: Option<&Path>,
+    base_font_size: f32,
+) -> Vec<PreviewEvent> {
+    state.ensure_parsed(version, text);
+    for done in state.remote_images.drain() {
+        let entry = match done.result {
+            Ok(crate::markdown::net_img::DecodedImage::Raster { image, size }) => {
+                let texture = ui.ctx().load_texture(
+                    format!("md_net:{}", done.url),
+                    image,
+                    TextureOptions::LINEAR,
+                );
+                CachedImage::Loaded {
+                    texture,
+                    size,
+                    modified: None,
+                }
+            }
+            Ok(crate::markdown::net_img::DecodedImage::Svg(graphic)) => CachedImage::Svg {
+                cache: crate::markdown::svg::SvgRenderCache::new(ui.ctx(), &done.url, graphic),
+                modified: None,
+            },
+            Err(err) => CachedImage::Failed(err),
+        };
+        state.textures.insert(done.url, entry);
+    }
+    let mut events = Vec::new();
+    let doc = std::sync::Arc::clone(&state.doc);
+    let content_w = ui.available_width().max(120.0);
+    let origin_y = ui.cursor().top();
+    let mut rctx = RenderContext {
+        style,
+        theme: style.theme,
+        base_size: base_font_size.clamp(11.0, 20.0),
+        doc_dir: workspace_root,
+        workspace_root,
+        state,
+        events: &mut events,
+        scroll_origin_y: origin_y,
+        inherited_align: None,
+    };
+    render_blocks(ui, &mut rctx, &doc.blocks, content_w, true);
+    events
+}
+
 fn render_front_matter(ui: &mut Ui, rctx: &mut RenderContext<'_>, fm: &FrontMatter, width: f32) {
     let theme = rctx.theme;
     let kind_label = match fm.kind {

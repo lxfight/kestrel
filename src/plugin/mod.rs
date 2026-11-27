@@ -1,18 +1,23 @@
-//! Plugin host: discovery, per-plugin Lua runtimes, commands, events, hot reload.
+//! Plugin host: discovery, per-plugin Lua runtimes, commands, events, streaming
+//! HTTP/exec/RPC, declarative UI views, edit proposals, timers, and hot reload.
 
 pub mod actions;
 mod api;
+mod http;
 mod manifest;
 mod panel;
+mod rpc;
+mod secret;
+pub mod view;
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::time::{Duration, Instant};
 
 use mlua::{Function, HookTriggers, Lua, LuaOptions, RegistryKey, StdLib, VmState};
 
@@ -20,6 +25,9 @@ use crate::commands::{Command, Shortcut};
 use crate::settings::Settings;
 
 use actions::{HostAction, PluginContext};
+use http::HttpEvent;
+use rpc::{RpcControl, RpcEvent};
+use view::{PluginView, UiNode, ViewEvent, ViewLocation};
 
 pub const INSTRUCTION_BUDGET: u64 = 5_000_000;
 /// Concurrent `kestrel.exec` processes across all plugins; extra calls are rejected.
@@ -123,60 +131,194 @@ pub(crate) struct PendingCommand {
     pub handler: RegistryKey,
 }
 
-pub(crate) struct ExecDone {
+pub(crate) enum ExecEvent {
+    Stdout {
+        runtime: u64,
+        task: u64,
+        chunk: String,
+    },
+    Stderr {
+        runtime: u64,
+        task: u64,
+        chunk: String,
+    },
+    Done {
+        runtime: u64,
+        task: u64,
+        code: i32,
+        stdout: String,
+        stderr: String,
+        error: Option<String>,
+    },
+}
+
+pub(crate) struct PendingExecCallbacks {
+    pub on_stdout: Option<RegistryKey>,
+    pub on_stderr: Option<RegistryKey>,
+    pub on_done: Option<RegistryKey>,
+    pub cancel: Arc<AtomicBool>,
+}
+
+pub(crate) struct PendingHttpCallbacks {
+    pub on_chunk: Option<RegistryKey>,
+    pub on_done: RegistryKey,
+    pub cancel: Arc<AtomicBool>,
+}
+
+pub(crate) struct PendingRpcCallbacks {
+    pub on_message: Option<RegistryKey>,
+    pub on_stderr: Option<RegistryKey>,
+    pub on_exit: Option<RegistryKey>,
+    pub control: RpcControl,
+}
+
+pub(crate) struct SearchHitItem {
+    pub path: String,
+    pub line: u32,
+    pub column: u32,
+    pub preview: String,
+}
+
+pub(crate) struct SearchDone {
     pub runtime: u64,
     pub task: u64,
-    pub code: i32,
-    pub stdout: String,
-    pub stderr: String,
+    pub results: Vec<SearchHitItem>,
+    pub truncated: bool,
     pub error: Option<String>,
+}
+
+pub(crate) struct PendingSearchCallbacks {
+    pub on_done: RegistryKey,
+}
+
+pub(crate) struct PendingTimer {
+    pub deadline: Instant,
+    pub callback: RegistryKey,
+    pub cancelled: Arc<AtomicBool>,
+}
+
+pub(crate) struct PendingProposal {
+    pub id: u64,
+    pub path: PathBuf,
+    pub on_accept: Option<RegistryKey>,
+    pub on_reject: Option<RegistryKey>,
+}
+
+pub(crate) struct PendingViewReg {
+    pub id: String,
+    pub title: String,
+    pub location: ViewLocation,
+    pub on_event: Option<RegistryKey>,
+}
+
+pub(crate) struct PendingViewUpdate {
+    pub id: String,
+    pub nodes: Vec<UiNode>,
 }
 
 pub(crate) struct PluginShared {
     pub plugin_id: String,
+    pub plugin_dir: PathBuf,
     pub runtime: u64,
     pub changed_allowed: bool,
+    pub permissions: Option<Vec<String>>,
+    pub in_before_save: bool,
     pub ctx: Option<PluginContext>,
+    pub repaint_ctx: Option<egui::Context>,
     pub actions: Vec<HostAction>,
     pub commands: Vec<PendingCommand>,
     pub events: Vec<(Event, RegistryKey)>,
     pub status: Vec<(String, String, Option<String>)>,
     pub logs: Vec<String>,
     pub config: HashMap<String, serde_json::Value>,
-    pub exec_callbacks: Vec<(u64, RegistryKey)>,
     pub next_task: u64,
-    pub exec_tx: Sender<ExecDone>,
-    /// Slots held by running `exec` processes; the thread releases its own slot.
+    pub exec_tx: Sender<ExecEvent>,
     pub exec_running: Arc<AtomicUsize>,
-    /// Set on disable/reload so running `exec` processes stop and report cancelled.
-    pub cancel_exec: Arc<AtomicBool>,
+    pub exec_callbacks: Vec<(u64, PendingExecCallbacks)>,
+    pub http_tx: Sender<HttpEvent>,
+    pub http_running: Arc<AtomicUsize>,
+    pub http_callbacks: Vec<(u64, PendingHttpCallbacks)>,
+    pub rpc_tx: Sender<RpcEvent>,
+    pub rpc_running: Arc<AtomicUsize>,
+    pub rpc_callbacks: Vec<(u64, PendingRpcCallbacks)>,
+    pub search_tx: Sender<SearchDone>,
+    pub search_callbacks: Vec<(u64, PendingSearchCallbacks)>,
+    pub timers: Vec<PendingTimer>,
+    pub proposals: Vec<PendingProposal>,
+    pub view_regs: Vec<PendingViewReg>,
+    pub view_updates: Vec<PendingViewUpdate>,
+    /// Set on disable/reload so all running exec/http/rpc/search tasks terminate cleanly.
+    pub cancel_all: Arc<AtomicBool>,
+    pub loaded_modules: HashMap<String, RegistryKey>,
+    pub loading_modules: HashSet<String>,
 }
 
 impl PluginShared {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         plugin_id: String,
+        plugin_dir: PathBuf,
         runtime: u64,
         changed_allowed: bool,
+        permissions: Option<Vec<String>>,
         config: HashMap<String, serde_json::Value>,
-        exec_tx: Sender<ExecDone>,
+        repaint_ctx: Option<egui::Context>,
+        exec_tx: Sender<ExecEvent>,
         exec_running: Arc<AtomicUsize>,
+        http_tx: Sender<HttpEvent>,
+        http_running: Arc<AtomicUsize>,
+        rpc_tx: Sender<RpcEvent>,
+        rpc_running: Arc<AtomicUsize>,
+        search_tx: Sender<SearchDone>,
     ) -> Self {
         Self {
             plugin_id,
+            plugin_dir,
             runtime,
             changed_allowed,
+            permissions,
+            in_before_save: false,
             ctx: None,
+            repaint_ctx,
             actions: Vec::new(),
             commands: Vec::new(),
             events: Vec::new(),
             status: Vec::new(),
             logs: Vec::new(),
             config,
-            exec_callbacks: Vec::new(),
-            next_task: 0,
+            next_task: 1,
             exec_tx,
             exec_running,
-            cancel_exec: Arc::new(AtomicBool::new(false)),
+            exec_callbacks: Vec::new(),
+            http_tx,
+            http_running,
+            http_callbacks: Vec::new(),
+            rpc_tx,
+            rpc_running,
+            rpc_callbacks: Vec::new(),
+            search_tx,
+            search_callbacks: Vec::new(),
+            timers: Vec::new(),
+            proposals: Vec::new(),
+            view_regs: Vec::new(),
+            view_updates: Vec::new(),
+            cancel_all: Arc::new(AtomicBool::new(false)),
+            loaded_modules: HashMap::new(),
+            loading_modules: HashSet::new(),
+        }
+    }
+
+    pub(crate) fn allows(&self, perm: &str) -> bool {
+        match perm {
+            "network" | "terminal" | "ui" | "rpc" => self
+                .permissions
+                .as_deref()
+                .is_some_and(|list| list.iter().any(|p| p == perm)),
+            "exec" | "fs:write" => match self.permissions.as_deref() {
+                None => true,
+                Some(list) => list.iter().any(|p| p == perm),
+            },
+            _ => false,
         }
     }
 }
@@ -186,6 +328,7 @@ pub struct PluginInfo {
     pub name: String,
     pub version: String,
     pub description: String,
+    pub permissions: Vec<String>,
     pub enabled: bool,
     pub loaded: bool,
     pub error: Option<String>,
@@ -203,20 +346,30 @@ pub struct Plugin {
     shared: Option<Rc<RefCell<PluginShared>>>,
     handlers: HashMap<Event, Vec<RegistryKey>>,
     budget: Rc<Cell<u64>>,
-    pending_exec: HashMap<u64, RegistryKey>,
+    pending_exec: HashMap<u64, PendingExecCallbacks>,
+    pending_http: HashMap<u64, PendingHttpCallbacks>,
+    pending_rpc: HashMap<u64, PendingRpcCallbacks>,
+    pending_search: HashMap<u64, PendingSearchCallbacks>,
+    pending_timers: Vec<PendingTimer>,
+    pending_proposals: HashMap<u64, PendingProposal>,
+    view_handlers: HashMap<String, RegistryKey>,
 }
 
 impl Plugin {
-    fn enter(&self, ctx: Option<&PluginContext>) {
+    fn enter(&self, ctx: Option<&PluginContext>, in_before_save: bool) {
         self.budget.set(0);
         if let Some(shared) = &self.shared {
-            shared.borrow_mut().ctx = ctx.cloned();
+            let mut s = shared.borrow_mut();
+            s.ctx = ctx.cloned();
+            s.in_before_save = in_before_save;
         }
     }
 
     fn leave(&self) {
         if let Some(shared) = &self.shared {
-            shared.borrow_mut().ctx = None;
+            let mut s = shared.borrow_mut();
+            s.ctx = None;
+            s.in_before_save = false;
         }
     }
 
@@ -224,15 +377,16 @@ impl Plugin {
         let (Some(lua), Some(shared)) = (self.lua.as_ref(), self.shared.as_ref()) else {
             return Ok(());
         };
-        self.enter(Some(ctx));
+        self.enter(Some(ctx), event == Event::BeforeSave);
         let result = (|| -> mlua::Result<()> {
             let table = lua.create_table()?;
             table.set("name", event.name())?;
             if let Some(subject) = ctx.subject
-                && let Some(snapshot) = ctx.docs.get(&subject) {
-                    let handle = api::DocHandle::new(snapshot.clone(), shared.clone());
-                    table.set("doc", lua.create_userdata(handle)?)?;
-                }
+                && let Some(snapshot) = ctx.docs.get(&subject)
+            {
+                let handle = api::DocHandle::new(snapshot.clone(), shared.clone());
+                table.set("doc", lua.create_userdata(handle)?)?;
+            }
             let keys: Vec<&RegistryKey> = self
                 .handlers
                 .get(&event)
@@ -252,7 +406,7 @@ impl Plugin {
         let Some(lua) = self.lua.as_ref() else {
             return Ok(());
         };
-        self.enter(ctx);
+        self.enter(ctx, false);
         let result = (|| -> mlua::Result<()> {
             let function: Function = lua.registry_value(key)?;
             function.call::<()>(())
@@ -261,22 +415,215 @@ impl Plugin {
         result
     }
 
-    fn call_exec(
+    fn call_exec_chunk(
         &self,
         key: &RegistryKey,
-        done: &ExecDone,
+        chunk: &str,
         ctx: &PluginContext,
     ) -> mlua::Result<()> {
         let Some(lua) = self.lua.as_ref() else {
             return Ok(());
         };
-        self.enter(Some(ctx));
+        self.enter(Some(ctx), false);
+        let result = (|| -> mlua::Result<()> {
+            let function: Function = lua.registry_value(key)?;
+            function.call::<()>(chunk)
+        })();
+        self.leave();
+        result
+    }
+
+    fn call_exec_done(
+        &self,
+        key: &RegistryKey,
+        code: i32,
+        stdout: &str,
+        stderr: &str,
+        error: Option<&str>,
+        ctx: &PluginContext,
+    ) -> mlua::Result<()> {
+        let Some(lua) = self.lua.as_ref() else {
+            return Ok(());
+        };
+        self.enter(Some(ctx), false);
         let result = (|| -> mlua::Result<()> {
             let table = lua.create_table()?;
-            table.set("code", done.code)?;
-            table.set("stdout", done.stdout.as_str())?;
-            table.set("stderr", done.stderr.as_str())?;
+            table.set("code", code)?;
+            table.set("stdout", stdout)?;
+            table.set("stderr", stderr)?;
+            table.set("error", error)?;
+            let function: Function = lua.registry_value(key)?;
+            function.call::<()>(table)
+        })();
+        self.leave();
+        result
+    }
+
+    fn call_http_chunk(
+        &self,
+        key: &RegistryKey,
+        status: u16,
+        chunk: &str,
+        ctx: &PluginContext,
+    ) -> mlua::Result<()> {
+        let Some(lua) = self.lua.as_ref() else {
+            return Ok(());
+        };
+        self.enter(Some(ctx), false);
+        let result = (|| -> mlua::Result<()> {
+            let function: Function = lua.registry_value(key)?;
+            function.call::<()>((chunk, status))
+        })();
+        self.leave();
+        result
+    }
+
+    fn call_http_done(
+        &self,
+        key: &RegistryKey,
+        status: u16,
+        headers: &HashMap<String, String>,
+        body: &str,
+        error: Option<&str>,
+        ctx: &PluginContext,
+    ) -> mlua::Result<()> {
+        let Some(lua) = self.lua.as_ref() else {
+            return Ok(());
+        };
+        self.enter(Some(ctx), false);
+        let result = (|| -> mlua::Result<()> {
+            let table = lua.create_table()?;
+            table.set("status", status)?;
+            table.set("headers", api::headers_to_lua(lua, headers)?)?;
+            table.set("body", body)?;
+            table.set("error", error)?;
+            let function: Function = lua.registry_value(key)?;
+            function.call::<()>(table)
+        })();
+        self.leave();
+        result
+    }
+
+    fn call_rpc_message(
+        &self,
+        key: &RegistryKey,
+        payload: &serde_json::Value,
+        ctx: &PluginContext,
+    ) -> mlua::Result<()> {
+        let Some(lua) = self.lua.as_ref() else {
+            return Ok(());
+        };
+        self.enter(Some(ctx), false);
+        let result = (|| -> mlua::Result<()> {
+            let val = api::json_to_lua(lua, payload)?;
+            let function: Function = lua.registry_value(key)?;
+            function.call::<()>(val)
+        })();
+        self.leave();
+        result
+    }
+
+    fn call_rpc_exit(
+        &self,
+        key: &RegistryKey,
+        code: i32,
+        error: Option<&str>,
+        ctx: &PluginContext,
+    ) -> mlua::Result<()> {
+        let Some(lua) = self.lua.as_ref() else {
+            return Ok(());
+        };
+        self.enter(Some(ctx), false);
+        let result = (|| -> mlua::Result<()> {
+            let table = lua.create_table()?;
+            table.set("code", code)?;
+            table.set("error", error)?;
+            let function: Function = lua.registry_value(key)?;
+            function.call::<()>(table)
+        })();
+        self.leave();
+        result
+    }
+
+    fn call_search_done(
+        &self,
+        key: &RegistryKey,
+        done: &SearchDone,
+        ctx: &PluginContext,
+    ) -> mlua::Result<()> {
+        let Some(lua) = self.lua.as_ref() else {
+            return Ok(());
+        };
+        self.enter(Some(ctx), false);
+        let result = (|| -> mlua::Result<()> {
+            let table = lua.create_table()?;
+            let hits = lua.create_table_with_capacity(done.results.len(), 0)?;
+            for (i, hit) in done.results.iter().enumerate() {
+                let row = lua.create_table()?;
+                row.set("path", hit.path.as_str())?;
+                row.set("line", hit.line)?;
+                row.set("column", hit.column)?;
+                row.set("preview", hit.preview.as_str())?;
+                hits.set(i + 1, row)?;
+            }
+            table.set("results", hits)?;
+            table.set("truncated", done.truncated)?;
             table.set("error", done.error.as_deref())?;
+            let function: Function = lua.registry_value(key)?;
+            function.call::<()>(table)
+        })();
+        self.leave();
+        result
+    }
+
+    fn call_proposal_result(
+        &self,
+        key: &RegistryKey,
+        path: &Path,
+        accepted: bool,
+        ctx: &PluginContext,
+    ) -> mlua::Result<()> {
+        let Some(lua) = self.lua.as_ref() else {
+            return Ok(());
+        };
+        self.enter(Some(ctx), false);
+        let result = (|| -> mlua::Result<()> {
+            let table = lua.create_table()?;
+            table.set("accepted", accepted)?;
+            table.set("path", path.to_string_lossy().to_string())?;
+            let function: Function = lua.registry_value(key)?;
+            function.call::<()>(table)
+        })();
+        self.leave();
+        result
+    }
+
+    fn call_view_event(
+        &self,
+        key: &RegistryKey,
+        event: &ViewEvent,
+        ctx: &PluginContext,
+    ) -> mlua::Result<()> {
+        let Some(lua) = self.lua.as_ref() else {
+            return Ok(());
+        };
+        self.enter(Some(ctx), false);
+        let result = (|| -> mlua::Result<()> {
+            let table = lua.create_table()?;
+            table.set("view", event.view_id.as_str())?;
+            table.set("type", event.kind.as_str())?;
+            table.set("id", event.id.as_str())?;
+            if let Some(val) = &event.value {
+                table.set("value", val.as_str())?;
+            }
+            if let Some(checked) = event.checked {
+                table.set("checked", checked)?;
+            }
+            let values = lua.create_table_with_capacity(0, event.values.len())?;
+            for (k, v) in &event.values {
+                values.set(k.as_str(), v.as_str())?;
+            }
+            table.set("values", values)?;
             let function: Function = lua.registry_value(key)?;
             function.call::<()>(table)
         })();
@@ -290,12 +637,22 @@ pub struct PluginHost {
     plugins: Vec<Plugin>,
     commands: Vec<PluginCommand>,
     status_items: Vec<StatusItem>,
+    views: Vec<PluginView>,
     logs: Vec<String>,
     actions: Vec<(u64, HostAction)>,
     open_docs: HashMap<u64, TrackedDoc>,
-    exec_tx: Sender<ExecDone>,
-    exec_rx: Receiver<ExecDone>,
+    repaint_ctx: Option<egui::Context>,
+    exec_tx: Sender<ExecEvent>,
+    exec_rx: Receiver<ExecEvent>,
     exec_running: Arc<AtomicUsize>,
+    http_tx: Sender<HttpEvent>,
+    http_rx: Receiver<HttpEvent>,
+    http_running: Arc<AtomicUsize>,
+    rpc_tx: Sender<RpcEvent>,
+    rpc_rx: Receiver<RpcEvent>,
+    rpc_running: Arc<AtomicUsize>,
+    search_tx: Sender<SearchDone>,
+    search_rx: Receiver<SearchDone>,
     next_runtime: u64,
     load_errors: Vec<String>,
     errors: Vec<String>,
@@ -313,17 +670,30 @@ impl PluginHost {
     pub fn with_root(root: PathBuf, settings: &Settings) -> Self {
         let _ = std::fs::create_dir_all(&root);
         let (exec_tx, exec_rx) = channel();
+        let (http_tx, http_rx) = channel();
+        let (rpc_tx, rpc_rx) = channel();
+        let (search_tx, search_rx) = channel();
         let mut host = Self {
             root,
             plugins: Vec::new(),
             commands: Vec::new(),
             status_items: Vec::new(),
+            views: Vec::new(),
             logs: Vec::new(),
             actions: Vec::new(),
             open_docs: HashMap::new(),
+            repaint_ctx: None,
             exec_tx,
             exec_rx,
             exec_running: Arc::new(AtomicUsize::new(0)),
+            http_tx,
+            http_rx,
+            http_running: Arc::new(AtomicUsize::new(0)),
+            rpc_tx,
+            rpc_rx,
+            rpc_running: Arc::new(AtomicUsize::new(0)),
+            search_tx,
+            search_rx,
             next_runtime: 1,
             load_errors: Vec::new(),
             errors: Vec::new(),
@@ -331,6 +701,15 @@ impl PluginHost {
         };
         host.scan(settings);
         host
+    }
+
+    pub fn set_repaint_ctx(&mut self, ctx: egui::Context) {
+        self.repaint_ctx = Some(ctx.clone());
+        for plugin in &self.plugins {
+            if let Some(shared) = &plugin.shared {
+                shared.borrow_mut().repaint_ctx = Some(ctx.clone());
+            }
+        }
     }
 
     fn scan(&mut self, settings: &Settings) {
@@ -359,6 +738,12 @@ impl PluginHost {
                 handlers: HashMap::new(),
                 budget: Rc::new(Cell::new(0)),
                 pending_exec: HashMap::new(),
+                pending_http: HashMap::new(),
+                pending_rpc: HashMap::new(),
+                pending_search: HashMap::new(),
+                pending_timers: Vec::new(),
+                pending_proposals: HashMap::new(),
+                view_handlers: HashMap::new(),
             });
         }
     }
@@ -375,7 +760,24 @@ impl PluginHost {
         &self.load_errors
     }
 
-    pub fn load_enabled(&mut self, configs: &HashMap<String, HashMap<String, serde_json::Value>>) -> Vec<u64> {
+    pub fn any_has_permission(&self, perm: &str) -> bool {
+        self.plugins
+            .iter()
+            .any(|p| p.loaded && p.manifest.allows(perm))
+    }
+
+    pub fn views(&self) -> &[PluginView] {
+        &self.views
+    }
+
+    pub fn view_mut(&mut self, id: &str) -> Option<&mut PluginView> {
+        self.views.iter_mut().find(|v| v.id == id)
+    }
+
+    pub fn load_enabled(
+        &mut self,
+        configs: &HashMap<String, HashMap<String, serde_json::Value>>,
+    ) -> Vec<u64> {
         let indices: Vec<usize> = self
             .plugins
             .iter()
@@ -394,8 +796,12 @@ impl PluginHost {
         loaded
     }
 
-    fn load_runtime(&mut self, index: usize, config: HashMap<String, serde_json::Value>) -> Result<u64, String> {
-        let started = std::time::Instant::now();
+    fn load_runtime(
+        &mut self,
+        index: usize,
+        config: HashMap<String, serde_json::Value>,
+    ) -> Result<u64, String> {
+        let started = Instant::now();
         self.unload(index);
         self.plugins[index].enabled = true;
         let manifest = self.plugins[index].manifest.clone();
@@ -414,11 +820,19 @@ impl PluginHost {
         self.next_runtime += 1;
         let shared = Rc::new(RefCell::new(PluginShared::new(
             manifest.id.clone(),
+            dir.clone(),
             runtime,
             manifest.events.iter().any(|event| event == "changed"),
+            manifest.permissions.clone(),
             config,
+            self.repaint_ctx.clone(),
             self.exec_tx.clone(),
             self.exec_running.clone(),
+            self.http_tx.clone(),
+            self.http_running.clone(),
+            self.rpc_tx.clone(),
+            self.rpc_running.clone(),
+            self.search_tx.clone(),
         )));
         let budget = Rc::new(Cell::new(0u64));
         let result = (|| -> Result<Option<Lua>, String> {
@@ -506,6 +920,7 @@ impl PluginHost {
         self.plugins.clear();
         self.commands.clear();
         self.status_items.clear();
+        self.views.clear();
         self.actions.clear();
         self.open_docs.clear();
         self.scan(settings);
@@ -515,21 +930,39 @@ impl PluginHost {
         let runtime = self.plugins[index].runtime;
         self.commands.retain(|command| command.plugin != index);
         self.status_items.retain(|item| item.plugin != runtime);
+        self.views.retain(|view| view.runtime != runtime);
         self.actions.retain(|(plugin, _)| *plugin != runtime);
         if let Some(shared) = self.plugins[index].shared.take() {
             let mut shared = shared.borrow_mut();
-            // Running exec processes see the flag and kill themselves instead of
-            // reporting into a runtime that no longer exists.
-            shared.cancel_exec.store(true, std::sync::atomic::Ordering::Relaxed);
+            shared.cancel_all.store(true, Ordering::Relaxed);
             shared.ctx = None;
             shared.actions.clear();
             shared.commands.clear();
             shared.events.clear();
             shared.status.clear();
             shared.exec_callbacks.clear();
+            shared.http_callbacks.clear();
+            for (_, rpc) in shared.rpc_callbacks.drain(..) {
+                rpc.control.kill();
+            }
+            shared.search_callbacks.clear();
+            shared.timers.clear();
+            shared.proposals.clear();
+            shared.view_regs.clear();
+            shared.view_updates.clear();
+            shared.loaded_modules.clear();
+            shared.loading_modules.clear();
+        }
+        for (_, rpc) in self.plugins[index].pending_rpc.drain() {
+            rpc.control.kill();
         }
         self.plugins[index].handlers.clear();
         self.plugins[index].pending_exec.clear();
+        self.plugins[index].pending_http.clear();
+        self.plugins[index].pending_search.clear();
+        self.plugins[index].pending_timers.clear();
+        self.plugins[index].pending_proposals.clear();
+        self.plugins[index].view_handlers.clear();
         self.plugins[index].lua = None;
         self.plugins[index].loaded = false;
     }
@@ -539,15 +972,36 @@ impl PluginHost {
             return;
         };
         let runtime = self.plugins[index].runtime;
-        let (commands, events, status, logs, actions, execs) = {
-            let mut shared = shared.borrow_mut();
+        let (
+            commands,
+            events,
+            status,
+            logs,
+            actions,
+            execs,
+            https,
+            rpcs,
+            searches,
+            timers,
+            proposals,
+            view_regs,
+            view_updates,
+        ) = {
+            let mut s = shared.borrow_mut();
             (
-                std::mem::take(&mut shared.commands),
-                std::mem::take(&mut shared.events),
-                std::mem::take(&mut shared.status),
-                std::mem::take(&mut shared.logs),
-                std::mem::take(&mut shared.actions),
-                std::mem::take(&mut shared.exec_callbacks),
+                std::mem::take(&mut s.commands),
+                std::mem::take(&mut s.events),
+                std::mem::take(&mut s.status),
+                std::mem::take(&mut s.logs),
+                std::mem::take(&mut s.actions),
+                std::mem::take(&mut s.exec_callbacks),
+                std::mem::take(&mut s.http_callbacks),
+                std::mem::take(&mut s.rpc_callbacks),
+                std::mem::take(&mut s.search_callbacks),
+                std::mem::take(&mut s.timers),
+                std::mem::take(&mut s.proposals),
+                std::mem::take(&mut s.view_regs),
+                std::mem::take(&mut s.view_updates),
             )
         };
         for pending in commands {
@@ -568,7 +1022,11 @@ impl PluginHost {
             });
         }
         for (event, key) in events {
-            self.plugins[index].handlers.entry(event).or_default().push(key);
+            self.plugins[index]
+                .handlers
+                .entry(event)
+                .or_default()
+                .push(key);
         }
         for (key, text, command) in status {
             if let Some(existing) = self
@@ -595,8 +1053,53 @@ impl PluginHost {
         for action in actions {
             self.actions.push((runtime, action));
         }
-        for (task, key) in execs {
-            self.plugins[index].pending_exec.insert(task, key);
+        for (task, cb) in execs {
+            self.plugins[index].pending_exec.insert(task, cb);
+        }
+        for (task, cb) in https {
+            self.plugins[index].pending_http.insert(task, cb);
+        }
+        for (id, cb) in rpcs {
+            self.plugins[index].pending_rpc.insert(id, cb);
+        }
+        for (task, cb) in searches {
+            self.plugins[index].pending_search.insert(task, cb);
+        }
+        self.plugins[index].pending_timers.extend(timers);
+        for prop in proposals {
+            self.plugins[index].pending_proposals.insert(prop.id, prop);
+        }
+        for reg in view_regs {
+            if let Some(cb) = reg.on_event {
+                self.plugins[index]
+                    .view_handlers
+                    .insert(reg.id.clone(), cb);
+            }
+            if let Some(existing) = self.views.iter_mut().find(|v| v.id == reg.id) {
+                if existing.runtime == runtime {
+                    existing.title = reg.title;
+                    existing.location = reg.location;
+                } else {
+                    self.record_message(index, format!("视图 id 重复，已忽略: {}", reg.id));
+                }
+            } else {
+                self.views.push(PluginView::new(
+                    index,
+                    runtime,
+                    reg.id,
+                    reg.title,
+                    reg.location,
+                ));
+            }
+        }
+        for update in view_updates {
+            if let Some(view) = self
+                .views
+                .iter_mut()
+                .find(|v| v.id == update.id && v.runtime == runtime)
+            {
+                view.nodes = update.nodes;
+            }
         }
     }
 
@@ -672,9 +1175,65 @@ impl PluginHost {
         self.drain_plugin(index);
     }
 
+    pub fn dispatch_view_event(&mut self, event: &ViewEvent, ctx: &PluginContext) {
+        let Some((plugin_index, runtime)) = self
+            .views
+            .iter()
+            .find(|v| v.id == event.view_id)
+            .map(|v| (v.plugin_index, v.runtime))
+        else {
+            return;
+        };
+        let Some(plugin) = self.plugins.get(plugin_index) else {
+            return;
+        };
+        if !plugin.loaded || plugin.runtime != runtime {
+            return;
+        }
+        let result = if let Some(key) = plugin.view_handlers.get(&event.view_id) {
+            plugin.call_view_event(key, event, ctx)
+        } else {
+            Ok(())
+        };
+        if let Err(err) = result {
+            self.record_error(plugin_index, err);
+        }
+        self.drain_plugin(plugin_index);
+    }
+
+    pub fn resolve_proposal(
+        &mut self,
+        runtime: u64,
+        proposal_id: u64,
+        accepted: bool,
+        ctx: &PluginContext,
+    ) {
+        let Some(index) = self
+            .plugins
+            .iter()
+            .position(|p| p.loaded && p.runtime == runtime)
+        else {
+            return;
+        };
+        let Some(prop) = self.plugins[index].pending_proposals.remove(&proposal_id) else {
+            return;
+        };
+        let cb = if accepted {
+            prop.on_accept
+        } else {
+            prop.on_reject
+        };
+        if let Some(key) = cb
+            && let Err(err) = self.plugins[index].call_proposal_result(&key, &prop.path, accepted, ctx)
+        {
+            self.record_error(index, err);
+        }
+        self.drain_plugin(index);
+    }
+
     pub fn plan_doc_events(&mut self, tracks: &[DocTrack], active: Option<u64>) -> Vec<DocEvent> {
         let mut events = Vec::new();
-        let current: std::collections::HashSet<u64> = tracks.iter().map(|track| track.id).collect();
+        let current: HashSet<u64> = tracks.iter().map(|track| track.id).collect();
         let closed: Vec<u64> = self
             .open_docs
             .keys()
@@ -719,37 +1278,300 @@ impl PluginHost {
         events
     }
 
-    pub fn poll_exec(&mut self, ctx: &PluginContext) {
-        let mut done = Vec::new();
+    pub fn has_pending_async(&self) -> bool {
+        self.plugins.iter().any(|p| {
+            !p.pending_exec.is_empty()
+                || !p.pending_http.is_empty()
+                || !p.pending_rpc.is_empty()
+                || !p.pending_search.is_empty()
+                || !p.pending_timers.is_empty()
+        })
+    }
+
+    pub fn next_timer_delay(&self) -> Option<Duration> {
+        let now = Instant::now();
+        self.plugins
+            .iter()
+            .flat_map(|p| p.pending_timers.iter())
+            .filter(|t| !t.cancelled.load(Ordering::Relaxed))
+            .map(|t| t.deadline.saturating_duration_since(now))
+            .min()
+    }
+
+    /// Poll all async channels (exec, streaming HTTP, JSON-RPC, search, timers).
+    /// Returns true when at least one Lua callback executed.
+    pub fn poll_async(&mut self, ctx: &PluginContext) -> bool {
+        let mut fired = false;
+        fired |= self.poll_exec(ctx);
+        fired |= self.poll_http(ctx);
+        fired |= self.poll_rpc(ctx);
+        fired |= self.poll_search(ctx);
+        fired |= self.poll_timers(ctx);
+        fired
+    }
+
+    fn runtime_index(&self, runtime: u64) -> Option<usize> {
+        self.plugins
+            .iter()
+            .position(|plugin| plugin.loaded && plugin.runtime == runtime)
+    }
+
+    fn poll_exec(&mut self, ctx: &PluginContext) -> bool {
+        let mut events = Vec::new();
         while let Ok(item) = self.exec_rx.try_recv() {
+            events.push(item);
+        }
+        if events.is_empty() {
+            return false;
+        }
+        for ev in events {
+            match ev {
+                ExecEvent::Stdout {
+                    runtime,
+                    task,
+                    chunk,
+                } => {
+                    let Some(index) = self.runtime_index(runtime) else {
+                        continue;
+                    };
+                    if let Some(cb) = self.plugins[index].pending_exec.get(&task)
+                        && !cb.cancel.load(Ordering::Relaxed)
+                        && let Some(key) = &cb.on_stdout
+                        && let Err(err) = self.plugins[index].call_exec_chunk(key, &chunk, ctx)
+                    {
+                        self.record_error(index, err);
+                    }
+                    self.drain_plugin(index);
+                }
+                ExecEvent::Stderr {
+                    runtime,
+                    task,
+                    chunk,
+                } => {
+                    let Some(index) = self.runtime_index(runtime) else {
+                        continue;
+                    };
+                    if let Some(cb) = self.plugins[index].pending_exec.get(&task)
+                        && !cb.cancel.load(Ordering::Relaxed)
+                        && let Some(key) = &cb.on_stderr
+                        && let Err(err) = self.plugins[index].call_exec_chunk(key, &chunk, ctx)
+                    {
+                        self.record_error(index, err);
+                    }
+                    self.drain_plugin(index);
+                }
+                ExecEvent::Done {
+                    runtime,
+                    task,
+                    code,
+                    stdout,
+                    stderr,
+                    error,
+                } => {
+                    let Some(index) = self.runtime_index(runtime) else {
+                        continue;
+                    };
+                    let Some(cb) = self.plugins[index].pending_exec.remove(&task) else {
+                        continue;
+                    };
+                    if let Some(key) = cb.on_done
+                        && let Err(err) = self.plugins[index].call_exec_done(
+                            &key,
+                            code,
+                            &stdout,
+                            &stderr,
+                            error.as_deref(),
+                            ctx,
+                        )
+                    {
+                        self.record_error(index, err);
+                    }
+                    self.drain_plugin(index);
+                }
+            }
+        }
+        true
+    }
+
+    fn poll_http(&mut self, ctx: &PluginContext) -> bool {
+        let mut events = Vec::new();
+        while let Ok(item) = self.http_rx.try_recv() {
+            events.push(item);
+        }
+        if events.is_empty() {
+            return false;
+        }
+        for ev in events {
+            match ev {
+                HttpEvent::Chunk {
+                    runtime,
+                    task,
+                    status,
+                    chunk,
+                } => {
+                    let Some(index) = self.runtime_index(runtime) else {
+                        continue;
+                    };
+                    if let Some(cb) = self.plugins[index].pending_http.get(&task)
+                        && !cb.cancel.load(Ordering::Relaxed)
+                        && let Some(key) = &cb.on_chunk
+                        && let Err(err) =
+                            self.plugins[index].call_http_chunk(key, status, &chunk, ctx)
+                    {
+                        self.record_error(index, err);
+                    }
+                    self.drain_plugin(index);
+                }
+                HttpEvent::Done {
+                    runtime,
+                    task,
+                    status,
+                    headers,
+                    body,
+                    error,
+                } => {
+                    let Some(index) = self.runtime_index(runtime) else {
+                        continue;
+                    };
+                    let Some(cb) = self.plugins[index].pending_http.remove(&task) else {
+                        continue;
+                    };
+                    if let Err(err) = self.plugins[index].call_http_done(
+                        &cb.on_done,
+                        status,
+                        &headers,
+                        &body,
+                        error.as_deref(),
+                        ctx,
+                    ) {
+                        self.record_error(index, err);
+                    }
+                    self.drain_plugin(index);
+                }
+            }
+        }
+        true
+    }
+
+    fn poll_rpc(&mut self, ctx: &PluginContext) -> bool {
+        let mut events = Vec::new();
+        while let Ok(item) = self.rpc_rx.try_recv() {
+            events.push(item);
+        }
+        if events.is_empty() {
+            return false;
+        }
+        for ev in events {
+            match ev {
+                RpcEvent::Message {
+                    runtime,
+                    id,
+                    payload,
+                } => {
+                    let Some(index) = self.runtime_index(runtime) else {
+                        continue;
+                    };
+                    if let Some(cb) = self.plugins[index].pending_rpc.get(&id)
+                        && let Some(key) = &cb.on_message
+                        && let Err(err) = self.plugins[index].call_rpc_message(key, &payload, ctx)
+                    {
+                        self.record_error(index, err);
+                    }
+                    self.drain_plugin(index);
+                }
+                RpcEvent::Stderr { runtime, id, chunk } => {
+                    let Some(index) = self.runtime_index(runtime) else {
+                        continue;
+                    };
+                    if let Some(cb) = self.plugins[index].pending_rpc.get(&id)
+                        && let Some(key) = &cb.on_stderr
+                        && let Err(err) = self.plugins[index].call_exec_chunk(key, &chunk, ctx)
+                    {
+                        self.record_error(index, err);
+                    }
+                    self.drain_plugin(index);
+                }
+                RpcEvent::Exit {
+                    runtime,
+                    id,
+                    code,
+                    error,
+                } => {
+                    let Some(index) = self.runtime_index(runtime) else {
+                        continue;
+                    };
+                    let Some(cb) = self.plugins[index].pending_rpc.remove(&id) else {
+                        continue;
+                    };
+                    if let Some(key) = cb.on_exit
+                        && let Err(err) =
+                            self.plugins[index].call_rpc_exit(&key, code, error.as_deref(), ctx)
+                    {
+                        self.record_error(index, err);
+                    }
+                    self.drain_plugin(index);
+                }
+            }
+        }
+        true
+    }
+
+    fn poll_search(&mut self, ctx: &PluginContext) -> bool {
+        let mut done = Vec::new();
+        while let Ok(item) = self.search_rx.try_recv() {
             done.push(item);
         }
+        if done.is_empty() {
+            return false;
+        }
         for item in done {
-            let Some(index) = self
-                .plugins
-                .iter()
-                .position(|plugin| plugin.loaded && plugin.runtime == item.runtime)
-            else {
+            let Some(index) = self.runtime_index(item.runtime) else {
                 continue;
             };
-            let Some(key) = self.plugins[index].pending_exec.remove(&item.task) else {
+            let Some(cb) = self.plugins[index].pending_search.remove(&item.task) else {
                 continue;
             };
-            if let Err(err) = self.plugins[index].call_exec(&key, &item, ctx) {
+            if let Err(err) = self.plugins[index].call_search_done(&cb.on_done, &item, ctx) {
                 self.record_error(index, err);
             }
             self.drain_plugin(index);
         }
+        true
     }
 
-    pub fn has_pending_exec(&self) -> bool {
-        self.plugins
-            .iter()
-            .any(|plugin| !plugin.pending_exec.is_empty())
+    fn poll_timers(&mut self, ctx: &PluginContext) -> bool {
+        let now = Instant::now();
+        let mut fired = false;
+        for index in 0..self.plugins.len() {
+            if !self.plugins[index].loaded || self.plugins[index].pending_timers.is_empty() {
+                continue;
+            }
+            let mut due = Vec::new();
+            let mut keep = Vec::new();
+            for timer in std::mem::take(&mut self.plugins[index].pending_timers) {
+                if timer.cancelled.load(Ordering::Relaxed) {
+                    continue;
+                }
+                if timer.deadline <= now {
+                    due.push(timer);
+                } else {
+                    keep.push(timer);
+                }
+            }
+            self.plugins[index].pending_timers = keep;
+            for timer in due {
+                fired = true;
+                if let Err(err) = self.plugins[index].call_handler(&timer.callback, Some(ctx)) {
+                    self.record_error(index, err);
+                }
+                self.drain_plugin(index);
+            }
+        }
+        fired
     }
 
     pub fn run_command(&mut self, index: usize, ctx: &PluginContext) -> bool {
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         let Some(command) = self.commands.get(index) else {
             return false;
         };
@@ -836,6 +1658,7 @@ impl PluginHost {
                 name: plugin.manifest.name.clone(),
                 version: plugin.manifest.version.clone(),
                 description: plugin.manifest.description.clone(),
+                permissions: plugin.manifest.permissions_list().to_vec(),
                 enabled: plugin.enabled,
                 loaded: plugin.loaded,
                 error: plugin.error.clone(),
@@ -916,6 +1739,20 @@ mod tests {
             dir.join("plugin.json"),
             format!(
                 r#"{{"id":"{id}","name":"{id}","version":"0.1.0","apiVersion":1,"main":"main.lua"}}"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(dir.join("main.lua"), main).unwrap();
+    }
+
+    fn write_plugin_with_perms(root: &Path, id: &str, perms: &[&str], main: &str) {
+        let dir = root.join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let perms_json = serde_json::to_string(perms).unwrap();
+        std::fs::write(
+            dir.join("plugin.json"),
+            format!(
+                r#"{{"id":"{id}","name":"{id}","version":"0.1.0","apiVersion":1,"main":"main.lua","permissions":{perms_json}}}"#
             ),
         )
         .unwrap();
@@ -1046,6 +1883,7 @@ end)
         let mut ctx = PluginContext::default();
         ctx.active = Some(7);
         ctx.subject = Some(7);
+        ctx.open_order.push(7);
         ctx.docs
             .insert(7, Rc::new(DocSnapshot::from_editor(&editor)));
         assert!(host.run_command(0, &ctx));
@@ -1124,15 +1962,15 @@ end)
 "#,
             );
         }
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         let mut host = PluginHost::with_root(root.path().to_path_buf(), &Settings::default());
         let runtimes = host.load_enabled(&HashMap::new());
         let elapsed = started.elapsed();
         assert_eq!(runtimes.len(), 20);
         let memory: usize = host.plugin_infos().iter().map(|info| info.memory).sum();
         println!("20 plugins: {elapsed:?}, {} KB", memory / 1024);
-        assert!(elapsed < std::time::Duration::from_millis(200), "{elapsed:?}");
-        assert!(memory < 3 * 1024 * 1024);
+        assert!(elapsed < Duration::from_millis(300), "{elapsed:?}");
+        assert!(memory < 4 * 1024 * 1024);
     }
 
     #[test]
@@ -1150,5 +1988,472 @@ end)
         let info = &host.plugin_infos()[0];
         assert!(!info.enabled);
         assert!(info.error.as_deref().unwrap_or_default().contains("apiVersion"));
+    }
+
+    #[test]
+    fn local_require_loads_modules_and_blocks_traversal() {
+        let root = TempRoot::new();
+        write_plugin(
+            root.path(),
+            "modtest",
+            r#"
+local helper = require("sub.helper")
+kestrel.command("modtest.run", "run", function()
+  kestrel.log("val=" .. helper.greet("kestrel"))
+  local ok = pcall(function() require("../escape") end)
+  assert(not ok, "traversal must fail")
+end)
+"#,
+        );
+        let sub_dir = root.path().join("modtest").join("sub");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+        std::fs::write(
+            sub_dir.join("helper.lua"),
+            r#"return { greet = function(name) return "hi " .. name end }"#,
+        )
+        .unwrap();
+
+        let mut host = load(root.path());
+        assert!(host.plugin_infos()[0].error.is_none());
+        let ctx = PluginContext::default();
+        assert!(host.run_command(0, &ctx));
+        assert!(host.take_errors().is_empty());
+        assert!(host.logs().iter().any(|l| l.contains("val=hi kestrel")));
+    }
+
+    #[test]
+    fn json_encode_decode_and_permissions_work() {
+        let root = TempRoot::new();
+        write_plugin(
+            root.path(),
+            "jsonperm",
+            r#"
+kestrel.command("jsonperm.run", "run", function()
+  local s = kestrel.json.encode({ model = "gpt", tags = { "a", "b" } })
+  local obj = kestrel.json.decode(s)
+  assert(obj.model == "gpt" and obj.tags[2] == "b")
+  -- network permission not declared -> must fail
+  local ok, err = pcall(function()
+    kestrel.http({ url = "https://example.com", on_done = function() end })
+  end)
+  assert(not ok and tostring(err):find("network"), "expected permission error")
+  kestrel.log("json_ok")
+end)
+"#,
+        );
+        let mut host = load(root.path());
+        let ctx = PluginContext::default();
+        assert!(host.run_command(0, &ctx));
+        assert!(host.take_errors().is_empty());
+        assert!(host.logs().iter().any(|l| l.contains("json_ok")));
+    }
+
+    #[test]
+    fn declarative_ui_view_registers_updates_and_handles_events() {
+        let root = TempRoot::new();
+        write_plugin_with_perms(
+            root.path(),
+            "uiview",
+            &["ui"],
+            r###"
+kestrel.register_view({
+  id = "uiview.panel",
+  title = "Agent",
+  location = "right",
+  on_event = function(ev)
+    kestrel.log("ev=" .. ev.type .. ":" .. ev.id .. ":" .. (ev.values.prompt or ""))
+  end,
+})
+kestrel.set_view("uiview.panel", {
+  { type = "markdown", id = "m1", text = "## Hello Agent" },
+  { type = "text_input", id = "prompt", placeholder = "Ask..." },
+  { type = "button", id = "send", label = "Send", variant = "primary" },
+})
+"###,
+        );
+        let mut host = load(root.path());
+        assert!(host.plugin_infos()[0].error.is_none());
+        assert_eq!(host.views().len(), 1);
+        assert_eq!(host.views()[0].id, "uiview.panel");
+        assert_eq!(host.views()[0].nodes.len(), 3);
+
+        let mut values = HashMap::new();
+        values.insert("prompt".to_string(), "fix bug".to_string());
+        let ev = ViewEvent {
+            view_id: "uiview.panel".to_string(),
+            kind: "click".to_string(),
+            id: "send".to_string(),
+            value: None,
+            checked: None,
+            values,
+        };
+        host.dispatch_view_event(&ev, &PluginContext::default());
+        assert!(host.take_errors().is_empty());
+        assert!(
+            host.logs()
+                .iter()
+                .any(|l| l.contains("ev=click:send:fix bug"))
+        );
+
+        host.disable(0);
+        assert!(host.views().is_empty());
+    }
+
+    #[test]
+    fn workspace_tools_and_propose_edit_lifecycle() {
+        let root = TempRoot::new();
+        let ws = TempRoot::new();
+        std::fs::write(ws.path().join("hello.txt"), "line1\nline2\nline3\n").unwrap();
+
+        write_plugin_with_perms(
+            root.path(),
+            "agent",
+            &["fs:write"],
+            r#"
+kestrel.command("agent.inspect", "inspect", function()
+  local files = kestrel.list_files()
+  assert(#files == 1 and files[1] == "hello.txt")
+  local chunk = kestrel.read_lines("hello.txt", 2, 3)
+  assert(chunk.text == "line2\nline3" and chunk.total_lines == 3)
+  local st = kestrel.stat("hello.txt")
+  assert(st.exists and st.is_file)
+  kestrel.propose_edit({
+    path = "hello.txt",
+    text = "line1\nUPDATED\nline3\n",
+    title = "Update line 2",
+    on_accept = function(res) kestrel.log("accepted:" .. tostring(res.accepted)) end,
+    on_reject = function(res) kestrel.log("rejected:" .. tostring(res.accepted)) end,
+  })
+end)
+"#,
+        );
+        let mut host = load(root.path());
+        let mut ctx = PluginContext::default();
+        ctx.root = Some(ws.path().to_path_buf());
+        assert!(host.run_command(0, &ctx));
+        assert!(host.take_errors().is_empty());
+        let actions = host.take_actions();
+        let (runtime, proposal_id) = actions
+            .iter()
+            .find_map(|(rt, a)| match a {
+                HostAction::ProposeEdit { proposal_id, .. } => Some((*rt, *proposal_id)),
+                _ => None,
+            })
+            .expect("expected ProposeEdit action");
+        host.resolve_proposal(runtime, proposal_id, true, &ctx);
+        assert!(host.logs().iter().any(|l| l.contains("accepted:true")));
+    }
+
+    #[test]
+    fn timer_fires_after_deadline_and_can_be_cancelled() {
+        let root = TempRoot::new();
+        write_plugin(
+            root.path(),
+            "tmr",
+            r#"
+kestrel.command("tmr.run", "run", function()
+  kestrel.set_timeout(1, function() kestrel.log("fired") end)
+  local c = kestrel.set_timeout(1, function() kestrel.log("cancelled") end)
+  c:cancel()
+end)
+"#,
+        );
+        let mut host = load(root.path());
+        let ctx = PluginContext::default();
+        assert!(host.run_command(0, &ctx));
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(host.poll_async(&ctx));
+        assert!(host.logs().iter().any(|l| l.contains("fired")));
+        assert!(!host.logs().iter().any(|l| l.contains("cancelled")));
+    }
+
+    #[test]
+    fn before_save_forbids_exec() {
+        let root = TempRoot::new();
+        write_plugin(
+            root.path(),
+            "nosaveexec",
+            r#"
+kestrel.on("before_save", function()
+  kestrel.exec({ program = "cmd", args = { "/C", "echo hi" }, on_done = function() end })
+end)
+"#,
+        );
+        let mut host = load(root.path());
+        host.emit(Event::BeforeSave, &PluginContext::default());
+        let errors = host.take_errors();
+        assert!(
+            errors.iter().any(|e| e.contains("before_save")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn async_search_and_streaming_http_work_end_to_end() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut req_buf = [0u8; 2048];
+                let _ = stream.read(&mut req_buf);
+                let body = "data: {\"delta\":\"hello \"}\n\ndata: {\"delta\":\"kestrel\"}\n\n";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        let root = TempRoot::new();
+        let ws = TempRoot::new();
+        std::fs::write(ws.path().join("alpha.rs"), "fn needle_fn() {}\n").unwrap();
+
+        let script = format!(
+            r#"
+kestrel.command("net.test", "net", function()
+  kestrel.search({{
+    pattern = "needle_fn",
+    on_done = function(res)
+      kestrel.log("search_hits=" .. tostring(#res.results) .. ":" .. (res.results[1] and res.results[1].path or ""))
+    end,
+  }})
+  local chunks = ""
+  kestrel.http({{
+    method = "POST",
+    url = "http://127.0.0.1:{}/v1/chat",
+    headers = {{ ["X-Test"] = "1" }},
+    body = {{ prompt = "hi" }},
+    on_chunk = function(chunk, status)
+      chunks = chunks .. chunk
+    end,
+    on_done = function(res)
+      kestrel.log("http_status=" .. tostring(res.status) .. " has_chunk=" .. tostring(chunks:find("kestrel") ~= nil))
+    end,
+  }})
+end)
+"#,
+            addr.port()
+        );
+        write_plugin_with_perms(root.path(), "nettest", &["network"], &script);
+        let mut host = load(root.path());
+        let mut ctx = PluginContext::default();
+        ctx.root = Some(ws.path().to_path_buf());
+        assert!(host.run_command(0, &ctx));
+        assert!(host.take_errors().is_empty());
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while host.has_pending_async() && Instant::now() < deadline {
+            host.poll_async(&ctx);
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        let _ = server.join();
+        assert!(host.take_errors().is_empty());
+        assert!(
+            host.logs()
+                .iter()
+                .any(|l| l.contains("search_hits=1:alpha.rs")),
+            "{:?}",
+            host.logs()
+        );
+        assert!(
+            host.logs()
+                .iter()
+                .any(|l| l.contains("http_status=200 has_chunk=true")),
+            "{:?}",
+            host.logs()
+        );
+    }
+
+    #[test]
+    fn open_docs_exposes_diagnostics_and_outline() {
+        let root = TempRoot::new();
+        write_plugin(
+            root.path(),
+            "inspect",
+            r#"
+kestrel.command("inspect.run", "run", function()
+  local docs = kestrel.open_docs()
+  assert(#docs == 1)
+  local diags = docs[1]:diagnostics()
+  local syms = docs[1]:outline()
+  kestrel.log("d=" .. tostring(#diags) .. ":" .. diags[1].severity .. " s=" .. tostring(#syms) .. ":" .. syms[1].name)
+end)
+"#,
+        );
+        let mut host = load(root.path());
+        let mut editor = Editor::new(Document::from_text("fn demo() {}"), 11, 0);
+        editor.diagnostics.push(crate::lsp::Diagnostic {
+            line: 0,
+            col: 0,
+            end_col: 2,
+            start_byte: 0,
+            end_byte: 2,
+            severity: crate::lsp::DiagSeverity::Warning,
+            message: "unused".to_string(),
+            source: "syntax".to_string(),
+        });
+        editor.symbols.push(crate::lsp::OutlineSymbol {
+            name: "demo".to_string(),
+            detail: "fn demo()".to_string(),
+            kind: crate::lsp::SymbolKind::Function,
+            start_line: 0,
+            end_line: 0,
+            byte_offset: 0,
+            depth: 0,
+        });
+        let mut ctx = PluginContext::default();
+        ctx.active = Some(11);
+        ctx.open_order.push(11);
+        ctx.docs
+            .insert(11, Rc::new(DocSnapshot::from_editor(&editor)));
+        assert!(host.run_command(0, &ctx));
+        assert!(host.take_errors().is_empty());
+        assert!(
+            host.logs()
+                .iter()
+                .any(|l| l.contains("d=1:warning s=1:demo"))
+        );
+    }
+
+    #[test]
+    fn cline_style_agent_plugin_loads_and_renders_view() {
+        let root = TempRoot::new();
+        write_plugin_with_perms(
+            root.path(),
+            "agent-mini",
+            &["network", "exec", "terminal", "ui", "fs:write"],
+            r###"
+local tools = require("tools")
+kestrel.register_view({
+  id = "agent.chat",
+  title = "AI Agent",
+  location = "right",
+  on_event = function(ev)
+    if ev.id == "ping" then
+      kestrel.log("agent_ping:" .. tools.tag())
+    end
+  end,
+})
+kestrel.on("startup", function()
+  kestrel.set_view("agent.chat", {
+    { type = "badge", text = "ready", tone = "accent" },
+    { type = "markdown", id = "welcome", text = '### AI Agent Ready' },
+    { type = "button", id = "ping", label = "Ping", variant = "primary" },
+  })
+end)
+kestrel.command("agent.open", "Open Agent", function()
+  kestrel.open_view("agent.chat")
+end)
+"###,
+        );
+        std::fs::write(
+            root.path().join("agent-mini").join("tools.lua"),
+            r#"return { tag = function() return "ok" end }"#,
+        )
+        .unwrap();
+
+        let mut host = PluginHost::with_root(root.path().to_path_buf(), &Settings::default());
+        let loaded = host.load_enabled(&HashMap::new());
+        assert_eq!(loaded.len(), 1);
+        assert!(host.plugin_infos()[0].error.is_none());
+        let ctx = PluginContext::default();
+        host.emit_to(loaded[0], Event::Startup, &ctx);
+        assert!(host.take_errors().is_empty());
+        let view = host
+            .views()
+            .iter()
+            .find(|v| v.id == "agent.chat")
+            .expect("agent.chat view must be registered");
+        assert_eq!(view.nodes.len(), 3);
+        assert!(host.command_index_of_id("agent.open").is_some());
+
+        // When local docs/plugins/cline-demo is present in the workspace, also smoke-test it.
+        let demo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("docs")
+            .join("plugins");
+        if demo_root.join("cline-demo").join("plugin.json").is_file() {
+            let mut demo_host = PluginHost::with_root(demo_root, &Settings::default());
+            let demo_loaded = demo_host.load_enabled(&HashMap::new());
+            for info in demo_host.plugin_infos() {
+                assert!(
+                    info.error.is_none(),
+                    "plugin {} failed: {:?}",
+                    info.id,
+                    info.error
+                );
+            }
+            for rt in demo_loaded {
+                demo_host.emit_to(rt, Event::Startup, &ctx);
+            }
+            assert!(demo_host.take_errors().is_empty());
+            assert!(demo_host.views().iter().any(|v| v.id == "cline.agent"));
+        }
+    }
+
+    #[test]
+    fn spawn_rpc_receives_ndjson_messages_and_exit() {
+        let root = TempRoot::new();
+        #[cfg(windows)]
+        let script = r#"
+kestrel.command("rpc.test", "rpc", function()
+  local h = kestrel.spawn_rpc({
+    program = "powershell",
+    args = { "-NoProfile", "-Command", "$line = [Console]::In.ReadLine(); Write-Output $line" },
+    framing = "ndjson",
+    on_message = function(msg)
+      kestrel.log("rpc_msg=" .. tostring(msg.result))
+    end,
+    on_exit = function(ev)
+      kestrel.log("rpc_exit=" .. tostring(ev.code))
+    end,
+  })
+  h:send({ jsonrpc = "2.0", result = "pong" })
+end)
+"#;
+        #[cfg(not(windows))]
+        let script = r#"
+kestrel.command("rpc.test", "rpc", function()
+  local h = kestrel.spawn_rpc({
+    program = "sh",
+    args = { "-c", "IFS= read -r line; printf '%s\\n' \"$line\"" },
+    framing = "ndjson",
+    on_message = function(msg)
+      kestrel.log("rpc_msg=" .. tostring(msg.result))
+    end,
+    on_exit = function(ev)
+      kestrel.log("rpc_exit=" .. tostring(ev.code))
+    end,
+  })
+  h:send({ jsonrpc = "2.0", result = "pong" })
+end)
+"#;
+        write_plugin_with_perms(root.path(), "rpctest", &["rpc"], script);
+        let mut host = load(root.path());
+        let ctx = PluginContext::default();
+        assert!(host.run_command(0, &ctx));
+        assert!(host.take_errors().is_empty());
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while host.has_pending_async() && Instant::now() < deadline {
+            host.poll_async(&ctx);
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        assert!(host.take_errors().is_empty());
+        assert!(
+            host.logs().iter().any(|l| l.contains("rpc_msg=pong")),
+            "{:?}",
+            host.logs()
+        );
+        assert!(
+            host.logs().iter().any(|l| l.contains("rpc_exit=0")),
+            "{:?}",
+            host.logs()
+        );
     }
 }

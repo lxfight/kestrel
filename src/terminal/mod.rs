@@ -474,6 +474,62 @@ impl TerminalSession {
         self.parser.screen().scrollback_len()
     }
 
+    /// Capture up to `max_lines` trailing lines of terminal scrollback + visible screen.
+    pub fn tail_text(&mut self, max_lines: usize) -> String {
+        let max_lines = max_lines.clamp(1, 2000);
+        let screen = self.parser.screen_mut();
+        let (rows_nz, cols_nz) = screen.size();
+        let rows = rows_nz.get() as usize;
+        let cols = cols_nz.get();
+        let scrollback_len = screen.scrollback_len();
+        let total = scrollback_len + rows;
+        let start_from = total.saturating_sub(max_lines);
+        let original = screen.scrollback();
+        let mut lines = Vec::with_capacity(total - start_from);
+        let mut pos = start_from;
+        while pos < total {
+            let skip = if pos < scrollback_len {
+                screen.set_scrollback(scrollback_len - pos);
+                0
+            } else {
+                screen.set_scrollback(0);
+                pos - scrollback_len
+            };
+            for vis_row in skip..rows {
+                let mut line = String::new();
+                let mut col = 0u16;
+                while col < cols {
+                    if let Some(cell) = screen.cell(vis_row as u16, col)
+                        && !cell.is_wide_continuation()
+                    {
+                        let s = cell.contents();
+                        if s.is_empty() {
+                            line.push(' ');
+                        } else {
+                            line.push_str(s);
+                        }
+                    }
+                    col += 1;
+                }
+                lines.push(line.trim_end().to_string());
+                if lines.len() >= total - start_from {
+                    break;
+                }
+            }
+            if pos < scrollback_len {
+                pos += rows;
+            } else {
+                pos = total;
+            }
+        }
+        screen.set_scrollback(original);
+        // Trim trailing blank screen padding lines so agents see clean output.
+        while lines.last().is_some_and(String::is_empty) {
+            lines.pop();
+        }
+        lines.join("\n")
+    }
+
     /// First history row currently visible (scrollback rows followed by screen rows).
     pub fn visible_start_row(&self) -> usize {
         let len = self.parser.screen().scrollback_len();

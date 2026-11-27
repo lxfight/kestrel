@@ -395,7 +395,14 @@ fn plugin_row(
     if info.memory > 0 {
         meta.push_str(&format!(" · {} KB", info.memory.div_ceil(1024)));
     }
-    ui.painter().text(
+    if !info.permissions.is_empty() {
+        meta.push_str(&format!(" · 权限: {}", info.permissions.join(", ")));
+    }
+    let meta_clip = Rect::from_min_max(
+        Pos2::new(text_x, rect.top() + 50.0),
+        Pos2::new(text_right, rect.top() + 74.0),
+    );
+    ui.painter().with_clip_rect(meta_clip).text(
         Pos2::new(text_x, rect.top() + 62.0),
         Align2::LEFT_CENTER,
         &meta,

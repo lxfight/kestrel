@@ -67,6 +67,7 @@ pub enum Command {
     ShowPalette,
     QuickOpen,
     ToggleSidebar,
+    ToggleAuxSidebar,
     ToggleTerminal,
     FocusTerminal,
     NewTerminal,
@@ -392,6 +393,7 @@ impl Command {
             Command::ShowPalette => "view.commandPalette",
             Command::QuickOpen => "view.quickOpen",
             Command::ToggleSidebar => "view.toggleSidebar",
+            Command::ToggleAuxSidebar => "view.toggleAuxSidebar",
             Command::ToggleTerminal => "view.toggleTerminal",
             Command::FocusTerminal => "terminal.focus",
             Command::NewTerminal => "view.newTerminal",
@@ -501,6 +503,7 @@ impl Command {
         Command::ShowPalette,
         Command::QuickOpen,
         Command::ToggleSidebar,
+        Command::ToggleAuxSidebar,
         Command::ToggleTerminal,
         Command::FocusTerminal,
         Command::NewTerminal,
@@ -605,6 +608,7 @@ impl Command {
             Command::ShowPalette => "显示所有命令",
             Command::QuickOpen => "快速打开文件",
             Command::ToggleSidebar => "切换侧边栏",
+            Command::ToggleAuxSidebar => "切换右侧辅助栏",
             Command::ToggleTerminal => "切换终端面板",
             Command::FocusTerminal => "聚焦终端（或打开终端）",
             Command::NewTerminal => "新建终端实例",
@@ -679,6 +683,7 @@ impl Command {
             Command::ToggleFold | Command::FoldAll => Icon::CollapseAll,
             Command::UnfoldAll => Icon::ExpandAll,
             Command::ToggleSidebar | Command::ShowExplorer => Icon::Explorer,
+            Command::ToggleAuxSidebar => Icon::PanelRight,
             Command::ToggleTerminal
             | Command::FocusTerminal
             | Command::NewTerminal
@@ -815,6 +820,7 @@ impl Command {
             Command::ShowPalette => Shortcut::new(ctrl_shift(), P),
             Command::QuickOpen => Shortcut::new(CTRL, P),
             Command::ToggleSidebar => Shortcut::new(CTRL, B),
+            Command::ToggleAuxSidebar => Shortcut::new(ctrl_alt(), B),
             Command::ToggleTerminal => Shortcut::new(CTRL, J),
             Command::FocusTerminal => Shortcut::new(CTRL, Backtick),
             Command::NewTerminal => Shortcut::new(ctrl_shift(), Backtick),

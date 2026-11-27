@@ -42,6 +42,7 @@ pub enum Icon {
     Sun,
     Moon,
     PanelLeft,
+    PanelRight,
     PanelBottom,
     SplitHorizontal,
     SplitVertical,
@@ -134,6 +135,7 @@ impl Icon {
             Icon::ClearAll => '\u{eabf}',        // clear-all
             Icon::Sun | Icon::Moon => return None,
             Icon::PanelLeft => '\u{ebf3}',       // layout-sidebar-left
+            Icon::PanelRight => '\u{ebf4}',      // layout-sidebar-right
             Icon::PanelBottom => '\u{ebf2}',     // layout-panel
             Icon::SplitHorizontal => '\u{eb56}', // split-horizontal
             Icon::SplitVertical => '\u{eb57}',   // split-vertical

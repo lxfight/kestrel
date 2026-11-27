@@ -125,6 +125,29 @@ impl KestrelApp {
             }
         }
 
+        if self.aux_sidebar.visible {
+            let left_used = 48.0 + if self.sidebar.visible { self.sidebar.width } else { 0.0 };
+            let max_w = (win_w - left_used - 280.0).clamp(240.0, 720.0);
+            let width = self.aux_sidebar.width.clamp(240.0, max_w);
+            self.aux_sidebar.width = width;
+            let aux_resp = Panel::right("kestrel_aux_sidebar")
+                .default_size(width)
+                .size_range(240.0..=max_w)
+                .resizable(true)
+                .frame(
+                    Frame::new()
+                        .fill(theme.sidebar_bg)
+                        .inner_margin(Margin::ZERO),
+                )
+                .show(ui, |ui| {
+                    self.aux_sidebar_ui(ui, &style);
+                });
+            let new_w = aux_resp.response.rect.width();
+            if new_w >= 240.0 {
+                self.aux_sidebar.width = new_w;
+            }
+        }
+
         Panel::bottom("kestrel_status")
             .exact_size(crate::theme::H_STATUS)
             .frame(
@@ -494,6 +517,15 @@ impl KestrelApp {
             );
             resp.on_hover_text(tip).clicked()
         };
+        if action(
+            ui,
+            &mut x,
+            Icon::PanelRight,
+            self.aux_sidebar.visible,
+            "切换右侧辅助栏 (Ctrl+Alt+B)",
+        ) {
+            self.aux_sidebar.visible = !self.aux_sidebar.visible;
+        }
         if action(
             ui,
             &mut x,

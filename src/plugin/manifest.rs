@@ -19,6 +19,31 @@ pub struct Manifest {
     pub main: Option<String>,
     /// Events the plugin may subscribe to beyond the default set.
     pub events: Vec<String>,
+    /// Explicit capability grants (`network`, `exec`, `terminal`, `ui`, `rpc`, `fs:write`).
+    /// When omitted (`None`), legacy v1 capabilities (`exec`, `fs:write`) remain allowed
+    /// while new high-privilege capabilities (`network`, `terminal`, `ui`, `rpc`) require
+    /// explicit declaration.
+    pub permissions: Option<Vec<String>>,
+}
+
+impl Manifest {
+    pub fn permissions_list(&self) -> &[String] {
+        self.permissions.as_deref().unwrap_or(&[])
+    }
+
+    pub fn allows(&self, perm: &str) -> bool {
+        match perm {
+            "network" | "terminal" | "ui" | "rpc" => self
+                .permissions
+                .as_deref()
+                .is_some_and(|list| list.iter().any(|p| p == perm)),
+            "exec" | "fs:write" => match self.permissions.as_deref() {
+                None => true,
+                Some(list) => list.iter().any(|p| p == perm),
+            },
+            _ => false,
+        }
+    }
 }
 
 pub struct Discovered {
@@ -119,12 +144,20 @@ fn validate(manifest: &mut Manifest, dir: &Path) -> Result<(), String> {
         ));
     }
     if let Some(main) = &manifest.main
-        && !dir.join(main).is_file() {
-            return Err(format!("入口文件不存在: {main}"));
-        }
+        && !dir.join(main).is_file()
+    {
+        return Err(format!("入口文件不存在: {main}"));
+    }
     for event in &manifest.events {
         if !event_name_known(event) {
             return Err(format!("未知事件: {event}"));
+        }
+    }
+    if let Some(perms) = &manifest.permissions {
+        for perm in perms {
+            if !permission_name_known(perm) {
+                return Err(format!("未知权限声明: {perm}"));
+            }
         }
     }
     Ok(())
@@ -134,5 +167,12 @@ pub fn event_name_known(name: &str) -> bool {
     matches!(
         name,
         "startup" | "opened" | "before_save" | "saved" | "closed" | "changed" | "shutdown"
+    )
+}
+
+pub fn permission_name_known(name: &str) -> bool {
+    matches!(
+        name,
+        "network" | "exec" | "terminal" | "ui" | "rpc" | "fs:write"
     )
 }

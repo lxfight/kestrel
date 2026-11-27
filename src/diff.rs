@@ -225,6 +225,16 @@ struct DiffMinimapCache {
     buckets: Vec<DiffMinimapBucket>,
 }
 
+/// Metadata for an in-memory edit proposal raised by a plugin (e.g. an AI coding
+/// agent) waiting for human review inside the diff view.
+#[derive(Clone, Debug)]
+pub struct DiffProposal {
+    pub runtime: u64,
+    pub proposal_id: u64,
+    pub title: String,
+    pub proposed_text: String,
+}
+
 // ---------------------------------------------------------------------------
 // Tab state
 // ---------------------------------------------------------------------------
@@ -235,6 +245,7 @@ pub struct DiffTab {
     pub staged: bool,
     pub status: GitFileStatus,
     pub orig_rel: Option<String>,
+    pub proposal: Option<DiffProposal>,
     pub inline: bool,
     pub data: Option<FileDiff>,
     pub data_rev: u64,
@@ -266,6 +277,7 @@ impl DiffTab {
             staged,
             status,
             orig_rel: None,
+            proposal: None,
             inline: false,
             data: None,
             data_rev: 0,
@@ -290,7 +302,56 @@ impl DiffTab {
     }
 
     pub fn can_edit_working_tree(&self) -> bool {
-        !self.staged && self.status != GitFileStatus::Deleted && self.path.exists()
+        self.proposal.is_none()
+            && !self.staged
+            && self.status != GitFileStatus::Deleted
+            && self.path.exists()
+    }
+
+    /// Build a diff tab directly from an in-memory edit proposal (original vs proposed text).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_proposal(
+        path: PathBuf,
+        rel_path: String,
+        original_text: String,
+        proposed_text: String,
+        title: String,
+        runtime: u64,
+        proposal_id: u64,
+        tab_size: usize,
+    ) -> Self {
+        let status = if original_text.is_empty() && !path.exists() {
+            GitFileStatus::Added
+        } else {
+            GitFileStatus::Modified
+        };
+        let mut tab = Self::new(path.clone(), rel_path.clone(), false, status);
+        tab.tab_size = tab_size;
+        let diff_result = build_memory_diff(
+            &path,
+            rel_path,
+            "当前内容".to_string(),
+            "建议修改".to_string(),
+            &original_text,
+            &proposed_text,
+            tab_size,
+        );
+        match diff_result {
+            Ok(data) => {
+                tab.data = Some(data);
+                tab.data_rev = 1;
+            }
+            Err(err) => {
+                tab.error = Some(err);
+            }
+        }
+        tab.proposal = Some(DiffProposal {
+            runtime,
+            proposal_id,
+            title,
+            proposed_text,
+        });
+        tab
     }
 
     /// Start computing the diff on a worker thread.
@@ -542,12 +603,15 @@ pub enum DiffCommand {
     Stage { hunk: usize },
     Unstage { hunk: usize },
     Discard { hunk: usize },
+    AcceptProposal,
+    RejectProposal,
 }
 
 impl DiffCommand {
     pub fn hunk(self) -> usize {
         match self {
             Self::Stage { hunk } | Self::Unstage { hunk } | Self::Discard { hunk } => hunk,
+            Self::AcceptProposal | Self::RejectProposal => 0,
         }
     }
 
@@ -556,6 +620,8 @@ impl DiffCommand {
             Self::Stage { .. } => "已暂存所选差异块",
             Self::Unstage { .. } => "已取消暂存所选差异块",
             Self::Discard { .. } => "已丢弃所选差异块",
+            Self::AcceptProposal => "已应用建议修改",
+            Self::RejectProposal => "已拒绝建议修改",
         }
     }
 }
@@ -757,6 +823,60 @@ pub fn load_file_diff(
         patch_header,
         patch_hunks,
         hunks,
+        coarse,
+        max_chars,
+    })
+}
+
+/// Build a [`FileDiff`] directly from two in-memory text snapshots (used for
+/// plugin edit proposals).
+fn build_memory_diff(
+    path: &Path,
+    rel_path: String,
+    left_label: String,
+    right_label: String,
+    left_raw: &str,
+    right_raw: &str,
+    tab_size: usize,
+) -> Result<FileDiff, String> {
+    if left_raw.len() + right_raw.len() > MAX_DIFF_BYTES {
+        return Err("文件内容过大，无法显示逐行对比".to_string());
+    }
+    let language = Language::from_path(path);
+    let left_text = normalize_text(&left_raw.replace("\r\n", "\n"), tab_size);
+    let right_text = normalize_text(&right_raw.replace("\r\n", "\n"), tab_size);
+    let left_lines = split_lines(&left_text);
+    let right_lines = split_lines(&right_text);
+    if left_lines.len() + right_lines.len() > MAX_DIFF_LINES {
+        return Err("文件行数过多，无法显示逐行对比".to_string());
+    }
+    let (rows, changes, coarse) = compute_rows(&left_lines, &right_lines);
+    let left_loaded = build_loaded(&left_text, language, true);
+    let right_loaded = build_loaded(&right_text, language, true);
+    let max_chars = left_lines
+        .iter()
+        .chain(right_lines.iter())
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(0);
+    let inline_rows = build_inline_rows(&rows);
+    Ok(FileDiff {
+        rel_path,
+        staged: false,
+        left_label,
+        right_label,
+        left: left_text,
+        right: right_text,
+        left_starts: left_loaded.starts,
+        right_starts: right_loaded.starts,
+        left_spans: left_loaded.spans,
+        right_spans: right_loaded.spans,
+        rows,
+        inline_rows,
+        changes,
+        patch_header: String::new(),
+        patch_hunks: Vec::new(),
+        hunks: Vec::new(),
         coarse,
         max_chars,
     })
@@ -1890,6 +2010,96 @@ pub fn diff_ui(
                     .unwrap_or((0, 0));
                 tab.open_inline_edit(s, e);
             }
+        }
+    }
+
+    if let Some(proposal) = tab.proposal.clone() {
+        let (banner, _) = ui.allocate_exact_size(Vec2::new(width, 36.0), Sense::hover());
+        ui.painter().rect_filled(banner, 0.0, theme.accent_subtle);
+        ui.painter().line_segment(
+            [
+                Pos2::new(banner.left(), banner.bottom() - 0.5),
+                Pos2::new(banner.right(), banner.bottom() - 0.5),
+            ],
+            Stroke::new(1.0, theme.border),
+        );
+        let title = if proposal.title.is_empty() {
+            format!("插件建议修改: {}", tab.rel_path)
+        } else {
+            proposal.title
+        };
+        let reject_rect = Rect::from_min_size(
+            Pos2::new(banner.right() - 78.0, banner.center().y - 12.0),
+            Vec2::new(68.0, 24.0),
+        );
+        let accept_rect = Rect::from_min_size(
+            Pos2::new(reject_rect.left() - 96.0, banner.center().y - 12.0),
+            Vec2::new(88.0, 24.0),
+        );
+        let title_clip = Rect::from_min_max(
+            Pos2::new(banner.left() + 12.0, banner.top()),
+            Pos2::new((accept_rect.left() - 10.0).max(banner.left() + 40.0), banner.bottom()),
+        );
+        ui.painter().with_clip_rect(title_clip).text(
+            Pos2::new(banner.left() + 12.0, banner.center().y),
+            Align2::LEFT_CENTER,
+            title,
+            style.bold(11.5),
+            theme.text,
+        );
+        let accept_resp = ui.interact(
+            accept_rect,
+            ui.scope_id().with(("proposal_accept", proposal.proposal_id)),
+            Sense::click(),
+        );
+        ui.painter().rect_filled(
+            accept_rect,
+            CornerRadius::same(4),
+            if accept_resp.hovered() {
+                theme.accent
+            } else {
+                theme.accent_fill
+            },
+        );
+        ui.painter().text(
+            accept_rect.center(),
+            Align2::CENTER_CENTER,
+            "接受修改",
+            style.small(),
+            theme.accent_text,
+        );
+        if accept_resp.clicked() {
+            tab.pending = Some(DiffCommand::AcceptProposal);
+        }
+        let reject_resp = ui.interact(
+            reject_rect,
+            ui.scope_id().with(("proposal_reject", proposal.proposal_id)),
+            Sense::click(),
+        );
+        ui.painter().rect_filled(
+            reject_rect,
+            CornerRadius::same(4),
+            if reject_resp.hovered() {
+                theme.error.gamma_multiply(0.28)
+            } else {
+                theme.error.gamma_multiply(0.16)
+            },
+        );
+        ui.painter().rect_stroke(
+            reject_rect,
+            CornerRadius::same(4),
+            Stroke::new(1.0, theme.error.gamma_multiply(0.5)),
+            StrokeKind::Inside,
+        );
+        ui.painter().text(
+            reject_rect.center(),
+            Align2::CENTER_CENTER,
+            "拒绝",
+            style.small(),
+            theme.error,
+        );
+        if reject_resp.clicked() {
+            tab.pending = Some(DiffCommand::RejectProposal);
         }
     }
 

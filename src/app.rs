@@ -137,6 +137,12 @@ pub struct SidebarUi {
     pub plugin_installed_open: bool,
 }
 
+pub struct AuxSidebarUi {
+    pub visible: bool,
+    pub width: f32,
+    pub active_view: Option<String>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum TreeEditKind {
     NewFile,
@@ -808,6 +814,7 @@ pub struct KestrelApp {
     pub custom_shortcuts: std::collections::HashMap<Command, Shortcut>,
     pub pending_plugin_commands: Vec<Command>,
     pub sidebar: SidebarUi,
+    pub aux_sidebar: AuxSidebarUi,
     pub palette: PaletteState,
     pub bottom: BottomPanel,
     pub dialog: Option<Dialog>,
@@ -884,7 +891,8 @@ impl KestrelApp {
         theme.apply(&cc.egui_ctx);
         let ui_ready_ms = startup_started.elapsed().as_secs_f64() * 1000.0;
         let plugin_started = std::time::Instant::now();
-        let plugins = PluginHost::new(&settings);
+        let mut plugins = PluginHost::new(&settings);
+        plugins.set_repaint_ctx(cc.egui_ctx.clone());
         let custom_shortcuts = build_custom_shortcuts(&settings);
         let (_, baseline_rx) = std::sync::mpsc::channel();
 
@@ -910,6 +918,11 @@ impl KestrelApp {
                 plugin_search: String::new(),
                 plugin_search_focus: false,
                 plugin_installed_open: true,
+            },
+            aux_sidebar: AuxSidebarUi {
+                visible: false,
+                width: settings.aux_sidebar_width.clamp(240.0, 720.0),
+                active_view: None,
             },
             settings,
             theme,
@@ -1160,6 +1173,9 @@ impl KestrelApp {
         self.sidebar.visible = session.sidebar_visible;
         if session.sidebar_width >= 180.0 {
             self.sidebar.width = session.sidebar_width;
+        }
+        if session.aux_sidebar_width >= 240.0 {
+            self.aux_sidebar.width = session.aux_sidebar_width;
         }
         self.sidebar.mode = SidebarMode::from_str(&session.sidebar_mode);
         self.bottom.height = session.bottom_height.max(120.0);
@@ -1479,6 +1495,7 @@ impl KestrelApp {
             active_group: self.active_group,
             sidebar_visible: self.sidebar.visible,
             sidebar_width: self.sidebar.width,
+            aux_sidebar_width: self.aux_sidebar.width,
             sidebar_mode: self.sidebar.mode.as_str().to_string(),
             bottom_visible: self.bottom.visible,
             bottom_tab: self.bottom.tab.as_str().to_string(),
@@ -2675,14 +2692,78 @@ impl KestrelApp {
         }
     }
 
-    /// Apply hunk-level Git actions parked by the diff view's hunk buttons. Git
-    /// runs here, outside the paint pass; each action reloads its diff tab and
-    /// the Git panel through the regular refresh path.
+    /// Open a dedicated proposal diff tab for a plugin edit request (`kestrel.propose_edit`).
+    pub fn open_proposal_diff(
+        &mut self,
+        runtime: u64,
+        proposal_id: u64,
+        path: PathBuf,
+        proposed_text: String,
+        title: String,
+    ) {
+        let rel_path = self
+            .workspace
+            .root
+            .as_ref()
+            .and_then(|root| path.strip_prefix(root).ok())
+            .map(|rel| rel.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/"))
+            .unwrap_or_else(|| path.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/"));
+        let target_canon = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        let original_text = self
+            .tabs
+            .iter()
+            .find(|tab| {
+                tab.diff.is_none()
+                    && tab.multimodal.is_none()
+                    && tab.doc.path.as_ref().is_some_and(|p| {
+                        p == &path
+                            || std::fs::canonicalize(p)
+                                .map(|c| c == target_canon)
+                                .unwrap_or(false)
+                    })
+            })
+            .map(|tab| tab.doc.text())
+            .or_else(|| std::fs::read_to_string(&path).ok())
+            .unwrap_or_default();
+        let language = Language::from_path(&path);
+        let mut doc = Document::from_text("");
+        doc.readonly = true;
+        let id = self.next_id;
+        self.next_id += 1;
+        let mut editor = Editor::new(doc, id, 0);
+        editor.set_language(language);
+        editor.virtual_title = Some(format!("{rel_path} (建议修改)"));
+        let diff = crate::diff::DiffTab::new_proposal(
+            path,
+            rel_path,
+            original_text,
+            proposed_text,
+            title,
+            runtime,
+            proposal_id,
+            self.settings.tab_size,
+        );
+        editor.diff = Some(diff);
+        self.tabs.push(editor);
+        self.attach_editor_to_active_group(id);
+    }
+
+    /// Close every view of the editor with `tab_id` across all groups.
+    fn close_tab_by_id(&mut self, tab_id: u64) {
+        for gi in (0..self.groups.len()).rev() {
+            if self.groups[gi].index_of(tab_id).is_some()
+                && let Some(idx) = self.tabs.iter().position(|t| t.id == tab_id)
+            {
+                self.close_tab_force_in_group(gi, idx);
+            }
+        }
+    }
+
+    /// Apply hunk-level Git actions and plugin edit-proposal accept/reject actions
+    /// parked by the diff view. Runs outside the paint pass.
     fn apply_diff_commands(&mut self) {
-        let Some(root) = self.workspace.root.clone() else {
-            return;
-        };
-        let mut commands = Vec::new();
+        let mut proposal_actions = Vec::new();
+        let mut git_commands = Vec::new();
         for tab in &mut self.tabs {
             let Some(diff) = tab.diff.as_mut() else {
                 continue;
@@ -2690,14 +2771,50 @@ impl KestrelApp {
             let Some(command) = diff.pending.take() else {
                 continue;
             };
-            let patch = diff
-                .data
-                .as_ref()
-                .and_then(|data| data.hunk_patch(command.hunk()));
-            diff.pending_scroll_y = Some(diff.last_scroll_y);
-            commands.push((tab.id, command, patch, diff.staged));
+            match command {
+                crate::diff::DiffCommand::AcceptProposal
+                | crate::diff::DiffCommand::RejectProposal => {
+                    if let Some(proposal) = diff.proposal.take() {
+                        proposal_actions.push((
+                            tab.id,
+                            diff.path.clone(),
+                            proposal,
+                            command == crate::diff::DiffCommand::AcceptProposal,
+                        ));
+                    }
+                }
+                _ => {
+                    let patch = diff
+                        .data
+                        .as_ref()
+                        .and_then(|data| data.hunk_patch(command.hunk()));
+                    diff.pending_scroll_y = Some(diff.last_scroll_y);
+                    git_commands.push((tab.id, command, patch, diff.staged));
+                }
+            }
         }
-        for (tab_id, command, patch, staged) in commands {
+        for (tab_id, path, proposal, accepted) in proposal_actions {
+            if accepted {
+                self.apply_file_content(path.clone(), proposal.proposed_text, true);
+                if let Some(root) = self.workspace.root.clone() {
+                    self.workspace.tree.reload();
+                    self.workspace.index.scan(&root);
+                    self.git.refresh(&root);
+                }
+                self.toast("已应用插件建议修改", ToastKind::Success);
+            } else {
+                self.toast("已拒绝插件建议修改", ToastKind::Info);
+            }
+            self.close_tab_by_id(tab_id);
+            let ctx = self.plugin_context(self.tabs.get(self.active).map(|tab| tab.id));
+            self.plugins
+                .resolve_proposal(proposal.runtime, proposal.proposal_id, accepted, &ctx);
+            self.apply_plugin_actions();
+        }
+        let Some(root) = self.workspace.root.clone() else {
+            return;
+        };
+        for (tab_id, command, patch, staged) in git_commands {
             let label = command.success_label();
             let Some(patch) = patch else {
                 self.toast(
@@ -2714,6 +2831,8 @@ impl KestrelApp {
                 crate::diff::DiffCommand::Discard { .. } => {
                     crate::git::discard_patch(&root, &patch, staged)
                 }
+                crate::diff::DiffCommand::AcceptProposal
+                | crate::diff::DiffCommand::RejectProposal => Ok(()),
             };
             match result {
                 Ok(()) => self.toast(label, ToastKind::Success),
@@ -2890,6 +3009,10 @@ impl KestrelApp {
             return;
         }
         let id = self.tabs[index].id;
+        let dismissed_proposal = self.tabs[index]
+            .diff
+            .as_mut()
+            .and_then(|diff| diff.proposal.take());
         let mut active_group = self.active_group;
         if let Some(pos) = self.groups[group].index_of(id) {
             self.groups[group].tabs.remove(pos);
@@ -2913,6 +3036,12 @@ impl KestrelApp {
         }
         self.active_group = active_group;
         self.prune_editors();
+        if let Some(proposal) = dismissed_proposal {
+            let ctx = self.plugin_context(self.tabs.get(self.active).map(|tab| tab.id));
+            self.plugins
+                .resolve_proposal(proposal.runtime, proposal.proposal_id, false, &ctx);
+            self.apply_plugin_actions();
+        }
         if self.tabs.is_empty() {
             self.active = 0;
             self.reset_groups();
@@ -4187,6 +4316,67 @@ impl KestrelApp {
         self.open_terminal_in(cwd, shell);
     }
 
+    /// Run a shell command in a named (or newly spawned) integrated PTY terminal.
+    pub(crate) fn plugin_terminal_run(
+        &mut self,
+        name: Option<String>,
+        command: String,
+        cwd: Option<PathBuf>,
+        show: bool,
+    ) {
+        let existing_idx = name.as_deref().and_then(|target| {
+            self.bottom
+                .terminals
+                .iter_mut()
+                .position(|t| t.title() == target && t.is_alive())
+        });
+        let idx = if let Some(idx) = existing_idx {
+            idx
+        } else {
+            let dir = cwd
+                .or_else(|| self.workspace.root.clone())
+                .or_else(|| std::env::current_dir().ok())
+                .unwrap_or_default();
+            let was_visible = self.bottom.visible;
+            self.open_terminal_in(dir, ShellKind::Default);
+            if !show {
+                self.bottom.visible = was_visible;
+            }
+            let idx = self.bottom.terminals.len().saturating_sub(1);
+            if let Some(title) = name
+                && let Some(term) = self.bottom.terminals.get_mut(idx)
+            {
+                term.custom_title = Some(title);
+            }
+            idx
+        };
+        if let Some(term) = self.bottom.terminals.get_mut(idx) {
+            let mut line = command;
+            if !line.ends_with('\r') && !line.ends_with('\n') {
+                line.push('\r');
+            }
+            term.write(line.as_bytes());
+        }
+        if show {
+            self.focus_terminal_index(idx);
+            self.bottom.visible = true;
+            self.bottom.tab = BottomTab::Terminal;
+        }
+    }
+
+    pub(crate) fn plugin_terminal_send(&mut self, name: Option<String>, text: String) {
+        if let Some(name) = name.as_deref() {
+            for term in &mut self.bottom.terminals {
+                if term.title() == name && term.is_alive() {
+                    term.write(text.as_bytes());
+                    break;
+                }
+            }
+        } else if let Some(term) = self.bottom.terminals.get_mut(self.bottom.active_terminal) {
+            term.write(text.as_bytes());
+        }
+    }
+
     pub fn open_terminal_at(&mut self, path: PathBuf) {
         let dir = if path.is_dir() {
             path
@@ -4775,6 +4965,7 @@ impl KestrelApp {
             Command::ShowPalette => self.open_palette(PaletteMode::Commands),
             Command::QuickOpen => self.open_palette(PaletteMode::QuickOpen),
             Command::ToggleSidebar => self.sidebar.visible = !self.sidebar.visible,
+            Command::ToggleAuxSidebar => self.aux_sidebar.visible = !self.aux_sidebar.visible,
             Command::ToggleTerminal => self.toggle_terminal(),
             Command::FocusTerminal => self.focus_terminal(),
             Command::NewTerminal => self.new_terminal(),
@@ -4941,6 +5132,7 @@ impl KestrelApp {
 
     pub fn finish_apply_update_now(&mut self, ctx: &egui::Context, allow_elevation: bool) {
         self.settings.sidebar_width = self.sidebar.width;
+        self.settings.aux_sidebar_width = self.aux_sidebar.width;
         self.settings.terminal_height = self.bottom.height;
         self.settings.terminal_follow_active_dir = self.bottom.follow_active_dir;
         self.settings.flush();
@@ -5468,8 +5660,11 @@ impl KestrelApp {
         {
             ctx.request_repaint_after(delay);
         }
-        if self.plugins.has_pending_exec() {
-            ctx.request_repaint_after(Duration::from_millis(60));
+        if let Some(delay) = self.plugins.next_timer_delay() {
+            ctx.request_repaint_after(delay.max(Duration::from_millis(5)));
+        }
+        if self.plugins.has_pending_async() {
+            ctx.request_repaint_after(Duration::from_millis(120));
         }
         if self.settings.autosave {
             let mut next_autosave: Option<Duration> = None;
