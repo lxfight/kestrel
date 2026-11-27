@@ -675,7 +675,11 @@ impl KestrelApp {
             );
         });
         ui.menu_button("帮助", |ui| {
-            self.menu_items(ui, style, &[Command::Shortcuts, Command::About]);
+            self.menu_items(
+                ui,
+                style,
+                &[Command::Shortcuts, Command::CheckForUpdates, Command::About],
+            );
         })
         .response
         .rect
@@ -2577,6 +2581,23 @@ impl KestrelApp {
         // its hover plate underneath. Its left edge bounds the left cluster so
         // the two can never overlap on narrow windows.
         let mut right: Vec<StatusSegment> = Vec::new();
+        if let Some((text, tip, highlight)) = self.updater.status_badge() {
+            right.push(StatusSegment {
+                text,
+                color: if highlight {
+                    theme.accent
+                } else {
+                    theme.text_dim
+                },
+                font: if highlight {
+                    style.small_bold()
+                } else {
+                    style.small()
+                },
+                action: Some(StatusAction::Update),
+                tip,
+            });
+        }
         if (self.settings.ui_zoom - 1.0).abs() > 0.01 {
             right.push(StatusSegment {
                 text: self.status_cache.zoom(self.settings.ui_zoom).to_owned(),
@@ -2952,6 +2973,7 @@ impl KestrelApp {
                 continue;
             }
             match action {
+                StatusAction::Update => self.dialog = Some(crate::app::Dialog::Update),
                 StatusAction::Zoom => self.set_ui_zoom(1.0, &ctx),
                 StatusAction::Language => {
                     self.open_palette(PaletteMode::Language);
@@ -3798,6 +3820,7 @@ struct StatusSegment {
 
 /// What clicking a status-bar segment does.
 enum StatusAction {
+    Update,
     Zoom,
     Language,
     Cursor,

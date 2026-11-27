@@ -18,6 +18,7 @@ mod settings;
 mod terminal;
 mod theme;
 mod ui;
+mod updater;
 mod viewer;
 mod workspace;
 
@@ -79,6 +80,9 @@ fn install_panic_hook() {
 
 fn main() -> eframe::Result {
     install_panic_hook();
+    if let Some(code) = updater::apply::maybe_run_helper_from_args() {
+        std::process::exit(code);
+    }
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
         viewport: egui::ViewportBuilder::default()

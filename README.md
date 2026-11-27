@@ -50,6 +50,10 @@
 - 支持注册命令与快捷键、状态栏交互项、文档读写、生命周期钩子、异步外部进程调用与插件私有配置持久化。
 - 插件视图（`Ctrl+Shift+X`）支持免重启热启用、禁用、重载与重新扫描，实时展示各插件 Lua 内存占用并在禁用时立即回收。
 
+### 双形态自动更新
+- **安装版与便携版自适应**：自动识别 Windows 用户级安装版（Inno Setup，`%LOCALAPPDATA%\Programs\Kestrel\` 免 UAC）与便携单文件版；安装版通过静默安装程序平滑升级并同步系统集成，便携版通过无黑框原生辅助进程完成原子替换与失败回滚。
+- **零重依赖与高可靠校验**：基于原生系统网络栈自动继承系统代理，支持静态 `manifest.json` + ETag 缓存避免 GitHub API 限流，下载全程流式写入并强制 SHA-256 完整性校验；重启更新前自动保护未保存文档并无损恢复工作区会话。
+
 ---
 
 ## 技术栈与项目结构
@@ -78,6 +82,7 @@ src/
 ├── workspace/         # 文件树、后台文件索引、多线程全局搜索、文件监听
 ├── terminal.rs        # ConPTY / PTY 会话管理与 vt100 终端缓冲
 ├── plugin/            # Lua 5.4 插件宿主、清单解析、API 绑定与插件管理面板
+├── updater/           # 双形态自动更新引擎（清单解析、流式下载、SHA-256 校验、自替换/安装器交接）
 ├── ui/                # 顶栏、侧边栏、命令面板、弹窗、终端面板与基础控件
 ├── settings.rs        # 配置、自定义快捷键与会话状态持久化
 ├── theme.rs           # 深色/浅色设计系统 Token
@@ -125,6 +130,10 @@ bash scripts/build.sh --debug  # Debug 构建
 | `KESTREL_PLUGINS=<dir>` | 指定自定义插件根目录（便于本地插件开发调试） |
 | `KESTREL_TRACE=1` | 在输出面板记录插件加载、内存与命令耗时日志 |
 | `KESTREL_PROFILE=1` | 输出启动与帧耗时诊断信息 |
+| `KESTREL_UPDATE_URL=<url>` | 覆盖自动更新的 `manifest.json` 地址（支持本地 `127.0.0.1` 联调） |
+| `KESTREL_UPDATE_ALLOW_DEV=1` | 在开发构建中允许自动检查与替换更新（默认关闭保护开发产物） |
+| `KESTREL_INSTALL_KIND=installed\|portable` | 覆盖运行形态探测（用于联调安装版/便携版分流） |
+| `KESTREL_NO_UPDATE=1` | 完全禁用自动更新检查 |
 
 ### 配置与数据目录
 - **Windows**：`%APPDATA%\Kestrel\`

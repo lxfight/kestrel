@@ -15,9 +15,11 @@ use crate::ui::UiStyle;
 fn dialog_kind(dialog: &Dialog) -> &'static str {
     match dialog {
         Dialog::About => "about",
+        Dialog::Update => "update",
         Dialog::Shortcuts => "shortcuts",
         Dialog::Settings => "settings",
         Dialog::ConfirmClose => "confirm_close",
+        Dialog::ConfirmUpdateClose { .. } => "confirm_update_close",
         Dialog::ConfirmCloseAll => "confirm_close_all",
         Dialog::ConfirmCloseTab(_, _) => "confirm_close_tab",
         Dialog::ConfirmDelete(_) => "confirm_delete",
@@ -53,6 +55,7 @@ impl KestrelApp {
         let mut keep = true;
         match &dialog {
             Dialog::About => {
+                let mut open_update = false;
                 let modal = Modal::new(Id::unique("about_modal"))
                     .frame(Self::modal_frame(&style))
                     .show(ctx, |ui| {
@@ -71,8 +74,9 @@ impl KestrelApp {
                             ui.add_space(2.0);
                             ui.label(
                                 egui::RichText::new(format!(
-                                    "版本 {} · 使用 Rust 构建",
-                                    crate::app::APP_VERSION
+                                    "版本 {}（{}）· 使用 Rust 构建",
+                                    crate::app::APP_VERSION,
+                                    self.updater.install_kind.label()
                                 ))
                                 .font(style.small())
                                 .color(theme.text_dim),
@@ -99,14 +103,38 @@ impl KestrelApp {
                                         .color(theme.text_dim),
                                 );
                             }
-                            ui.add_space(18.0);
-                            if Self::modal_button(ui, &style, "关闭", true) {
-                                keep = false;
-                            }
+                            ui.add_space(12.0);
+                            ui.label(
+                                egui::RichText::new(self.updater.status_summary())
+                                    .font(style.tiny())
+                                    .color(theme.text_muted),
+                            );
+                            ui.add_space(14.0);
+                            ui.horizontal(|ui| {
+                                let total_w = 104.0 * 2.0 + 8.0;
+                                let pad = ((ui.available_width() - total_w) * 0.5).max(0.0);
+                                ui.add_space(pad);
+                                if Self::modal_button(ui, &style, "检查更新", false) {
+                                    open_update = true;
+                                }
+                                if Self::modal_button(ui, &style, "关闭", true) {
+                                    keep = false;
+                                }
+                            });
                         });
                     });
                 if modal.should_close() {
                     keep = false;
+                }
+                if open_update {
+                    self.trigger_check_for_updates(ctx);
+                    return;
+                }
+            }
+            Dialog::Update => {
+                keep = self.update_modal_ui(ctx, &style);
+                if self.dialog.is_some() {
+                    return;
                 }
             }
             Dialog::Shortcuts => {
@@ -512,6 +540,67 @@ impl KestrelApp {
                     }
                     Some(2) => keep = false,
                     None => {}
+                    _ => {}
+                }
+            }
+            Dialog::ConfirmUpdateClose { allow_elevation } => {
+                let allow_elevation = *allow_elevation;
+                let dirty = self.dirty_tabs();
+                let mut action: Option<u8> = None;
+                Modal::new(Id::unique("confirm_update_close_modal"))
+                    .frame(Self::modal_frame(&style))
+                    .show(ctx, |ui| {
+                        ui.set_width(420.0);
+                        ui.label(
+                            egui::RichText::new("重启更新前有未保存的文件")
+                                .font(style.font(16.0))
+                                .color(theme.text),
+                        );
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new("更新完成后会自动恢复当前工作区和标签页。是否先保存以下更改？")
+                                .font(style.small())
+                                .color(theme.text_dim),
+                        );
+                        ui.add_space(8.0);
+                        for name in dirty.iter().take(8) {
+                            ui.label(
+                                egui::RichText::new(format!("•  {name}"))
+                                    .font(style.small())
+                                    .color(theme.text_dim),
+                            );
+                        }
+                        ui.add_space(16.0);
+                        ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                            if Self::modal_button(ui, &style, "保存并更新", true) {
+                                action = Some(0);
+                            }
+                            if Self::modal_button(ui, &style, "不保存", false) {
+                                action = Some(1);
+                            }
+                            if Self::modal_button(ui, &style, "取消", false) {
+                                action = Some(2);
+                            }
+                        });
+                    });
+                match action {
+                    Some(0) => {
+                        self.save_all();
+                        if self.tabs.iter().any(|t| t.is_dirty()) {
+                            self.toast("存在无法自动保存的未命名文件，请手动保存后再更新", ToastKind::Warning);
+                        } else {
+                            self.finish_apply_update_now(ctx, allow_elevation);
+                            return;
+                        }
+                    }
+                    Some(1) => {
+                        self.finish_apply_update_now(ctx, allow_elevation);
+                        return;
+                    }
+                    Some(2) => {
+                        self.dialog = Some(Dialog::Update);
+                        return;
+                    }
                     _ => {}
                 }
             }
@@ -937,6 +1026,7 @@ impl KestrelApp {
         let mut settings = self.settings.clone();
         let mut changed = false;
         let mut open_plugins = false;
+        let mut trigger_update_check = false;
 
         ui.horizontal_top(|ui| {
             ui.vertical(|ui| {
@@ -948,6 +1038,7 @@ impl KestrelApp {
                     ("files", "文件", Icon::Folder),
                     ("git", "Git", Icon::SourceControl),
                     ("plugins", "插件", Icon::Extensions),
+                    ("updates", "更新", Icon::CloudDownload),
                 ] {
                     let active = !searching && section == key;
                     let (rect, resp) = ui.allocate_exact_size(
@@ -1480,6 +1571,254 @@ impl KestrelApp {
                             }
                         }
 
+                        if searching || section == "updates" {
+                            let mut shown = false;
+                            if matches("自动更新 模式 检查 update mode auto download manual") {
+                                Self::settings_section_header(ui, style, &mut shown, "更新");
+                                let mode = crate::updater::manifest::UpdateMode::from_str(
+                                    &settings.update_mode,
+                                );
+                                let mode_label = match mode {
+                                    crate::updater::manifest::UpdateMode::Prompt => "自动检查并提示",
+                                    crate::updater::manifest::UpdateMode::AutoDownload => {
+                                        "后台自动下载"
+                                    }
+                                    crate::updater::manifest::UpdateMode::Manual => "仅手动检查",
+                                };
+                                changed |= Self::settings_row(
+                                    ui,
+                                    style,
+                                    "更新策略",
+                                    "启动后自动检查新版本并按当前形态（安装版/便携版）更新",
+                                    |ui| {
+                                        let mut picked = false;
+                                        let (rect, resp) = ui.allocate_exact_size(
+                                            Vec2::new(152.0, 26.0),
+                                            Sense::click(),
+                                        );
+                                        ui.painter().rect_filled(
+                                            rect,
+                                            CornerRadius::same(5),
+                                            if resp.hovered() {
+                                                style.theme.hover
+                                            } else {
+                                                style.theme.input_bg
+                                            },
+                                        );
+                                        ui.painter().rect_stroke(
+                                            rect,
+                                            CornerRadius::same(5),
+                                            Stroke::new(1.0, style.theme.border),
+                                            StrokeKind::Inside,
+                                        );
+                                        ui.painter().text(
+                                            Pos2::new(rect.left() + 8.0, rect.center().y),
+                                            Align2::LEFT_CENTER,
+                                            mode_label,
+                                            style.tiny(),
+                                            style.theme.text,
+                                        );
+                                        icons::paint(
+                                            ui.painter(),
+                                            Rect::from_center_size(
+                                                Pos2::new(rect.right() - 12.0, rect.center().y),
+                                                Vec2::splat(11.0),
+                                            ),
+                                            Icon::ChevronDown,
+                                            style.theme.text_dim,
+                                            1.2,
+                                        );
+                                        egui::Popup::menu(&resp).width(160.0).show(|ui| {
+                                            for (val, text) in [
+                                                ("prompt", "自动检查并提示"),
+                                                ("auto_download", "后台自动下载"),
+                                                ("manual", "仅手动检查"),
+                                            ] {
+                                                if ui.button(text).clicked() {
+                                                    settings.update_mode = val.to_string();
+                                                    picked = true;
+                                                }
+                                            }
+                                        });
+                                        picked
+                                    },
+                                );
+                            }
+                            if matches("更新通道 稳定版 预览版 channel stable prerelease beta") {
+                                Self::settings_section_header(ui, style, &mut shown, "更新");
+                                let channel = crate::updater::manifest::UpdateChannel::from_str(
+                                    &settings.update_channel,
+                                );
+                                let channel_label = match channel {
+                                    crate::updater::manifest::UpdateChannel::Stable => {
+                                        "稳定版 (Stable)"
+                                    }
+                                    crate::updater::manifest::UpdateChannel::Prerelease => {
+                                        "预览版 (Pre-release)"
+                                    }
+                                };
+                                changed |= Self::settings_row(
+                                    ui,
+                                    style,
+                                    "更新通道",
+                                    "稳定版仅接收正式发布，预览版包含 beta / rc 测试版",
+                                    |ui| {
+                                        let mut picked = false;
+                                        let (rect, resp) = ui.allocate_exact_size(
+                                            Vec2::new(152.0, 26.0),
+                                            Sense::click(),
+                                        );
+                                        ui.painter().rect_filled(
+                                            rect,
+                                            CornerRadius::same(5),
+                                            if resp.hovered() {
+                                                style.theme.hover
+                                            } else {
+                                                style.theme.input_bg
+                                            },
+                                        );
+                                        ui.painter().rect_stroke(
+                                            rect,
+                                            CornerRadius::same(5),
+                                            Stroke::new(1.0, style.theme.border),
+                                            StrokeKind::Inside,
+                                        );
+                                        ui.painter().text(
+                                            Pos2::new(rect.left() + 8.0, rect.center().y),
+                                            Align2::LEFT_CENTER,
+                                            channel_label,
+                                            style.tiny(),
+                                            style.theme.text,
+                                        );
+                                        icons::paint(
+                                            ui.painter(),
+                                            Rect::from_center_size(
+                                                Pos2::new(rect.right() - 12.0, rect.center().y),
+                                                Vec2::splat(11.0),
+                                            ),
+                                            Icon::ChevronDown,
+                                            style.theme.text_dim,
+                                            1.2,
+                                        );
+                                        egui::Popup::menu(&resp).width(160.0).show(|ui| {
+                                            for (val, text) in [
+                                                ("stable", "稳定版 (Stable)"),
+                                                ("prerelease", "预览版 (Pre-release)"),
+                                            ] {
+                                                if ui.button(text).clicked() {
+                                                    settings.update_channel = val.to_string();
+                                                    picked = true;
+                                                }
+                                            }
+                                        });
+                                        picked
+                                    },
+                                );
+                            }
+                            if matches("更新源 镜像 代理 mirror url custom update") {
+                                Self::settings_section_header(ui, style, &mut shown, "更新");
+                                changed |= Self::settings_row(
+                                    ui,
+                                    style,
+                                    "自定义更新源 / 镜像",
+                                    "留空使用官方 GitHub Releases；可填镜像前缀或 manifest.json 地址",
+                                    |ui| {
+                                        let resp = ui.add_sized(
+                                            Vec2::new(164.0, 24.0),
+                                            TextEdit::singleline(&mut settings.update_mirror_url)
+                                                .hint_text("例如 https://mirror.example.com")
+                                                .font(style.tiny()),
+                                        );
+                                        resp.changed()
+                                    },
+                                );
+                            }
+                            if let Some(skipped) = settings.update_skipped_version.clone()
+                                && matches("跳过版本 skipped version update")
+                            {
+                                Self::settings_section_header(ui, style, &mut shown, "更新");
+                                changed |= Self::settings_row(
+                                    ui,
+                                    style,
+                                    "已跳过版本",
+                                    &format!("后台检查已忽略 v{skipped}"),
+                                    |ui| {
+                                        let (rect, resp) = ui.allocate_exact_size(
+                                            Vec2::new(84.0, 26.0),
+                                            Sense::click(),
+                                        );
+                                        if resp.hovered() {
+                                            ui.painter().rect_filled(
+                                                rect,
+                                                CornerRadius::same(5),
+                                                style.theme.hover,
+                                            );
+                                        }
+                                        ui.painter().text(
+                                            rect.center(),
+                                            Align2::CENTER_CENTER,
+                                            "恢复提醒",
+                                            style.tiny(),
+                                            style.theme.text_dim,
+                                        );
+                                        if resp.clicked() {
+                                            settings.update_skipped_version = None;
+                                            return true;
+                                        }
+                                        false
+                                    },
+                                );
+                            }
+                            if matches("检查更新 版本 安装版 便携版 check update version") {
+                                Self::settings_section_header(ui, style, &mut shown, "更新");
+                                let summary = format!(
+                                    "{} · 上次检查: {}",
+                                    self.updater.status_summary(),
+                                    crate::updater::format_unix_relative(
+                                        self.updater.last_check_unix
+                                    )
+                                );
+                                changed |= Self::settings_row(
+                                    ui,
+                                    style,
+                                    "当前版本与状态",
+                                    &summary,
+                                    |ui| {
+                                        let (rect, resp) = ui.allocate_exact_size(
+                                            Vec2::new(84.0, 26.0),
+                                            Sense::click(),
+                                        );
+                                        ui.painter().rect_filled(
+                                            rect,
+                                            CornerRadius::same(5),
+                                            if resp.hovered() {
+                                                style.theme.hover
+                                            } else {
+                                                style.theme.surface_subtle
+                                            },
+                                        );
+                                        ui.painter().rect_stroke(
+                                            rect,
+                                            CornerRadius::same(5),
+                                            Stroke::new(1.0, style.theme.border),
+                                            StrokeKind::Inside,
+                                        );
+                                        ui.painter().text(
+                                            rect.center(),
+                                            Align2::CENTER_CENTER,
+                                            "检查更新",
+                                            style.tiny(),
+                                            style.theme.text,
+                                        );
+                                        if resp.clicked() {
+                                            trigger_update_check = true;
+                                        }
+                                        false
+                                    },
+                                );
+                            }
+                        }
+
                         ui.add_space(8.0);
                     });
             });
@@ -1549,6 +1888,496 @@ impl KestrelApp {
             self.sidebar.visible = true;
             self.sidebar.mode = SidebarMode::Plugins;
             keep = false;
+        }
+        if trigger_update_check {
+            self.trigger_check_for_updates(ui.ctx());
+            return false;
+        }
+        keep
+    }
+
+    fn update_modal_ui(&mut self, ctx: &egui::Context, style: &UiStyle) -> bool {
+        use crate::updater::{UpdateState, format_bytes, format_unix_relative};
+
+        let theme = style.theme;
+        let state = self.updater.state.clone();
+        let install_kind = self.updater.install_kind;
+        let last_check = self.updater.last_check_unix;
+        let elevation_prompt = self.updater.elevation_prompt.clone();
+        let dev_restricted = self.updater.dev_restricted;
+        let pending_exit = self.updater.pending_apply_on_exit.is_some();
+
+        enum Action {
+            Close,
+            CheckNow,
+            Download(crate::updater::manifest::ReleaseInfo),
+            CancelDownload,
+            SkipVersion(String),
+            ApplyNow { allow_elevation: bool },
+            ApplyOnExit,
+            OpenUrl(String),
+            OpenStagedDir(std::path::PathBuf),
+        }
+
+        let mut action: Option<Action> = None;
+        let modal = Modal::new(Id::unique("update_modal"))
+            .frame(Self::modal_frame(style))
+            .show(ctx, |ui| {
+                ui.set_width(476.0);
+                // Header
+                ui.horizontal(|ui| {
+                    let (icon_rect, _) =
+                        ui.allocate_exact_size(Vec2::splat(26.0), Sense::hover());
+                    icons::paint(ui.painter(), icon_rect, Icon::CloudDownload, theme.accent, 1.4);
+                    ui.add_space(6.0);
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new("软件更新")
+                                .font(style.bold(16.0))
+                                .color(theme.text),
+                        );
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "当前版本 v{} · {} · 上次检查: {}",
+                                crate::app::APP_VERSION,
+                                install_kind.label(),
+                                format_unix_relative(last_check)
+                            ))
+                            .font(style.tiny())
+                            .color(theme.text_muted),
+                        );
+                    });
+                });
+                ui.add_space(12.0);
+                ui.separator();
+                ui.add_space(12.0);
+
+                match &state {
+                    UpdateState::Idle | UpdateState::UpToDate => {
+                        ui.horizontal(|ui| {
+                            let (r, _) =
+                                ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
+                            icons::paint(ui.painter(), r, Icon::PassFilled, theme.success, 1.3);
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "当前已是最新版本 (v{})",
+                                    crate::app::APP_VERSION
+                                ))
+                                .font(style.small_bold())
+                                .color(theme.text),
+                            );
+                        });
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "更新通道: {} · 自动匹配{}更新包",
+                                crate::updater::manifest::UpdateChannel::from_str(
+                                    &self.settings.update_channel
+                                )
+                                .as_str(),
+                                install_kind.label()
+                            ))
+                            .font(style.tiny())
+                            .color(theme.text_muted),
+                        );
+                        ui.add_space(18.0);
+                        ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                            if Self::modal_button(ui, style, "关闭", true) {
+                                action = Some(Action::Close);
+                            }
+                            if Self::modal_button(ui, style, "重新检查", false) {
+                                action = Some(Action::CheckNow);
+                            }
+                        });
+                    }
+                    UpdateState::Checking => {
+                        ui.horizontal(|ui| {
+                            let (r, _) =
+                                ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
+                            icons::paint(ui.painter(), r, Icon::Sync, theme.accent, 1.3);
+                            ui.label(
+                                egui::RichText::new("正在检查更新，请稍候…")
+                                    .font(style.small())
+                                    .color(theme.text),
+                            );
+                        });
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new("自动继承系统网络代理配置，可在后台继续编辑。")
+                                .font(style.tiny())
+                                .color(theme.text_muted),
+                        );
+                        ui.add_space(18.0);
+                        ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                            if Self::modal_button(ui, style, "后台检查", true) {
+                                action = Some(Action::Close);
+                            }
+                        });
+                    }
+                    UpdateState::Available(info) => {
+                        let size_text = info
+                            .asset
+                            .size
+                            .map(|n| format!(" · {}", format_bytes(n)))
+                            .unwrap_or_default();
+                        let pre_tag = if info.prerelease { " [预览版]" } else { "" };
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "发现新版本 v{}{pre_tag}",
+                                info.version
+                            ))
+                            .font(style.bold(15.0))
+                            .color(theme.accent),
+                        );
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "v{} -> v{} · {}{size_text}",
+                                crate::app::APP_VERSION,
+                                info.version,
+                                info.asset.package_kind.label()
+                            ))
+                            .font(style.tiny())
+                            .color(theme.text_dim),
+                        );
+                        ui.add_space(10.0);
+
+                        let notes_text = if info.notes.trim().is_empty() {
+                            "该版本未提供更新说明，可前往发布页查看完整变更记录。"
+                        } else {
+                            info.notes.trim()
+                        };
+                        Frame::new()
+                            .fill(theme.surface_subtle)
+                            .stroke(Stroke::new(1.0, theme.border))
+                            .corner_radius(CornerRadius::same(crate::theme::R_MD))
+                            .inner_margin(egui::Margin::same(10))
+                            .show(ui, |ui| {
+                                ui.set_min_width(ui.available_width());
+                                ScrollArea::vertical()
+                                    .max_height(170.0)
+                                    .id_salt("update_notes_scroll")
+                                    .show(ui, |ui| {
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(notes_text)
+                                                    .font(style.small())
+                                                    .color(theme.text_dim),
+                                            )
+                                            .wrap(),
+                                        );
+                                    });
+                            });
+
+                        ui.add_space(16.0);
+                        ui.horizontal(|ui| {
+                            if Self::modal_button(ui, style, "跳过此版本", false) {
+                                action = Some(Action::SkipVersion(info.version.to_string()));
+                            }
+                            if Self::modal_button(ui, style, "发布页", false) {
+                                action = Some(Action::OpenUrl(info.release_url.clone()));
+                            }
+                            ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                                if Self::modal_button(ui, style, "下载并更新", true) {
+                                    action = Some(Action::Download(info.clone()));
+                                }
+                                if Self::modal_button(ui, style, "稍后", false) {
+                                    action = Some(Action::Close);
+                                }
+                            });
+                        });
+                    }
+                    UpdateState::Downloading {
+                        info,
+                        downloaded,
+                        total,
+                        speed_bps,
+                    } => {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "正在下载 v{}（{}）…",
+                                info.version,
+                                info.asset.package_kind.label()
+                            ))
+                            .font(style.small_bold())
+                            .color(theme.text),
+                        );
+                        ui.add_space(10.0);
+
+                        let frac = match total {
+                            Some(t) if *t > 0 => (*downloaded as f32 / *t as f32).clamp(0.0, 1.0),
+                            _ => 0.0,
+                        };
+                        let (bar_rect, _) = ui.allocate_exact_size(
+                            Vec2::new(ui.available_width(), 8.0),
+                            Sense::hover(),
+                        );
+                        ui.painter().rect_filled(
+                            bar_rect,
+                            CornerRadius::same(4),
+                            theme.surface_subtle,
+                        );
+                        if frac > 0.0 {
+                            let fill_rect = Rect::from_min_size(
+                                bar_rect.min,
+                                Vec2::new((bar_rect.width() * frac).max(6.0), bar_rect.height()),
+                            );
+                            ui.painter().rect_filled(
+                                fill_rect,
+                                CornerRadius::same(4),
+                                theme.accent_fill,
+                            );
+                        }
+                        ui.add_space(6.0);
+                        let progress_desc = match total {
+                            Some(t) if *t > 0 => format!(
+                                "{} / {} ({:.0}%) · {}/s",
+                                format_bytes(*downloaded),
+                                format_bytes(*t),
+                                frac * 100.0,
+                                format_bytes(*speed_bps)
+                            ),
+                            _ => format!(
+                                "已下载 {} · {}/s",
+                                format_bytes(*downloaded),
+                                format_bytes(*speed_bps)
+                            ),
+                        };
+                        ui.label(
+                            egui::RichText::new(progress_desc)
+                                .font(style.tiny())
+                                .color(theme.text_muted),
+                        );
+                        ui.add_space(18.0);
+                        ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                            if Self::modal_button(ui, style, "后台下载", true) {
+                                action = Some(Action::Close);
+                            }
+                            if Self::modal_button(ui, style, "取消下载", false) {
+                                action = Some(Action::CancelDownload);
+                            }
+                        });
+                    }
+                    UpdateState::Verifying { info } => {
+                        ui.horizontal(|ui| {
+                            let (r, _) =
+                                ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
+                            icons::paint(ui.painter(), r, Icon::Sync, theme.accent, 1.3);
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "正在校验 v{} 的 SHA-256 完整性…",
+                                    info.version
+                                ))
+                                .font(style.small())
+                                .color(theme.text),
+                            );
+                        });
+                        ui.add_space(18.0);
+                        ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                            if Self::modal_button(ui, style, "后台等待", true) {
+                                action = Some(Action::Close);
+                            }
+                        });
+                    }
+                    UpdateState::ReadyToInstall(staged) => {
+                        ui.horizontal(|ui| {
+                            let (r, _) =
+                                ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
+                            icons::paint(ui.painter(), r, Icon::PassFilled, theme.success, 1.3);
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "v{} 已下载并通过完整性校验",
+                                    staged.info.version
+                                ))
+                                .font(style.small_bold())
+                                .color(theme.text),
+                            );
+                        });
+                        ui.add_space(6.0);
+                        let mode_hint = match staged.info.asset.package_kind {
+                            crate::updater::manifest::PackageKind::Installer => {
+                                "安装方式：静默运行用户级安装程序（自动同步版本号与系统集成），重启后自动恢复当前会话。"
+                            }
+                            crate::updater::manifest::PackageKind::PortableZip => {
+                                "安装方式：便携版无黑框原子替换（失败自动回滚），重启后自动恢复当前会话。"
+                            }
+                        };
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(mode_hint)
+                                    .font(style.tiny())
+                                    .color(theme.text_dim),
+                            )
+                            .wrap(),
+                        );
+
+                        if pending_exit {
+                            ui.add_space(8.0);
+                            ui.label(
+                                egui::RichText::new("已设置为下次退出 Kestrel 时自动静默更新。")
+                                    .font(style.tiny())
+                                    .color(theme.accent),
+                            );
+                        }
+
+                        if let Some((dir, _)) = &elevation_prompt {
+                            ui.add_space(10.0);
+                            Frame::new()
+                                .fill(theme.surface_subtle)
+                                .stroke(Stroke::new(1.0, theme.warning))
+                                .corner_radius(CornerRadius::same(crate::theme::R_MD))
+                                .inner_margin(egui::Margin::same(10))
+                                .show(ui, |ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(format!(
+                                                "程序目录 {} 需要管理员权限才能写入。可点击下方按钮通过 UAC 授权继续更新，或打开暂存目录手动替换。",
+                                                dir.display()
+                                            ))
+                                            .font(style.tiny())
+                                            .color(theme.warning),
+                                        )
+                                        .wrap(),
+                                    );
+                                });
+                        }
+
+                        if dev_restricted {
+                            ui.add_space(8.0);
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(
+                                        "提示：当前处于开发构建保护模式，默认禁止覆盖程序文件（设置 KESTREL_UPDATE_ALLOW_DEV=1 可开启联调）。",
+                                    )
+                                    .font(style.tiny())
+                                    .color(theme.warning),
+                                )
+                                .wrap(),
+                            );
+                        }
+
+                        ui.add_space(18.0);
+                        ui.horizontal(|ui| {
+                            if elevation_prompt.is_some()
+                                && Self::modal_button(ui, style, "打开暂存目录", false)
+                            {
+                                action =
+                                    Some(Action::OpenStagedDir(staged.staged_dir.clone()));
+                            }
+                            ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                                if elevation_prompt.is_some() {
+                                    if Self::modal_button(ui, style, "管理员更新", true) {
+                                        action = Some(Action::ApplyNow {
+                                            allow_elevation: true,
+                                        });
+                                    }
+                                } else if Self::modal_button(ui, style, "立即重启更新", true) {
+                                    action = Some(Action::ApplyNow {
+                                        allow_elevation: false,
+                                    });
+                                }
+                                if Self::modal_button(ui, style, "退出时更新", false) {
+                                    action = Some(Action::ApplyOnExit);
+                                }
+                                if Self::modal_button(ui, style, "稍后", false) {
+                                    action = Some(Action::Close);
+                                }
+                            });
+                        });
+                    }
+                    UpdateState::Applying { version } => {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "正在保存工作区并交接至 v{version} 更新程序…"
+                            ))
+                            .font(style.small())
+                            .color(theme.text),
+                        );
+                    }
+                    UpdateState::Error {
+                        message,
+                        release_url,
+                        ..
+                    } => {
+                        ui.horizontal(|ui| {
+                            let (r, _) =
+                                ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
+                            icons::paint(ui.painter(), r, Icon::Error, theme.error, 1.3);
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(message)
+                                        .font(style.small())
+                                        .color(theme.text),
+                                )
+                                .wrap(),
+                            );
+                        });
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new("如网络受限，可在设置 → 更新中配置镜像源或前往 GitHub 发布页手动下载。")
+                                .font(style.tiny())
+                                .color(theme.text_muted),
+                        );
+                        ui.add_space(18.0);
+                        ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                            if Self::modal_button(ui, style, "重试", true) {
+                                action = Some(Action::CheckNow);
+                            }
+                            if let Some(url) = release_url
+                                && Self::modal_button(ui, style, "打开发布页", false)
+                            {
+                                action = Some(Action::OpenUrl(url.clone()));
+                            }
+                            if Self::modal_button(ui, style, "关闭", false) {
+                                action = Some(Action::Close);
+                            }
+                        });
+                    }
+                }
+            });
+
+        let mut keep = !modal.should_close();
+        if let Some(act) = action {
+            match act {
+                Action::Close => keep = false,
+                Action::CheckNow => {
+                    self.updater.check_now(&self.settings, true, ctx);
+                }
+                Action::Download(info) => {
+                    self.updater.start_download(info, ctx);
+                }
+                Action::CancelDownload => {
+                    self.updater.cancel_download();
+                }
+                Action::SkipVersion(ver) => {
+                    self.settings.update_skipped_version = Some(ver.clone());
+                    self.settings.save();
+                    self.updater.state = UpdateState::Idle;
+                    self.toast(format!("已跳过 v{ver} 的后台更新提醒"), ToastKind::Info);
+                    keep = false;
+                }
+                Action::ApplyNow { allow_elevation } => {
+                    self.request_apply_update_now(ctx, allow_elevation);
+                    return false;
+                }
+                Action::ApplyOnExit => {
+                    if let Some(ver) = self.updater.schedule_apply_on_exit() {
+                        self.toast(
+                            format!("将在退出 Kestrel 时自动静默更新至 v{ver}"),
+                            ToastKind::Info,
+                        );
+                    }
+                    keep = false;
+                }
+                Action::OpenUrl(url) => {
+                    if !crate::app::open_external_url(&url) {
+                        self.toast("已阻止打开不安全或无效的外部链接", ToastKind::Warning);
+                    }
+                }
+                Action::OpenStagedDir(dir) => {
+                    self.open_in_default_app(&dir);
+                }
+            }
         }
         keep
     }

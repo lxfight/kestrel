@@ -63,6 +63,14 @@ pub struct Settings {
     pub terminal_custom_shell_path: String,
     /// Space/quote-delimited arguments passed to the custom shell executable.
     pub terminal_custom_shell_args: String,
+    /// Auto-update behavior: `"prompt"`, `"auto_download"`, or `"manual"`.
+    pub update_mode: String,
+    /// Release channel: `"stable"` or `"prerelease"`.
+    pub update_channel: String,
+    /// Optional custom manifest URL or GitHub download mirror prefix.
+    pub update_mirror_url: String,
+    /// Version explicitly skipped by the user for background prompts.
+    pub update_skipped_version: Option<String>,
 }
 
 impl Default for Settings {
@@ -110,6 +118,10 @@ impl Default for Settings {
             terminal_copy_on_select: false,
             terminal_custom_shell_path: String::new(),
             terminal_custom_shell_args: String::new(),
+            update_mode: "prompt".to_string(),
+            update_channel: "stable".to_string(),
+            update_mirror_url: String::new(),
+            update_skipped_version: None,
         }
     }
 }
@@ -409,12 +421,18 @@ mod tests {
         assert!(defaults.detect_indentation);
         assert!(defaults.scroll_past_end);
         assert!(defaults.search_history.is_empty());
+        assert_eq!(defaults.update_mode, "prompt");
+        assert_eq!(defaults.update_channel, "stable");
+        assert!(defaults.update_mirror_url.is_empty());
+        assert!(defaults.update_skipped_version.is_none());
 
         let legacy = r#"{"theme":"light","font_size":15.0}"#;
         let parsed: Settings = serde_json::from_str(legacy).unwrap();
         assert_eq!(parsed.theme, "light");
         assert!(parsed.auto_close_pairs);
         assert!(parsed.search_history.is_empty());
+        assert_eq!(parsed.update_mode, "prompt");
+        assert_eq!(parsed.update_channel, "stable");
     }
 
     #[test]

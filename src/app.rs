@@ -390,9 +390,11 @@ impl BottomPanel {
 
 pub enum Dialog {
     About,
+    Update,
     Shortcuts,
     Settings,
     ConfirmClose,
+    ConfirmUpdateClose { allow_elevation: bool },
     ConfirmCloseAll,
     ConfirmCloseTab(usize, usize),
     ConfirmDelete(PathBuf),
@@ -801,6 +803,7 @@ pub struct KestrelApp {
 
     pub workspace: WorkspaceState,
     pub git: GitService,
+    pub updater: crate::updater::UpdateService,
     pub plugins: PluginHost,
     pub custom_shortcuts: std::collections::HashMap<Command, Shortcut>,
     pub pending_plugin_commands: Vec<Command>,
@@ -927,6 +930,9 @@ impl KestrelApp {
             next_untitled: 0,
             workspace: WorkspaceState::new(),
             git: GitService::new(),
+            updater: crate::updater::UpdateService::new(
+                crate::updater::apply::parse_post_update_args(),
+            ),
             plugins,
             custom_shortcuts,
             pending_plugin_commands: Vec::new(),
@@ -978,6 +984,19 @@ impl KestrelApp {
         let session_ms = session_started.elapsed().as_secs_f64() * 1000.0;
         app.load_plugins();
         app.apply_dev_ui();
+        if let Some(notice) = app.updater.post_update_notice.take() {
+            if let Some(err) = notice.error {
+                app.toast(format!("更新失败并已回滚: {err}"), ToastKind::Error);
+            } else {
+                let msg = match notice.from_version {
+                    Some(prev) if !prev.is_empty() && prev != APP_VERSION => {
+                        format!("已从 v{prev} 成功更新至 v{APP_VERSION}")
+                    }
+                    _ => format!("Kestrel 已成功更新至 v{APP_VERSION}"),
+                };
+                app.toast(msg, ToastKind::Success);
+            }
+        }
         if std::env::var_os("KESTREL_TRACE").is_some() {
             app.plugins.trace_log(format!(
                 "启动插件阶段 {:.2}ms",
@@ -1351,6 +1370,7 @@ impl KestrelApp {
                 }
             }
             "about" => self.dialog = Some(Dialog::About),
+            "update" => self.dialog = Some(Dialog::Update),
             "shortcuts" => self.dialog = Some(Dialog::Shortcuts),
             _ => {}
         }
@@ -4882,6 +4902,7 @@ impl KestrelApp {
                     self.git.refresh(&root);
                 }
             }
+            Command::CheckForUpdates => self.trigger_check_for_updates(ctx),
             Command::About => self.dialog = Some(Dialog::About),
             Command::Shortcuts => self.dialog = Some(Dialog::Shortcuts),
             Command::Plugins => {
@@ -4896,6 +4917,50 @@ impl KestrelApp {
         self.settings.theme = kind.as_str().to_string();
         self.settings.save();
         ctx.request_repaint();
+    }
+
+    pub fn trigger_check_for_updates(&mut self, ctx: &egui::Context) {
+        self.dialog = Some(Dialog::Update);
+        if matches!(
+            self.updater.state,
+            crate::updater::UpdateState::Idle
+                | crate::updater::UpdateState::UpToDate
+                | crate::updater::UpdateState::Error { .. }
+        ) {
+            self.updater.check_now(&self.settings, true, ctx);
+        }
+    }
+
+    pub fn request_apply_update_now(&mut self, ctx: &egui::Context, allow_elevation: bool) {
+        if self.tabs.iter().any(|t| t.is_dirty()) {
+            self.dialog = Some(Dialog::ConfirmUpdateClose { allow_elevation });
+            return;
+        }
+        self.finish_apply_update_now(ctx, allow_elevation);
+    }
+
+    pub fn finish_apply_update_now(&mut self, ctx: &egui::Context, allow_elevation: bool) {
+        self.settings.sidebar_width = self.sidebar.width;
+        self.settings.terminal_height = self.bottom.height;
+        self.settings.terminal_follow_active_dir = self.bottom.follow_active_dir;
+        self.settings.flush();
+        self.save_session();
+
+        match self.updater.begin_apply_now(allow_elevation) {
+            Ok(_) => {
+                self.close_confirmed = true;
+                self.dialog = None;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Err(crate::updater::apply::ApplyLaunchError::NeedsElevation(dir)) => {
+                self.updater.elevation_prompt = Some((dir, true));
+                self.dialog = Some(Dialog::Update);
+            }
+            Err(crate::updater::apply::ApplyLaunchError::Failed(msg)) => {
+                self.toast(format!("无法启动更新: {msg}"), ToastKind::Error);
+                self.dialog = Some(Dialog::Update);
+            }
+        }
     }
 
     // ------------------------------------------------------------------
@@ -5317,6 +5382,46 @@ impl KestrelApp {
         self.session_autosave();
         self.window_focused = focused;
 
+        let update_notices = self.updater.poll(&self.settings, ctx);
+        if !update_notices.is_empty() {
+            repaint = true;
+            let update_dialog_open = matches!(self.dialog, Some(Dialog::Update));
+            for notice in update_notices {
+                match notice {
+                    crate::updater::UpdateNotice::Available {
+                        version,
+                        manual,
+                        auto_download,
+                    } => {
+                        if !manual {
+                            let text = if auto_download {
+                                format!("发现新版本 v{version}，正在后台下载")
+                            } else {
+                                format!("发现新版本 v{version}，点击状态栏查看详情")
+                            };
+                            self.toast(text, ToastKind::Info);
+                        }
+                    }
+                    crate::updater::UpdateNotice::UpToDate { version, manual } => {
+                        if manual && !update_dialog_open {
+                            self.toast(format!("当前已是最新版本 (v{version})"), ToastKind::Info);
+                        }
+                    }
+                    crate::updater::UpdateNotice::ReadyToInstall { version } => {
+                        self.toast(
+                            format!("新版本 v{version} 已校验就绪，可重启完成更新"),
+                            ToastKind::Success,
+                        );
+                    }
+                    crate::updater::UpdateNotice::Error { message, manual } => {
+                        if manual && !update_dialog_open {
+                            self.toast(format!("更新检查失败: {message}"), ToastKind::Error);
+                        }
+                    }
+                }
+            }
+        }
+
         self.toasts
             .retain(|toast| toast.created.elapsed() < Duration::from_millis(3600));
 
@@ -5329,6 +5434,9 @@ impl KestrelApp {
     /// so a refresh requested later in the same frame still gets its timer.
     fn schedule_background_wakeup(&self, ctx: &egui::Context) {
         if let Some(after) = self.git.repaint_after() {
+            ctx.request_repaint_after(after);
+        }
+        if let Some(after) = self.updater.repaint_after(&self.settings) {
             ctx.request_repaint_after(after);
         }
         if self.workspace.index.is_loading() {
@@ -5624,6 +5732,7 @@ impl eframe::App for KestrelApp {
             // Settings writes are debounced; exit must land them immediately.
             self.settings.flush();
             self.save_session();
+            self.updater.apply_pending_on_exit();
         }
     }
 }

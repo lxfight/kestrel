@@ -81,6 +81,7 @@ pub enum Icon {
     DiffRemoved,
     Discard,
     Sync,
+    CloudDownload,
     Stage,
     Unstage,
     // Symbols (Outline / LSP / Completion)
@@ -169,6 +170,7 @@ impl Icon {
             Icon::DiffRemoved => '\u{eadf}',     // diff-removed
             Icon::Discard => '\u{eae2}',         // discard
             Icon::Sync => '\u{ea77}',            // sync
+            Icon::CloudDownload => '\u{eac2}',   // cloud-download
             Icon::Stage => '\u{ea60}',           // add
             Icon::Unstage => '\u{eb3b}',         // remove
             Icon::SymbolFunction => '\u{ea8c}',  // symbol-method / function

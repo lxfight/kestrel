@@ -107,6 +107,7 @@ pub enum Command {
     RevealInExplorer,
     RefreshExplorer,
     // Help
+    CheckForUpdates,
     About,
     Shortcuts,
     // Extensions
@@ -429,6 +430,7 @@ impl Command {
             Command::CopyPath => "workspace.copyPath",
             Command::RevealInExplorer => "workspace.revealInExplorer",
             Command::RefreshExplorer => "workspace.refreshExplorer",
+            Command::CheckForUpdates => "help.checkForUpdates",
             Command::About => "help.about",
             Command::Shortcuts => "help.shortcuts",
             Command::Plugins => "plugins.manage",
@@ -537,6 +539,7 @@ impl Command {
         Command::CopyPath,
         Command::RevealInExplorer,
         Command::RefreshExplorer,
+        Command::CheckForUpdates,
         Command::About,
         Command::Shortcuts,
         Command::Plugins,
@@ -640,6 +643,7 @@ impl Command {
             Command::CopyPath => "复制文件路径",
             Command::RevealInExplorer => "在文件资源管理器中显示",
             Command::RefreshExplorer => "刷新资源管理器",
+            Command::CheckForUpdates => "检查更新…",
             Command::About => "关于 Kestrel",
             Command::Shortcuts => "键盘快捷键",
             Command::Plugins => "管理插件",
@@ -694,6 +698,7 @@ impl Command {
             Command::OpenSettings => Icon::Settings,
             Command::ThemeLight => Icon::Sun,
             Command::ThemeDark => Icon::Moon,
+            Command::CheckForUpdates => Icon::CloudDownload,
             Command::Shortcuts => Icon::Keyboard,
             Command::About => Icon::Info,
             Command::Plugins => Icon::Extensions,
@@ -760,7 +765,7 @@ impl Command {
             | Command::JumpForward
             | Command::ToggleIndent => "编辑",
             Command::CopyPath | Command::RevealInExplorer | Command::RefreshExplorer => "工作区",
-            Command::About | Command::Shortcuts => "帮助",
+            Command::CheckForUpdates | Command::About | Command::Shortcuts => "帮助",
             Command::Plugins => "插件",
             _ => "视图",
         }
